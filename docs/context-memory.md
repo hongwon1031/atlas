@@ -79,6 +79,8 @@ Task 실행 결과, 실패, 해결 과정, 비용, 소요 시간입니다.
 
 현재 Run에서만 사용하는 로그와 중간 산출물입니다.
 
+Working Memory는 Run별 log와 artifact scope 안에 격리합니다. 여러 Task나 Project가 executor conversation, shell state, mutable worktree를 공유하지 않으며 Run 종료 후 [Execution Runtime](specs/execution-runtime.md)의 retention과 cleanup 규칙을 적용합니다.
+
 ### Agent-Specific Notes
 
 특정 역할의 경험 요약입니다. Canonical Memory를 덮어쓸 수 없습니다.
@@ -116,3 +118,5 @@ Task 실행 결과, 실패, 해결 과정, 비용, 소요 시간입니다.
 - 의미 기반 장기 기억
 - 자동 지식 그래프
 - 다중 저장소 cross-project retrieval
+
+장기 Project의 goal, roadmap, Epic, Task, 반복 PR 관계는 [Project Lifecycle Specification](specs/project-lifecycle.md)을 따릅니다. AI Trading은 예시 onboarding target일 뿐 Atlas memory에 구현된 기능이 아닙니다.

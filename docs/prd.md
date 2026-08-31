@@ -69,7 +69,7 @@ Atlas는 모바일에서 받은 개발 지시를 프로젝트 단위의 실행 �
 3. Executor가 별도 branch에서 작업·검증하고 PR을 생성합니다.
 4. 사람이 PR을 검토하고 merge하거나 수정을 요청합니다.
 
-자동 worker, claim, validation, GitHub delivery는 아직 구현되지 않았습니다.
+자동 worker, claim, validation, GitHub delivery는 아직 구현되지 않았습니다. Codex Cloud의 사람 prompt → branch 변경 → PR 생성 → 사람 merge 흐름은 수동으로 입증됐습니다. Atlas-to-Codex automated invocation은 feasibility가 검증되지 않았고, self-hosted Claude Code primary automated path는 계획됐지만 구현되지 않았습니다.
 
 ## Target MVP User Flow
 
@@ -77,7 +77,7 @@ Atlas는 모바일에서 받은 개발 지시를 프로젝트 단위의 실행 �
 2. Atlas worker가 Task를 정규화하고 위험도와 필요 역량을 분류한 뒤 claim합니다.
 3. Context Builder가 정책 문서, 관련 코드, 최근 Issue/PR, 테스트 정보를 수집합니다.
 4. Router가 primary self-hosted Claude Code Executor를 선택합니다.
-5. always-available server의 Runner가 격리된 branch 또는 workspace에서 작업합니다.
+5. always-available server의 Runner가 dedicated worktree/clone, branch, per-Task executor process에서 작업합니다.
 6. Validator가 테스트, lint, diff 제한, 비밀정보 검사를 수행합니다.
 7. Atlas가 PR과 모바일용 결과 요약을 생성합니다.
 8. 사용자가 휴대전화에서 승인, 수정 요청, 폐기를 선택합니다.
@@ -151,11 +151,11 @@ Atlas는 모바일에서 받은 개발 지시를 프로젝트 단위의 실행 �
 
 ## Open Questions
 
-- Atlas worker가 Issue를 webhook과 polling 중 어떤 방식으로 감지할지
-- always-available server의 hosting 위치와 process supervision 방식
+- Proposed polling-first ingestion의 interval, backoff, production scaling policy
+- always-available server의 hosting 위치와 stable supervisor로 systemd/Docker 중 무엇을 선택할지
 - self-hosted Claude Code worker의 인증 방식과 availability 확인 정책
 - Codex Cloud secondary fallback을 자동화할지 사람 배정으로만 둘지
 - Atlas의 초기 개발 언어와 Control Plane 배포 위치
 - network egress, secret scanning, branch protection의 구체적인 policy
 
-문서 원본, 초기 intake channel, primary automated Executor 결정은 각각 ADR-001, ADR-002, ADR-003에서 Accepted됐습니다.
+문서 원본, 초기 intake channel, primary automated Executor 결정은 각각 ADR-001, ADR-002, ADR-003에서 Accepted됐습니다. Polling-first ingestion, tmux PoC supervision, Task execution isolation은 ADR-008~010의 Proposed 방향이며 구현 근거로 승인되지 않았습니다.

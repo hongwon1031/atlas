@@ -6,7 +6,7 @@
 
 ## Role Model
 
-역할은 모델 계정과 분리합니다. 동일한 Claude 또는 Codex 실행기가 상황에 따라 Researcher, Implementer, Reviewer 역할을 수행할 수 있습니다.
+Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다. 역할은 모델 계정 및 Executor와 분리합니다. 동일한 Claude 또는 Codex 실행기가 policy에 따라 Planner, Researcher, Implementer, Reviewer, Validator, Reporter 역할을 수행할 수 있습니다.
 
 ## Initial Roles
 
@@ -54,6 +54,18 @@ capabilities:
   - local_tool_access
 ```
 
+Future [Agent Registry](specs/agent-registry.md)는 `agent_id`, `provider`, `adapter_type`, `execution_host`, `authentication_profile`, `capabilities`, `supported_roles`, `availability`, `usage_state`, `security_scope`, `current_run`을 구분합니다. 개인과 회사 account는 별도 authentication profile 또는 worker registration으로 등록합니다.
+
+## Executor Support Status
+
+| Executor path | 상태 | 설명 |
+| --- | --- | --- |
+| Codex Cloud manual | Proven Manually | 사람 prompt → Codex branch 변경 → Codex PR → 사람 merge |
+| self-hosted Claude Code | Planned | primary automated executor; worker와 invocation 미구현 |
+| Atlas-to-Codex Cloud | Feasibility Unverified | automated adapter로 routing하기 전 integration validation 필요 |
+| Claude API, OpenAI API, Gemini | Not Implemented | future API adapter 후보 |
+| local model | Not Implemented | future adapter 후보 |
+
 ## Routing Inputs
 
 - Task 유형과 위험도
@@ -77,9 +89,9 @@ Issue 생성, `/atlas` command, label 변경만으로 실행이 자동 시작되
 
 ## Target MVP Routing
 
-1. Atlas worker가 GitHub Issue를 검증하고 idempotent claim을 획득합니다.
-2. Router는 primary `claude_code_self_hosted` Adapter를 선택합니다.
-3. self-hosted Claude Code worker가 always-available server의 격리 workspace에서 실행합니다.
+1. Atlas worker가 GitHub Issue를 검증하고 lease 기반 idempotent claim을 획득합니다.
+2. Router는 security scope, capability, role, availability를 확인하고 primary `claude_code_self_hosted` Adapter를 선택합니다.
+3. self-hosted Claude Code worker가 always-available server의 전용 worktree/clone과 새 executor process에서 실행합니다.
 4. primary worker를 사용할 수 없으면 Task를 실패 또는 사람 확인 상태로 반환합니다.
 5. Codex Cloud는 사람이 선택하는 manual/secondary executor로 유지합니다. 자동 fallback은 별도 결정 전까지 수행하지 않습니다.
 
@@ -91,16 +103,28 @@ Issue 생성, `/atlas` command, label 변경만으로 실행이 자동 시작되
 4. 다른 Executor를 사용할 수 있으면 구현과 리뷰를 분리합니다.
 5. 고위험 변경은 자동 실행을 금지하거나 사람 승인 후 실행합니다.
 6. 사용량이나 worker 상태가 불명확하면 보수적으로 실행하지 않고 사람에게 반환합니다.
+7. 여러 Project가 conversation을 공유하거나 여러 Task가 mutable worktree를 공유하거나 여러 Run이 같은 branch를 동시에 수정하지 않습니다.
 
 ## Usage State
 
-서비스가 공식 잔여량 API를 제공하지 않으면 다음 상태를 수동 입력이나 실패 신호로 관리합니다.
+서비스가 공식 잔여량 API를 제공하지 않으면 다음 상태를 수동 입력, configured reset, execution signal로 관리하도록 [Usage and Availability](specs/usage-availability.md)에서 제안합니다. 자동 상태 관리 기능은 아직 구현되지 않았습니다.
 
 - `available`
 - `limited`
 - `exhausted`
 - `unknown`
 - `offline`
+
+초기 record는 다음 정보를 구분합니다.
+
+- `usage_window_type`: rolling five-hour, weekly, provider-defined, unknown
+- `resets_at`: 사람이 입력하거나 provider가 명시한 reset 시각
+- `weekly_state`: available, limited, exhausted, unknown
+- `remaining_estimate`: optional estimate와 단위·confidence; 근거가 없으면 null
+- `availability_source`: manual, configured reset, execution signal, official API
+- `last_usage_failure`: redacted category, 시각, optional retry time
+
+정상 실행은 service reachability signal일 뿐 정확한 remaining quota의 증거가 아닙니다. Atlas는 지원되지 않는 정밀 quota detection을 주장하지 않으며 rolling five-hour와 weekly limit을 초기에는 수동으로 입력할 수 있습니다.
 
 ## Fallback Policy
 
@@ -122,7 +146,8 @@ Issue 생성, `/atlas` command, label 변경만으로 실행이 자동 시작되
 - [ ] Role 정의 파일 포맷 설계
 - [ ] Capability taxonomy 확정
 - [ ] Agent Registry에 `claude_code_self_hosted` primary와 `codex_cloud` manual/secondary 등록
-- [ ] Availability 수동 입력 API 작성
+- [ ] 개인/회사 authentication profile을 분리한 Agent Registry schema 구현
+- [ ] Availability와 rolling/weekly reset 수동 입력 구현
 - [ ] primary-only 규칙 기반 Router 최소 구현
 - [ ] worker claim lease와 heartbeat 정책 구현
 - [ ] 재시도·Fallback 정책 구현
@@ -130,3 +155,4 @@ Issue 생성, `/atlas` command, label 변경만으로 실행이 자동 시작되
 - [ ] Reviewer 분리 정책 구현
 - [ ] 실행 결과 기반 성공률 통계 설계
 - [ ] 비용·사용량 대시보드 후속 Issue 생성
+- [ ] Atlas-to-Codex Cloud invocation, cancellation, delivery feasibility 검증
