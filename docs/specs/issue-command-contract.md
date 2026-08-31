@@ -1,6 +1,6 @@
 # GitHub Issue Command Contract v0.1
 
-이 문서는 GitHub Issue를 Atlas의 초기 모바일 Task channel로 사용할 때 comment와 label이 Task 상태를 변경하는 Target MVP 규칙을 정의합니다. [ADR-002](../adr/0002-initial-mobile-task-channel.md)는 GitHub Issues와 기존 Atlas Task Issue Form을 Accepted intake로 확정했습니다.
+이 문서는 GitHub Issue를 Atlas의 초기 모바일 Task channel로 사용할 때 comment와 label이 Task 상태를 변경하는 Target MVP 규칙을 정의합니다. [ADR-002](../adr/0002-initial-mobile-task-channel.md)는 GitHub Issues와 기존 Atlas Task Issue Form을 Accepted intake로 확정했고, [ADR-008](../adr/0008-initial-github-event-ingestion.md)은 polling-first 감지를 `Proposed`로 제안합니다.
 
 이 계약의 command와 label automation은 아직 구현되지 않았습니다. Current manual workflow에서 `/atlas` comment나 `atlas:*` label은 실행을 시작하지 않습니다.
 
@@ -81,6 +81,8 @@ Public repository의 Issue 작성자라는 사실만으로 mutation command 권�
 - CI·인프라와 dependency 변경은 필요한 사전 승인을 참조해야 합니다.
 - 이미 terminal state인 Task의 mutation은 거부합니다.
 - 같은 comment ID를 다시 전달받으면 이전 응답을 반환합니다.
+- 같은 Issue revision과 queue signal을 polling에서 반복 관찰해도 active Run이나 PR을 추가 생성하지 않습니다.
+- Issue의 실행 필드가 edit되면 기존 approval을 자동 재사용하지 않고 새 revision validation이 필요합니다.
 
 ## Response Contract
 
@@ -147,4 +149,5 @@ Target MVP에서 다음 사건에는 Issue comment 또는 연결된 모바일 no
 - Issue author에게 제한적인 `cancel` 권한을 허용할지
 - label set을 repository bootstrap 과정에서 자동 생성할지
 - 장문의 revision instruction에 별도 form 또는 attachment가 필요한지
-- worker가 Issue를 webhook과 polling 중 어떤 방식으로 감지할지
+- polling interval, backoff, production scaling policy
+- Issue edit 후 재승인에 필요한 field와 permission

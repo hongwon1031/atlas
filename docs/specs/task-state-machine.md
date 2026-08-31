@@ -99,9 +99,10 @@ stateDiagram-v2
 
 ### `Running`
 
-- Run은 고유 ID, branch, actor, 시작 시각, timeout을 가집니다.
+- Run은 고유 ID, dedicated branch, worktree/clone, executor process, log scope, actor, 시작 시각, timeout, cancellation state를 가집니다.
 - 모든 side effect는 허용된 scope와 command policy 안에 있어야 합니다.
 - cancel 요청을 받으면 새 side effect를 중단하고 정리 결과를 기록합니다.
+- 여러 Task가 mutable worktree를 공유하거나 여러 Run이 같은 branch를 동시에 수정할 수 없습니다.
 
 ### `Validating`
 
@@ -135,6 +136,8 @@ stateDiagram-v2
 - 동일 transition 요청을 다시 받으면 새 Run을 만들지 않고 기존 결과를 반환합니다.
 - retry Run은 이전 Run, 실패 원인, 변경된 plan을 참조합니다.
 - retry는 Acceptance Criteria나 scope를 몰래 변경할 수 없습니다.
+- lease expiry만으로 새 Run을 만들지 않고 heartbeat, worker ownership, process identity를 reconcile합니다.
+- worker restart는 [Execution Runtime](execution-runtime.md)의 recovery 절차로 stale lease, orphan process, stale worktree를 확인합니다.
 
 ## Current and Target State Ownership
 
@@ -183,5 +186,6 @@ evidence:
 - PR approval과 merge를 각각 상태로 분리할지
 - timeout과 retry budget의 Task별 기본값
 - Issue label을 상태의 source of truth로 사용할지 projection으로만 사용할지
-- worker trigger를 webhook과 polling 중 무엇으로 구현할지
+- Proposed polling-first trigger의 interval, backoff, production scaling policy
 - claim lease duration, heartbeat, abandoned Run recovery 정책
+- polling interval, source revision과 approval signal idempotency key
