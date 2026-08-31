@@ -1,7 +1,8 @@
 # ADR-001: Documentation Source of Truth
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-31
+- Accepted: 2026-08-31
 - Decision owners: Project owner
 
 ## Context
@@ -10,13 +11,14 @@ Atlas의 초기 제품 설계는 Notion에서 작성됐고 GitHub의 `docs/`로 
 
 두 시스템을 동시에 canonical source로 취급하면 내용 충돌, 오래된 정책 사용, 승인 상태 불명확 문제가 생깁니다.
 
-## Proposed Decision
+## Decision
 
 - 구현과 실행에 영향을 주는 Constitution, PRD, Architecture, spec, ADR은 GitHub Markdown을 canonical source로 사용합니다.
-- Notion은 아이디어 탐색, meeting note, 초안 작성, 읽기 쉬운 mirror로 사용할 수 있습니다.
-- Notion의 변경은 Accepted 결정으로 간주하지 않으며 GitHub PR을 통해 반영합니다.
+- Notion은 선택적인 human-friendly mirror, 아이디어 탐색, meeting note, 초안 작성에 사용할 수 있습니다.
+- Notion의 내용은 canonical policy나 Accepted 결정이 아닙니다. 실행에 영향을 주는 변경은 GitHub Pull Request로 반영하고 merge된 GitHub Markdown을 기준으로 판단합니다.
 - 각 동기화 문서는 가능한 경우 원문 링크와 마지막 동기화 기준을 남깁니다.
 - 자동 양방향 동기화는 MVP 범위에서 제외합니다.
+- 기존 문서의 Notion 링크는 역사적 출처와 선택적 mirror를 나타낼 뿐 source of truth를 뜻하지 않습니다.
 
 ## Alternatives Considered
 
@@ -50,7 +52,7 @@ Atlas의 초기 제품 설계는 Notion에서 작성됐고 GitHub의 `docs/`로 
 
 ## Follow-up Tasks
 
-- [ ] Project owner가 제안 결정을 승인하거나 수정
+- [x] Project owner가 GitHub Markdown canonical / Notion optional mirror 결정을 승인
 - [ ] canonical/mirror 상태를 문서 header에 표시하는 규칙 확정
 - [ ] 수동 동기화 checklist 작성
 - [ ] drift 점검 주기 결정

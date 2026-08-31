@@ -1,22 +1,41 @@
 # ADR-002: Initial Mobile Task Channel
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-31
+- Accepted: 2026-08-31
 - Decision owners: Project owner
 
 ## Context
 
 Atlas의 MVP는 휴대전화에서 Task를 생성하고 상태를 확인하며 결과 PR을 검토할 수 있어야 합니다. 후보는 GitHub Issue, Telegram Bot, 전용 Web UI, Notion입니다.
 
-Sprint 1은 GitHub Issue Form과 comment command 계약을 문서화하지만 실제 실행 automation은 구현하지 않습니다.
+Sprint 1은 GitHub Issue Form과 comment command 계약을 문서화했지만 실제 실행 automation은 아직 구현하지 않았습니다. 따라서 현재 운영과 목표 MVP를 구분해야 합니다.
 
-## Proposed Decision
+## Decision
 
-- 첫 모바일 Task channel은 GitHub Issue로 시작합니다.
-- `.github/ISSUE_TEMPLATE/atlas-task.yml`을 구조화된 입력 인터페이스로 사용합니다.
-- 권한 있는 사용자는 [Issue Command Contract](../specs/issue-command-contract.md)에 정의된 comment와 `atlas:queued` label로 Task를 제어합니다.
-- 실행 상태는 Atlas의 Task state가 canonical이며 GitHub label은 projection으로 취급합니다.
+- 초기 모바일 Task intake channel은 GitHub Issues입니다.
+- 기존 `.github/ISSUE_TEMPLATE/atlas-task.yml`을 canonical 구조화 입력 인터페이스로 사용합니다.
+- 현재는 사람이 Issue를 확인하고 선택한 Executor에게 전달합니다. comment command, label trigger, webhook, polling, 자동 claim은 동작하지 않습니다.
+- 목표 MVP에서는 Atlas worker가 Issue를 검증하고 claim하며, 권한 있는 사용자는 [Issue Command Contract](../specs/issue-command-contract.md)에 정의된 comment와 label로 Task를 제어합니다.
+- 자동화 이후 실행 상태는 Atlas Task state가 canonical이며 GitHub label은 projection으로 취급합니다.
 - 전용 Web UI는 Task → PR 경로가 검증된 뒤 검토합니다.
+
+## Current Manual Workflow
+
+1. 사람이 Atlas Task Issue Form으로 Issue를 생성합니다.
+2. 사람이 Issue의 목표, 범위, 위험, 완료 조건을 확인합니다.
+3. 사람이 Issue를 선택한 Executor에게 전달합니다.
+4. Executor가 독립 branch에서 작업하고 검증 근거가 포함된 PR을 엽니다.
+5. 사람이 PR을 검토하고 merge하거나 수정을 요청합니다.
+
+## Target MVP Workflow
+
+1. 사람이 Atlas Task Issue Form으로 Issue를 생성합니다.
+2. Atlas worker가 Task Schema를 검증하고 작업을 claim합니다.
+3. self-hosted Claude Code Executor가 독립된 작업 공간과 branch에서 실행합니다.
+4. Validator가 검증 policy를 실행합니다.
+5. Delivery Adapter가 PR을 생성합니다.
+6. 사람이 PR을 검토하고 merge하거나 수정을 요청합니다.
 
 ## Alternatives Considered
 
@@ -51,7 +70,7 @@ Sprint 1은 GitHub Issue Form과 comment command 계약을 문서화하지만 �
 
 ## Follow-up Tasks
 
-- [ ] Project owner가 GitHub Issue 우선 결정을 승인
+- [x] Project owner가 GitHub Issues와 기존 Atlas Task Issue Form을 초기 intake channel로 승인
 - [ ] 필요한 `atlas:*` label 목록과 provisioning 방식 확정
 - [ ] Issue parser와 schema validation acceptance test 정의
 - [ ] 휴대전화 기준 Issue → PR 사용성 시험
