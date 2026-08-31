@@ -23,9 +23,9 @@ Follow-up Tasks
 
 | ADR | Status | Summary |
 | --- | --- | --- |
-| [ADR-001: Documentation Source of Truth](0001-documentation-source-of-truth.md) | Proposed | GitHub Markdown canonical, Notion mirror 제안 |
-| [ADR-002: Initial Mobile Task Channel](0002-initial-mobile-task-channel.md) | Proposed | GitHub Issue 기반 첫 Task channel 제안 |
-| [ADR-003: Initial Execution Environment](0003-initial-execution-environment.md) | Proposed | Codex Cloud Remote PR Proof 우선 제안 |
+| [ADR-001: Documentation Source of Truth](0001-documentation-source-of-truth.md) | Accepted | GitHub Markdown canonical, Notion optional human-friendly mirror |
+| [ADR-002: Initial Mobile Task Channel](0002-initial-mobile-task-channel.md) | Accepted | GitHub Issues와 기존 Atlas Task Issue Form |
+| [ADR-003: Initial Execution Environment](0003-initial-execution-environment.md) | Accepted | self-hosted Claude Code worker primary, Codex Cloud manual/secondary |
 | [ADR-004: Workflow Engine](0004-workflow-engine.md) | Proposed | 단순 persisted state machine 우선 제안 |
 | [ADR-005: Project Memory Storage](0005-project-memory-storage.md) | Proposed | Git canonical 문서와 별도 운영 상태 저장 제안 |
 | [ADR-006: Agent Availability and Usage](0006-agent-availability-and-usage.md) | Proposed | 수동 availability와 실패 signal 결합 제안 |
@@ -49,10 +49,10 @@ Follow-up Tasks
 
 ## Open Decisions Requiring User Input
 
-1. 첫 모바일 입력 채널
-2. 첫 Executor
-3. Atlas의 초기 개발 언어
-4. Control Plane의 배포 위치
-5. Notion/GitHub 문서 원본 정책
-6. 개인 Claude 계정의 Atlas 사용 허용 기준
-7. 공개 저장소에서 공개할 설계 범위
+1. Atlas의 초기 개발 언어
+2. Control Plane과 worker의 배포 위치 및 process model
+3. GitHub Issue 감지를 webhook으로 할지 polling으로 할지
+4. self-hosted Claude Code worker의 인증 방식과 계정 사용 기준
+5. Codex Cloud secondary fallback을 자동화할지 사람 배정으로만 둘지
+6. 공개 저장소에서 공개할 설계 범위
+7. network egress, secret scanning, branch protection의 구체적인 정책

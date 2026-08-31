@@ -2,6 +2,8 @@
 
 이 문서는 Atlas Task와 Run의 수명주기를 정의합니다. 상태는 UI 표시가 아니라 권한, 재시도, 감사 로그를 제어하는 계약입니다. persistence와 workflow engine 구현은 아직 선택하지 않습니다.
 
+현재는 상태 저장과 자동 transition이 구현되지 않았습니다. Current manual workflow에서는 사람이 Issue를 Executor에게 전달하고 Issue/PR 기록으로 논리적 상태를 추적합니다. Target MVP에서는 Atlas worker가 transition, claim lease, event log를 관리합니다.
+
 ## States
 
 | 상태 | 의미 | 주요 책임자 |
@@ -66,8 +68,8 @@ stateDiagram-v2
 | `Draft` | `Planned` | `/atlas plan` 또는 Planner | Task Schema의 Planned 필드 완성 |
 | `NeedsClarification` | `Draft` | 사람 답변 | source와 답변 audit 기록 |
 | `Planned` | `ContextReady` | Context Builder 완료 | 필수 policy, source, selection reason |
-| `ContextReady` | `Queued` | `/atlas queue` 또는 `atlas:queued` | 권한, 위험, availability, 승인 확인 |
-| `Queued` | `Running` | Scheduler lease | branch/workspace lock과 Run ID |
+| `ContextReady` | `Queued` | 현재: 사람 전달 / 목표: worker queue trigger | 권한, 위험, availability, 승인 확인 |
+| `Queued` | `Running` | 현재: Executor 시작 / 목표: worker claim lease | branch/workspace lock과 Run ID |
 | `Running` | `Validating` | Executor 결과 제출 | diff와 artifact checksum |
 | `Validating` | `PullRequestReady` | 필수 검증 통과 | [PR Output Contract](pr-output-contract.md) 충족 |
 | `PullRequestReady` | `RevisionRequested` | PR change request 또는 `/atlas revise` | 수정 지시와 actor |
@@ -92,6 +94,8 @@ stateDiagram-v2
 - Executor capability와 availability가 확인되어야 합니다.
 - 고위험 변경의 사전 승인이 기록되어야 합니다.
 - 동일 branch를 점유한 다른 Run이 없어야 합니다.
+- Current manual workflow에서는 사람의 명시적 전달이 queue 승인 증거입니다.
+- Target MVP에서는 Atlas worker의 idempotent claim과 유효한 lease가 필요합니다.
 
 ### `Running`
 
@@ -132,6 +136,18 @@ stateDiagram-v2
 - retry Run은 이전 Run, 실패 원인, 변경된 plan을 참조합니다.
 - retry는 Acceptance Criteria나 scope를 몰래 변경할 수 없습니다.
 
+## Current and Target State Ownership
+
+| 항목 | Current manual workflow | Target MVP workflow |
+| --- | --- | --- |
+| Intake validation | 사람 | Atlas worker |
+| Claim / queue | 사람이 Executor에게 전달 | worker lease와 idempotency key |
+| Primary execution | 사람이 선택한 Executor | self-hosted Claude Code worker |
+| Secondary execution | Codex Cloud를 포함한 수동 선택 | Codex Cloud manual/secondary; 자동 fallback 미결정 |
+| State record | Issue/PR comment와 사람 보고 | persisted Task state와 append-only event |
+| Validation trigger | Executor와 사람이 실행 | Validator가 policy에 따라 실행 |
+| Merge approval | 사람 | 사람 |
+
 ## Transition Event
 
 모든 상태 변경은 최소한 다음 정보를 기록합니다.
@@ -145,7 +161,7 @@ to: Running
 trigger: scheduler_lease
 actor: agent:executor-id
 occurred_at: 2026-08-31T00:00:00Z
-reason: selected executor is available
+reason: self-hosted Claude Code worker claimed the task
 evidence:
   branch: docs/example
   commit: null
@@ -156,7 +172,8 @@ evidence:
 ## Authorization
 
 - 사람만 `Queued`, `Approved`, `Cancelled`로 가는 고위험 transition을 승인할 수 있습니다.
-- Executor는 자신의 Run을 `Running`과 `Validating` 사이에서만 이동하도록 제한합니다.
+- Current manual workflow에서는 사람이 Issue 전달로 queue를 승인합니다.
+- Target MVP에서는 Atlas worker만 claim/lease transition을 기록하고 self-hosted Claude Code Executor는 자신의 Run을 `Running`과 `Validating` 사이에서만 이동하도록 제한합니다.
 - Validator와 Delivery Adapter는 검증 근거 없이 `PullRequestReady`를 기록할 수 없습니다.
 - AI는 `Approved` 또는 `Completed`를 사람 승인 없이 생성하지 않습니다.
 
@@ -166,3 +183,5 @@ evidence:
 - PR approval과 merge를 각각 상태로 분리할지
 - timeout과 retry budget의 Task별 기본값
 - Issue label을 상태의 source of truth로 사용할지 projection으로만 사용할지
+- worker trigger를 webhook과 polling 중 무엇으로 구현할지
+- claim lease duration, heartbeat, abandoned Run recovery 정책

@@ -6,38 +6,64 @@
 
 큰 플랫폼을 한 번에 만들지 않고 실제 사용 가능한 세로 단면을 반복해서 완성합니다.
 
+## Current Baseline — Manual Issue to PR
+
+현재 가능한 운영 흐름은 **GitHub Issue 생성 → 사람이 Issue를 Executor에게 전달 → Executor가 branch에서 작업·검증 → PR 생성 → 사람 review/merge**입니다.
+
+Atlas worker, webhook/polling, 자동 claim, self-hosted Claude Code invocation, validation automation, GitHub delivery automation은 아직 구현되지 않았습니다.
+
 ## Milestone M0 — Foundation
 
 **Outcome:** AI와 사람이 동일하게 이해할 수 있는 프로젝트 정의가 존재합니다.
 
 - [ ] Vision & Constitution 리뷰
 - [ ] PRD v0.1 리뷰
-- [ ] Architecture v0.1 리뷰
+- [ ] Architecture v0.2 리뷰
 - [ ] Research 결과와 Build/Adopt 결정
-- [ ] GitHub `docs/` 동기화 계획
+- [x] GitHub Markdown canonical / Notion optional mirror 결정
+- [x] GitHub Issues와 Atlas Task Form intake 결정
+- [x] self-hosted Claude Code primary / Codex Cloud manual-secondary 결정
+- [x] AI Agent guide, Task contract, PR contract, ADR 문서 foundation
 
-## Milestone M1 — Remote PR Proof
+## Milestone M1 — Automated Issue-to-PR Vertical Slice
 
-**Outcome:** 휴대전화에서 지시한 문서 변경이 PR로 생성됩니다.
+**Outcome:** GitHub Issue로 등록한 문서 전용 Task를 Atlas worker가 검증·claim하고, always-available server의 self-hosted Claude Code worker가 수행한 뒤 validation 결과가 포함된 PR을 자동 생성합니다.
 
-### Epic 1. Task Intake
+### Epic 1. Worker Intake and Claim
 
-- [ ] GitHub Issue Template 생성
-- [ ] Task 필수 필드 검증
-- [ ] 실행 라벨과 취소 명령 정의
+- [x] GitHub Issue Template 생성
+- [x] Task Schema와 Issue Command Contract 작성
+- [ ] webhook과 polling 중 하나를 선택
+- [ ] Issue payload parser와 Task 필수 필드 검증
+- [ ] repository permission과 Project allowlist 확인
+- [ ] idempotent claim, lease, duplicate event 방지
+- [ ] 수동 workflow를 유지하는 safe rollout flag
 
-### Epic 2. Executor Connection
+### Epic 2. Self-hosted Claude Code Worker
 
-- [ ] Codex Cloud와 Atlas 저장소 연결
-- [ ] 최소 권한 확인
-- [ ] 문서 수정 Task 실행
-- [ ] PR 자동 생성 검증
+- [ ] always-available server hosting과 service identity 결정
+- [ ] provider-neutral Executor Adapter 최소 interface
+- [ ] Claude Code Adapter와 invocation contract
+- [ ] Task별 isolated workspace, branch, lock
+- [ ] timeout, cancel, process cleanup, redacted log
+- [ ] Codex Cloud를 manual/secondary로 유지하고 자동 fallback은 제외
 
-### Epic 3. Reporting
+### Epic 3. Validation and Delivery
 
-- [ ] PR 요약 템플릿
-- [ ] 테스트/검증 결과 표시
-- [ ] 모바일 알림 검증
+- [x] PR Output Contract와 PR template 작성
+- [ ] project validation command 실행
+- [ ] diff scope, forbidden path, secret scan
+- [ ] GitHub PR 생성과 Issue 상태 comment
+- [ ] 실패 보고와 retry budget
+- [ ] 문서 전용 Issue 한 건으로 mobile E2E 검증
+
+### M1 Explicit Non-Goals
+
+- multi-agent collaboration과 자동 Reviewer 분리
+- Codex Cloud 자동 fallback
+- 전용 Web UI 또는 Telegram Bot
+- vector memory와 semantic retrieval
+- production deployment와 회사 Project 연결
 
 ## Milestone M2 — Atlas Control Plane
 
@@ -50,10 +76,11 @@
 - [ ] SQLite/PostgreSQL persistence
 - [ ] Event log
 
-### Epic 5. Executor Adapter
+### Epic 5. Multi-Executor Adapter Hardening
 
-- [ ] Adapter interface
-- [ ] Codex adapter
+- [ ] M1의 Executor Adapter contract 안정화
+- [ ] Claude Code Adapter capability 확장
+- [ ] Codex Cloud manual/secondary Adapter 연결
 - [ ] Mock executor for tests
 - [ ] timeout/cancel/retry
 
@@ -113,12 +140,13 @@
 ## Sprint 0 — Immediate Checklist
 
 - [ ] 이 문서 전체 사용자 검토
-- [ ] MVP 입력 채널 결정
-- [ ] MVP Executor 결정
+- [x] MVP 입력 채널을 GitHub Issues로 결정
+- [x] MVP primary automated Executor를 self-hosted Claude Code worker로 결정
 - [ ] 공개 저장소에 노출하면 안 되는 개인 정보 제거
-- [ ] Notion 문서를 Markdown으로 GitHub에 옮길 방법 결정
-- [ ] Codex Cloud PR 실험 수행
-- [ ] 첫 GitHub Issue 세트 생성
+- [x] GitHub Markdown canonical / Notion optional mirror 결정
+- [ ] worker trigger, server hosting, network egress 결정
+- [ ] 첫 Atlas Task Issue 세트 생성
+- [ ] self-hosted Claude Code worker 문서 Task PR 실험 수행
 
 ## Definition of Done for Every Task
 

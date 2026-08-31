@@ -4,6 +4,8 @@
 >
 > 출처: [07. Existing Systems Research Plan](https://app.notion.com/p/3cd9f036b3078134a5b6fa7fbb928b3d) (2026-08-31 동기화)
 
+> 현재 실행 전략: [ADR-003](../adr/0003-initial-execution-environment.md)에 따라 self-hosted Claude Code worker가 primary automated executor이고 Codex Cloud는 manual/secondary입니다. 아래 항목은 남은 Build/Adopt 검증 계획입니다.
+
 ## Research Objective
 
 이미 해결된 실행·코딩 기능은 재구현하지 않고, Atlas의 차별 영역인 프로젝트 컨텍스트, 멀티 Executor 라우팅, 사용량 인식, 모바일 운영에 집중합니다.
@@ -36,11 +38,11 @@ repository map, git-native workflow, 편집 방식을 검토합니다.
 
 ### Codex Cloud
 
-모바일/클라우드 Task 실행, GitHub PR 전달, Plus 사용량 제약, API 연동 가능 범위를 검토합니다.
+manual/secondary Task 실행, GitHub PR 전달, 사용량 제약, fallback 연동 가능 범위를 검토합니다. primary automated path로 평가하지 않습니다.
 
 ### Claude Code
 
-remote control, hooks, subagents, MCP, Git worktree 운용, 구독 사용량 제약을 검토합니다.
+always-available server의 self-hosted worker를 전제로 invocation, hooks, Git worktree, timeout/cancel, 인증, 구독 사용량, process supervision을 검토합니다.
 
 ### OpenCode / Goose / Roo Code
 
@@ -64,7 +66,7 @@ tool 연결 표준으로 사용하되 MVP에 반드시 필요한지 구분합니
 | Context Builder | Build | Atlas 핵심 차별점 |
 | Router/Scheduler | Build | 구독 가용성·역할 기반 배정 |
 | Vector memory | Defer | MVP에 과도함 |
-| Mobile UI | Adopt first | GitHub Issue 또는 Telegram 활용 |
+| Mobile UI | Adopt | GitHub Issues와 기존 Atlas Task Issue Form 사용 |
 
 이 표는 조사 전 가설이며 최종 Build/Adopt 결정이 아닙니다.
 
@@ -85,10 +87,10 @@ tool 연결 표준으로 사용하되 MVP에 반드시 필요한지 구분합니
 - [ ] OpenHands 기술 문서와 저장소 분석
 - [ ] SWE-agent architecture 분석
 - [ ] Aider repo map 방식 분석
-- [ ] Codex Cloud E2E PR 생성 실험
-- [ ] Claude Code remote workflow 실험
+- [ ] Codex Cloud manual/secondary PR 생성 실험
+- [ ] self-hosted Claude Code worker Issue → PR 실험
 - [ ] OpenCode/Goose 비교
 - [ ] LangGraph와 Temporal 비교
 - [ ] MCP 도입 시점 결정
 - [ ] 결과 비교표 완성
-- [ ] ADR: Initial Execution Strategy 작성
+- [x] ADR: Initial Execution Strategy Accepted
