@@ -2,13 +2,26 @@
 
 Atlas는 사람이 휴대전화에서 업무를 지시하면 여러 AI 개발 에이전트가 올바른 프로젝트 컨텍스트를 불러오고, 격리된 환경에서 작업하고, 검증 가능한 결과와 Pull Request를 생성하도록 조율하는 AI Workforce Operating System입니다.
 
-> **현재 단계:** Sprint 0 — Foundation & Product Definition
+> **현재 작업 단계:** Sprint 1 — AI Development Foundation
 >
-> 이 저장소는 현재 제품 정의와 설계 문서만 포함합니다. 프로덕션 코드는 아직 구현하지 않습니다.
+> 이 저장소는 현재 제품 정의, 실행 계약, 기여 거버넌스만 포함합니다. 프로덕션 코드는 아직 구현하지 않습니다.
 
 ## 핵심 MVP
 
 휴대전화에서 작업을 지시하면 원격 실행 환경의 에이전트가 올바른 프로젝트 컨텍스트를 사용하여 별도 브랜치에서 작업하고, 테스트 결과가 포함된 Pull Request를 생성합니다. `main` 반영은 항상 사람의 승인을 거칩니다.
+
+## Getting Started
+
+Atlas에 기여하는 사람과 AI Agent는 application stack을 먼저 만들지 않고 문서와 Task contract에서 시작합니다.
+
+1. 저장소 전체 작업 규칙인 [AGENTS.md](AGENTS.md)를 읽습니다.
+2. [Constitution](docs/constitution.md), [PRD](docs/prd.md), [Architecture](docs/architecture.md), [Security & Governance](docs/security-governance.md)를 순서대로 읽습니다.
+3. [Task Schema](docs/specs/task-schema.md)에 맞춰 [Atlas Task Issue Form](.github/ISSUE_TEMPLATE/atlas-task.yml)으로 Objective, Constraints, Acceptance Criteria, Allowed Scope를 작성합니다.
+4. 적용되는 [ADR](docs/adr/README.md)의 상태를 확인합니다. `Proposed`는 확정된 구현 근거가 아닙니다.
+5. Task 전용 branch에서 작업하고 [PR template](.github/pull_request_template.md)에 변경 파일, 검증, 위험, open question을 기록합니다.
+6. 사람의 검토와 승인 전에는 `main`에 merge하지 않습니다.
+
+현재 단계에서는 별도 설치나 실행 명령이 없습니다. 언어, framework, database, deployment 환경은 Accepted ADR과 명시적인 구현 Task 없이 선택하지 않습니다.
 
 ## 왜 Atlas인가
 
@@ -30,7 +43,7 @@ Atlas는 사람이 휴대전화에서 업무를 지시하면 여러 AI 개발 �
 7. Atlas가 PR과 모바일용 결과 요약을 생성합니다.
 8. 사용자가 승인, 수정 요청, 폐기를 선택합니다.
 
-## 문서
+## 핵심 문서
 
 - [제품 비전](docs/vision.md)
 - [프로젝트 헌법](docs/constitution.md)
@@ -43,6 +56,38 @@ Atlas는 사람이 휴대전화에서 업무를 지시하면 여러 AI 개발 �
 - [기존 시스템 조사 계획](docs/research/existing-systems.md)
 - [로드맵, Epic과 백로그](docs/roadmap.md)
 - [ADR 등록부와 미해결 결정](docs/adr/README.md)
+
+### 실행 계약
+
+- [Task Schema](docs/specs/task-schema.md)
+- [Task State Machine](docs/specs/task-state-machine.md)
+- [GitHub Issue Command Contract](docs/specs/issue-command-contract.md)
+- [Pull Request Output Contract](docs/specs/pr-output-contract.md)
+
+## Repository Structure
+
+```text
+atlas/
+├── AGENTS.md                         # AI Agent 작업·리뷰·보안 규칙
+├── README.md                         # 프로젝트 진입점과 문서 지도
+├── .github/
+│   ├── ISSUE_TEMPLATE/
+│   │   └── atlas-task.yml            # 구조화된 Atlas Task 입력
+│   └── pull_request_template.md      # PR 결과와 검증 보고 형식
+└── docs/
+    ├── constitution.md               # 저장소의 최상위 운영 원칙
+    ├── prd.md                        # 목표, 범위, 요구사항, 성공 조건
+    ├── architecture.md               # 컴포넌트, 데이터, 상태 개요
+    ├── context-memory.md             # 컨텍스트 packet과 memory 정책
+    ├── agents-router-scheduler.md    # 역할, capability, routing 정책
+    ├── mobile-workflow.md            # 모바일 Task와 review 흐름
+    ├── security-governance.md        # 격리, 권한, 승인, 위협 모델
+    ├── specs/                         # 구현과 channel이 따라야 할 정규 계약
+    ├── adr/                           # 결정, 대안, 영향, 후속 작업
+    └── research/                      # 외부 시스템 조사와 Build/Adopt 근거
+```
+
+`docs/specs/`를 추가해 실행 가능한 계약을 제품 방향 문서와 분리했고, 기존 문서 경로는 이동하지 않아 링크 호환성을 유지합니다. ADR placeholder는 인덱스를 유지한 채 `docs/adr/0001-*.md`부터 `0007-*.md`까지 독립 문서로 확장했습니다.
 
 ## 설계 원칙
 
