@@ -11,10 +11,12 @@ Atlas는 여러 Executor의 capability, online 상태, 비용, 구독 잔여량�
 ## Proposed Decision
 
 - availability의 정규 상태는 `available`, `limited`, `exhausted`, `unknown`, `offline`입니다.
-- 공식 API가 없으면 사람이 상태와 유효 기간을 입력할 수 있습니다.
-- 인증 실패, quota 오류, timeout 같은 실행 결과는 상태 변경 후보 signal로 사용하되 원문 credential 정보를 저장하지 않습니다.
+- 공식 API가 없으면 사람이 rolling five-hour window, weekly state, reset time, remaining estimate와 유효 기간을 입력할 수 있습니다.
+- record는 `usage_window_type`, `resets_at`, `weekly_state`, `remaining_estimate`, `availability_source`, `last_usage_failure`를 구분합니다.
+- configured reset time, execution success/failure, usage-exhausted 오류를 상태 변경 후보 signal로 사용하되 원문 credential 정보를 저장하지 않습니다.
 - `unknown`은 `available`과 같게 취급하지 않고 보수적인 routing 또는 사람 확인을 요구합니다.
 - 자동 retry는 기본 1회이며 인증·quota 오류는 다른 Adapter로 재라우팅하는 후보가 됩니다.
+- 공식 API가 제공하지 않는 remaining quota를 정확한 자동 측정값으로 주장하지 않습니다.
 
 ## Alternatives Considered
 
@@ -39,6 +41,7 @@ Atlas는 여러 Executor의 capability, online 상태, 비용, 구독 잔여량�
 - 사용자가 수동 상태를 갱신해야 할 수 있습니다.
 - Router는 capability 외에 freshness와 confidence를 고려해야 합니다.
 - 정확한 비용 최적화는 후속 단계로 남습니다.
+- 정상 execution은 reachability 근거일 뿐 precise remaining quota의 근거가 아닙니다.
 
 ## Security Impact
 
@@ -49,6 +52,7 @@ Atlas는 여러 Executor의 capability, online 상태, 비용, 구독 잔여량�
 ## Follow-up Tasks
 
 - [ ] Project owner가 수동 상태 허용 기준을 승인
-- [ ] availability record와 TTL schema 정의
+- [x] availability와 usage record 초안 작성: [Usage and Availability Specification](../specs/usage-availability.md)
+- [ ] availability record TTL과 source precedence 확정
 - [ ] 오류 → 상태 signal mapping 작성
 - [ ] routing fallback acceptance test 정의

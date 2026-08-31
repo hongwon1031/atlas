@@ -30,6 +30,9 @@ Follow-up Tasks
 | [ADR-005: Project Memory Storage](0005-project-memory-storage.md) | Proposed | Git canonical 문서와 별도 운영 상태 저장 제안 |
 | [ADR-006: Agent Availability and Usage](0006-agent-availability-and-usage.md) | Proposed | 수동 availability와 실패 signal 결합 제안 |
 | [ADR-007: Public Repository Security Policy](0007-public-repository-security-policy.md) | Proposed | 공개 가능 설계와 민감 운영 정보 분리 제안 |
+| [ADR-008: Initial GitHub Event Ingestion](0008-initial-github-event-ingestion.md) | Proposed | Initial MVP polling-first, webhook deferred 제안 |
+| [ADR-009: Worker Process Supervision](0009-worker-process-supervision.md) | Proposed | tmux PoC, stable systemd 또는 Docker 전환 제안 |
+| [ADR-010: Task Execution Isolation](0010-task-execution-isolation.md) | Proposed | Task별 branch, worktree/clone, process, Run, log 격리 제안 |
 
 ## Status Definitions
 
@@ -50,9 +53,11 @@ Follow-up Tasks
 ## Open Decisions Requiring User Input
 
 1. Atlas의 초기 개발 언어
-2. Control Plane과 worker의 배포 위치 및 process model
-3. GitHub Issue 감지를 webhook으로 할지 polling으로 할지
-4. self-hosted Claude Code worker의 인증 방식과 계정 사용 기준
-5. Codex Cloud secondary fallback을 자동화할지 사람 배정으로만 둘지
-6. 공개 저장소에서 공개할 설계 범위
-7. network egress, secret scanning, branch protection의 구체적인 정책
+2. always-available server의 hosting 위치
+3. ADR-008의 polling interval, backoff, rate-limit, production scaling policy
+4. ADR-009의 stable supervisor로 systemd와 Docker 중 무엇을 선택할지
+5. self-hosted Claude Code worker의 인증 방식과 account 사용 기준
+6. Task claim lease duration, heartbeat, restart recovery, artifact retention 기본값
+7. Codex Cloud automated invocation feasibility와 secondary fallback 정책
+8. 공개 저장소에서 공개할 설계 범위
+9. network egress, secret scanning, branch protection의 구체적인 정책

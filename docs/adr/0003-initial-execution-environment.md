@@ -16,7 +16,7 @@ Atlas는 개인 PC가 꺼져 있어도 GitHub Issue를 처리할 수 있어야 �
 - Claude Code worker는 Task별 독립 workspace와 branch를 사용하고 validation 후 PR을 생성합니다. `main` write와 merge 권한은 갖지 않습니다.
 - Codex Cloud는 사람이 직접 전달해 사용하는 manual executor 또는 primary worker가 사용할 수 없을 때 선택하는 secondary executor로 유지합니다. MVP의 자동 primary path로 간주하지 않습니다.
 - Atlas core는 provider-neutral Executor Adapter 계약에 의존하며 Claude Code invocation 세부사항은 Adapter와 worker boundary 안에 격리합니다.
-- server의 hosting provider와 위치, webhook 또는 polling trigger, worker process model은 후속 구현 결정으로 남깁니다.
+- server의 hosting provider와 위치는 후속 결정입니다. [ADR-008](0008-initial-github-event-ingestion.md)은 polling-first trigger를, [ADR-009](0009-worker-process-supervision.md)은 tmux PoC와 stable supervisor 전환을, [ADR-010](0010-task-execution-isolation.md)은 Task별 runtime 격리를 각각 `Proposed`로 제안하며 아직 Accepted 구현 근거가 아닙니다.
 - credential, filesystem, network, timeout, update 경계가 구현·검증되기 전에는 worker가 고위험 Task를 실행하지 않습니다.
 
 ## Alternatives Considered
@@ -62,7 +62,9 @@ Atlas는 개인 PC가 꺼져 있어도 GitHub Issue를 처리할 수 있어야 �
 ## Follow-up Tasks
 
 - [x] Project owner가 self-hosted Claude Code worker primary / Codex Cloud manual-secondary 결정을 승인
-- [ ] worker trigger로 webhook과 polling 중 하나를 결정
+- [ ] ADR-008 polling-first trigger 제안 검토
+- [ ] ADR-009 worker process supervision 제안 검토
+- [ ] ADR-010 Task execution isolation 제안 검토
 - [ ] always-available server의 hosting 위치와 운영 책임 정의
 - [ ] provider-neutral Executor Adapter interface 작성
 - [ ] Claude Code invocation, timeout, cancel, redaction contract 작성

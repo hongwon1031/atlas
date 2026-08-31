@@ -18,6 +18,7 @@ Pull Request만 읽어도 Reviewer가 다음을 판단할 수 있어야 합니�
 
 - PR base는 Task가 승인한 default branch이며 MVP에서는 `main`입니다.
 - head는 하나의 Task만을 위한 독립 branch입니다.
+- automated Run은 dedicated worktree/clone과 executor process를 사용하며 여러 Run이 head branch를 동시에 수정하지 않습니다.
 - AI는 `main`에 직접 push하거나 PR을 merge하지 않습니다.
 - PR은 최소 한 개의 검토 가능한 commit을 포함합니다.
 - 검증이 끝나지 않았으면 Draft PR로 표시하고 Ready라고 주장하지 않습니다.
@@ -112,6 +113,7 @@ Pull Request만 읽어도 Reviewer가 다음을 판단할 수 있어야 합니�
 ```yaml
 task_id: ATLAS-0001
 run_id: run-0001
+previous_run_id: null
 agent_role: Implementer
 executor_adapter: claude_code_self_hosted
 workflow_mode: automated

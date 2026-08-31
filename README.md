@@ -2,13 +2,13 @@
 
 Atlas는 사람이 휴대전화에서 업무를 지시하면 여러 AI 개발 에이전트가 올바른 프로젝트 컨텍스트를 불러오고, 격리된 환경에서 작업하고, 검증 가능한 결과와 Pull Request를 생성하도록 조율하는 AI Workforce Operating System입니다.
 
-> **현재 작업 단계:** Initial Operating Model Accepted — 다음 단계는 self-hosted Claude Code worker의 최소 Issue-to-PR 세로 단면입니다.
+> **현재 작업 단계:** In Progress — architecture와 operations contract를 문서화했으며 자동 worker는 아직 구현하지 않았습니다.
 >
 > 이 저장소는 현재 제품 정의, 실행 계약, 기여 거버넌스만 포함합니다. worker, webhook, polling, Claude Code invocation, GitHub automation, application code는 아직 구현하지 않았습니다.
 
 ## 핵심 MVP
 
-휴대전화에서 GitHub Issue로 작업을 지시하면 Atlas worker가 Task를 검증하고 claim한 뒤, always-available server의 self-hosted Claude Code worker가 올바른 프로젝트 컨텍스트를 사용해 별도 브랜치에서 작업하고, validation 결과가 포함된 Pull Request를 생성합니다. `main` 반영은 항상 사람의 승인을 거칩니다.
+Target MVP는 휴대전화에서 GitHub Issue로 작업을 지시하면 Atlas worker가 Task를 검증하고 claim한 뒤, always-available server의 self-hosted Claude Code worker가 올바른 프로젝트 컨텍스트를 사용해 별도 브랜치에서 작업하고, validation 결과가 포함된 Pull Request를 생성하는 것을 목표로 합니다. `main` 반영은 항상 사람의 승인을 거칩니다.
 
 ## Getting Started
 
@@ -23,6 +23,20 @@ Atlas에 기여하는 사람과 AI Agent는 application stack을 먼저 만들�
 
 현재 단계에서는 별도 설치나 실행 명령이 없습니다. 언어, framework, database, deployment 환경은 Accepted ADR과 명시적인 구현 Task 없이 선택하지 않습니다.
 
+## Project Status
+
+| 영역 | 상태 | 근거와 완료 조건 |
+| --- | --- | --- |
+| 초기 문서·거버넌스 foundation | Complete | Agent guide, Task/PR contract, ADR register 존재 |
+| Codex Cloud manual delivery | Proven Manually | 사람 prompt → Codex branch 변경 → Codex PR → 사람 merge |
+| Runtime·isolation·ingestion specification | In Progress | ADR-008~010은 Proposed이며 구현 전 사람 승인 필요 |
+| self-hosted Claude Code automated path | Planned | primary automated executor로 결정됐지만 invocation 미구현 |
+| Atlas-to-Codex Cloud automation | Feasibility Unverified | adapter로 표시하기 전 integration validation 필요 |
+| Polling, claim, recovery, routing, validation delivery | Not Implemented | 문서 계약만 존재 |
+| API·Gemini·local-model adapters, dedicated mobile UI | Planned | vertical slice 이후 후보 |
+
+상태 label은 `Complete`, `Proven Manually`, `In Progress`, `Planned`, `Not Implemented`, `Feasibility Unverified`만 사용합니다. 설계 결정이나 수동 성공을 구현 완료로 계산하지 않습니다.
+
 ## Accepted Operating Model
 
 - **Documentation:** GitHub Markdown이 canonical source of truth입니다. Notion은 선택적인 human-friendly mirror이며 실행 정책의 근거가 아닙니다.
@@ -31,26 +45,79 @@ Atlas에 기여하는 사람과 AI Agent는 application stack을 먼저 만들�
 - **Secondary executor:** Codex Cloud는 사람이 직접 전달하는 manual executor 또는 secondary executor로 유지합니다.
 - **Approval:** 모든 변경은 독립 branch와 PR을 사용하며 사람만 최종 merge합니다.
 
-### Current Manual Workflow
+## Current Usable Workflow
 
-현재 repository에는 Atlas worker나 GitHub automation이 없습니다.
+현재 사용 가능한 흐름은 수동 Executor delivery입니다. Atlas는 아직 Task를 자동 ingest, route, execute, recover, validate, deliver하지 않습니다.
 
-1. 사람이 Atlas Task Issue Form으로 GitHub Issue를 생성합니다.
-2. 사람이 Issue를 검토하고 선택한 Executor에게 전달합니다.
-3. Executor가 독립 branch를 만들고 작업과 검증을 수행합니다.
-4. Executor가 검증 근거가 포함된 Pull Request를 엽니다.
-5. 사람이 PR을 검토하고 merge하거나 수정을 요청합니다.
+1. 사용자가 Task를 Codex Cloud 또는 Claude Code에 수동으로 제공합니다. GitHub Issue를 만들었다면 사람이 해당 Issue를 Executor에게 전달합니다.
+2. Executor가 Task 전용 branch를 생성하거나 업데이트합니다.
+3. Executor가 작업과 가능한 검증을 수행하고 Pull Request를 엽니다.
+4. 사람이 PR을 검토하고 merge, 수정 요청, 폐기를 결정합니다.
 
-### Target MVP Workflow
+Codex Cloud에서 **사람 prompt → Codex branch 변경 → Codex PR → 사람 merge** 흐름은 수동으로 입증됐습니다. 동일 수준의 Atlas-to-Codex 자동 호출은 검증되지 않았습니다.
 
-1. 사람이 Atlas Task Issue Form으로 GitHub Issue를 생성합니다.
-2. Atlas worker가 Task Schema를 검증하고 작업을 claim합니다.
-3. self-hosted Claude Code Executor가 격리된 workspace와 branch에서 작업합니다.
-4. Validator가 project validation, scope, forbidden path, secret 검사를 실행합니다.
-5. Delivery Adapter가 결과와 검증 근거가 포함된 Pull Request를 생성합니다.
-6. 사람이 PR을 검토하고 merge하거나 수정을 요청합니다.
+## Target Automated Workflow
 
-Comment command, label trigger, webhook/polling, 자동 claim은 Target MVP 계약이며 현재 동작하지 않습니다.
+1. 사용자가 휴대전화에서 GitHub Issue를 생성합니다.
+2. Atlas worker가 Task를 parse하고 schema, permission, Project, scope를 검증합니다.
+3. Planner가 계획과 위험도를 분류하고 사람이 승인한 범위를 확인합니다.
+4. Context Builder가 Project별 context packet을 구성합니다.
+5. Router가 capability, security scope, availability에 맞는 Executor를 선택합니다.
+6. worker가 Task를 lease로 idempotent하게 claim합니다.
+7. 전용 worktree 또는 clone과 Task branch를 준비합니다.
+8. Task마다 새로운 executor process를 시작합니다.
+9. Validator가 Acceptance Criteria, project command, diff scope, forbidden path, secret을 검사합니다.
+10. Delivery Adapter가 PR과 mobile-friendly result summary를 생성합니다.
+11. 사람이 승인, 수정 요청, 취소 중 하나를 선택하고 merge를 결정합니다.
+
+Initial MVP ingestion은 [ADR-008](docs/adr/0008-initial-github-event-ingestion.md)에서 polling-first로 제안합니다. ADR이 승인되고 구현되기 전까지 comment command, label trigger, polling, webhook, 자동 claim은 동작하지 않습니다.
+
+## Executor and Model Support
+
+Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다. Planner·Researcher·Implementer·Reviewer·Validator·Reporter는 역할이며 특정 model account가 아닙니다. Claude Code, Codex Cloud, future API model, local model은 [Agent Registry](docs/specs/agent-registry.md)를 통해 교체 가능한 Executor로 취급합니다.
+
+| Executor | 상태 | 현재 의미 |
+| --- | --- | --- |
+| Codex Cloud manual | Proven Manually | 사람이 직접 prompt를 전달하는 branch-to-PR workflow |
+| self-hosted Claude Code | Planned | always-available server의 primary automated executor; invocation 미구현 |
+| Atlas-to-Codex Cloud adapter | Feasibility Unverified | integration feasibility와 control boundary 검증 필요 |
+| Claude API, OpenAI API, Gemini | Not Implemented | future provider adapters |
+| local models | Not Implemented | future local adapters |
+
+개인과 회사 account는 별도 authentication profile과 worker registration으로 표현하며 credential, usage, Project scope를 공유하지 않습니다.
+
+## Runtime and Hosting Options
+
+- Target worker는 always-available server에서 실행하므로 개인 PC가 켜져 있을 필요가 없습니다.
+- [ADR-009](docs/adr/0009-worker-process-supervision.md)은 PoC에서 `tmux` 사용을 제안합니다. tmux는 process persistence일 뿐 service manager나 Task isolation boundary가 아닙니다.
+- stable operation은 systemd 또는 Docker 중 하나를 후속 결정해 startup, restart, logging, health, lifecycle을 관리합니다.
+- [ADR-010](docs/adr/0010-task-execution-isolation.md)은 Task마다 branch, worktree/clone, executor process, Run ID, log scope, timeout, cancellation을 분리하도록 제안합니다.
+- 하나의 persistent Claude conversation, shell session, tmux pane을 여러 Task 또는 Project가 공유하지 않습니다.
+
+자세한 lifecycle, lease, recovery, cleanup 계약은 [Execution Runtime Specification](docs/specs/execution-runtime.md)을 따릅니다. 이 항목들은 현재 specification이며 server나 worker가 존재한다는 뜻이 아닙니다.
+
+## Current Limitations
+
+- polling이나 webhook ingestion이 없습니다.
+- Issue parser, 자동 schema validation, idempotent claim과 lease가 없습니다.
+- worker process supervision, persistence, heartbeat, crash recovery가 없습니다.
+- self-hosted Claude Code invocation과 Codex automated adapter가 없습니다.
+- automated context building, routing, usage detection, validation, PR delivery, mobile notification이 없습니다.
+- precise remaining quota를 자동 확인하지 않습니다. 공식 API가 없을 때는 수동 입력과 실행 signal을 사용하도록만 제안했습니다.
+- production deployment, dedicated mobile UI, fully autonomous planning은 범위 밖입니다.
+
+## Next Implementation Scope
+
+다음 Sprint는 provider invocation보다 먼저 mock executor로 worker control path를 검증합니다.
+
+1. Atlas GitHub Issue를 parse하고 validate합니다.
+2. approved 또는 queued Task를 polling합니다.
+3. 한 Task를 idempotent하게 claim합니다.
+4. 최소 Task·Run·lease·heartbeat 상태를 persist합니다.
+5. 격리된 worktree와 branch를 만듭니다.
+6. mock executor를 새 process로 호출합니다.
+7. 결과를 validate하고 draft PR을 생성합니다.
+8. self-hosted Claude Code invocation은 별도 후속 PR에서 추가합니다.
 
 ## 왜 Atlas인가
 
@@ -60,17 +127,6 @@ Comment command, label trigger, webhook/polling, 자동 claim은 Target MVP 계�
 - 모델별 가용성, 비용, 사용량과 역할 적합성을 라우팅에 반영합니다.
 - 프로젝트와 Workspace 사이의 코드, 문서, 자격증명, 기억을 격리합니다.
 - 계획, 실행, 로그, 테스트, 비용, 결과를 관찰 가능하게 만듭니다.
-
-## Target MVP Component Flow
-
-1. 사용자가 휴대전화에서 Atlas Task Issue를 생성합니다.
-2. Atlas worker가 Task를 정규화하고 위험도와 필요한 역량을 분류한 뒤 claim합니다.
-3. Context Builder가 정책, 관련 코드, 최근 Issue/PR, 테스트 정보를 수집합니다.
-4. Router가 primary self-hosted Claude Code Executor를 선택합니다. Codex Cloud는 manual/secondary 경로입니다.
-5. always-available server의 Runner가 격리된 브랜치 또는 worktree에서 작업합니다.
-6. Validator가 테스트, lint, 변경 범위, 금지 파일, 비밀정보를 검사합니다.
-7. Atlas가 PR과 모바일용 결과 요약을 생성합니다.
-8. 사용자가 승인, 수정 요청, 폐기를 선택합니다.
 
 ## 핵심 문서
 
@@ -92,6 +148,11 @@ Comment command, label trigger, webhook/polling, 자동 claim은 Target MVP 계�
 - [Task State Machine](docs/specs/task-state-machine.md)
 - [GitHub Issue Command Contract](docs/specs/issue-command-contract.md)
 - [Pull Request Output Contract](docs/specs/pr-output-contract.md)
+- [Execution Runtime](docs/specs/execution-runtime.md)
+- [Agent Registry](docs/specs/agent-registry.md)
+- [Usage and Availability](docs/specs/usage-availability.md)
+- [GitHub Event Ingestion](docs/specs/github-event-ingestion.md)
+- [Project Lifecycle](docs/specs/project-lifecycle.md)
 
 ## Repository Structure
 
@@ -111,12 +172,12 @@ atlas/
     ├── agents-router-scheduler.md    # 역할, capability, routing 정책
     ├── mobile-workflow.md            # 모바일 Task와 review 흐름
     ├── security-governance.md        # 격리, 권한, 승인, 위협 모델
-    ├── specs/                         # 구현과 channel이 따라야 할 정규 계약
-    ├── adr/                           # 결정, 대안, 영향, 후속 작업
+    ├── specs/                         # Task, runtime, registry, ingestion의 정규 계약
+    ├── adr/                           # Accepted/Proposed 결정, 대안, 영향, 후속 작업
     └── research/                      # 외부 시스템 조사와 Build/Adopt 근거
 ```
 
-`docs/specs/`를 추가해 실행 가능한 계약을 제품 방향 문서와 분리했고, 기존 문서 경로는 이동하지 않아 링크 호환성을 유지합니다. ADR placeholder는 인덱스를 유지한 채 `docs/adr/0001-*.md`부터 `0007-*.md`까지 독립 문서로 확장했습니다.
+`docs/specs/`는 실행 가능한 계약을 제품 방향 문서와 분리합니다. 기존 문서 경로는 이동하지 않아 링크 호환성을 유지하고, ADR은 인덱스와 개별 파일을 함께 관리합니다.
 
 ## 설계 원칙
 
@@ -133,16 +194,18 @@ atlas/
 - [x] GitHub Issues와 Atlas Task Issue Form을 초기 mobile intake로 승인
 - [x] self-hosted Claude Code worker를 primary automated executor로 승인
 - [x] Codex Cloud를 manual/secondary executor로 분류
-- [ ] worker trigger: webhook 또는 polling 결정
-- [ ] always-available server의 hosting 위치와 운영 policy 결정
+- [ ] ADR-008 polling-first ingestion 제안 검토
+- [ ] ADR-009 tmux PoC와 stable supervisor 전환 제안 검토
+- [ ] ADR-010 Task/Run isolation 제안 검토
+- [ ] always-available server의 hosting 위치와 stable 운영 policy 결정
 - [ ] Issue → claim → Claude Code → validation → PR E2E 구현과 검증
 
 | 영역 | 상태 | 완료 기준 |
 | --- | --- | --- |
-| 제품 정의 | 초기 운영 모델 확정 | Accepted ADR-001~003 반영 |
-| 기술 조사 | 작성 중 | 재사용 대상과 직접 구현 범위 결정 |
-| 아키텍처 | v0.2 문서화 | manual/target workflow와 worker boundary 확정 |
-| 실행 환경 | 미구현 | Issue → self-hosted Claude Code → PR E2E 성공 |
+| 제품 정의 | Complete | Accepted ADR-001~003 반영 |
+| 운영 명세 | In Progress | Proposed ADR-008~010 검토와 open question 해소 |
+| 수동 delivery | Proven Manually | Codex branch → PR → human merge 재현 |
+| 자동 실행 환경 | Not Implemented | mock vertical slice 이후 Claude Code integration 검증 |
 
 ## 문서 운영
 

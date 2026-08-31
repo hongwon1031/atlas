@@ -163,12 +163,17 @@ execution:
   selected_adapter: codex_cloud
   claim_id: null
   claimed_by: human:project-owner
+  lease_owner: null
+  lease_expires_at: null
+  active_run_id: null
 ```
 
 - Current manual workflow의 `dispatch_mode`는 `manual`이며 사람이 `selected_adapter`와 전달 시점을 기록합니다.
 - Target MVP의 `dispatch_mode`는 `worker`이며 기본 `primary_adapter`는 `claude_code_self_hosted`입니다.
 - Codex Cloud는 `manual` 또는 명시적인 secondary 선택일 때만 사용합니다. 자동 fallback은 아직 결정되지 않았습니다.
-- claim을 구현하면 `claim_id`, `claimed_by`, lease와 idempotency evidence를 함께 기록합니다.
+- claim을 구현하면 `claim_id`, `claimed_by`, `lease_owner`, `lease_expires_at`, idempotency evidence를 함께 기록합니다.
+- Run은 [Execution Runtime](execution-runtime.md)에 따라 unique Run ID, branch, worktree/clone, process, log scope, timeout, cancellation state를 별도 record로 가집니다.
+- retry Run은 새 Run ID를 사용하고 이전 Run과 failure reason을 참조합니다. Task의 Acceptance Criteria와 scope는 명시적인 revision 없이 바꾸지 않습니다.
 
 ## Complete Example
 
@@ -226,6 +231,9 @@ execution:
   selected_adapter: codex_cloud
   claim_id: null
   claimed_by: human:hongwon1031
+  lease_owner: null
+  lease_expires_at: null
+  active_run_id: null
 audit:
   created_by: github:hongwon1031
   created_at: 2026-08-31T00:00:00Z
@@ -260,6 +268,8 @@ Issue body는 신뢰되지 않은 사용자 입력입니다. Parser는 heading l
 - `secrets_deployment`는 MVP에서 자동으로 `Queued` 또는 `Running`으로 전이할 수 없습니다.
 - `forbidden_scope` 위반을 발견하면 Run을 시작하지 않거나 안전하게 중단합니다.
 - source 원문과 정규화 결과의 변경 이력을 audit event로 연결합니다.
+- 한 Task에는 동시에 하나의 active Run과 하나의 유효 claim lease만 존재합니다.
+- source Issue나 queue signal을 반복 관찰해도 같은 Task revision에 중복 Run 또는 PR을 만들지 않습니다.
 
 ## Open Questions
 
@@ -267,5 +277,5 @@ Issue body는 신뢰되지 않은 사용자 입력입니다. Parser는 heading l
 - `workspace_id`와 `project_id` registry의 정규 저장 위치
 - schema version의 호환성과 migration 정책
 - path glob 해석과 대소문자 정규화 방식
-- worker claim lease와 heartbeat 필드의 정확한 schema
-- webhook과 polling 중 어떤 source event를 canonical intake event로 사용할지
+- worker claim lease duration과 heartbeat interval
+- Proposed polling-first ingestion의 interval, backoff, approval/queue signal

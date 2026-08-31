@@ -30,13 +30,18 @@
 ## Target MVP Workflow
 
 1. 휴대전화에서 기존 Atlas Task Issue Form으로 GitHub Issue를 생성합니다.
-2. Atlas worker가 구조화 정보를 검증하고 Task를 idempotent하게 claim합니다.
-3. self-hosted Claude Code worker가 always-available server의 격리 workspace와 branch에서 실행합니다.
-4. Validator가 project test, lint, scope, forbidden path, secret 검사를 수행합니다.
-5. Delivery Adapter가 진행 상태를 Issue에 기록하고 PR을 생성합니다.
-6. 사용자가 PR에서 승인, 수정 요청, 폐기를 선택합니다.
+2. Proposed polling worker가 approved 또는 queued Issue를 찾고 구조화 정보를 parse·validate합니다.
+3. Planner가 plan과 risk를 분류하고 Context Builder가 Project context를 구성합니다.
+4. Router가 Executor를 선택하고 worker가 Task를 lease로 idempotent하게 claim합니다.
+5. worker가 전용 worktree/clone과 branch를 만들고 Task별 새 executor process를 시작합니다.
+6. self-hosted Claude Code Executor가 always-available server에서 실행합니다.
+7. Validator가 project test, lint, scope, forbidden path, secret 검사를 수행합니다.
+8. Delivery Adapter가 진행 상태, mobile result summary, PR을 생성합니다.
+9. 사용자가 승인, 수정 요청, 취소 중 하나를 선택하고 merge를 결정합니다.
 
 Codex Cloud는 사람이 직접 전달하는 manual executor 또는 secondary 경로이며 Target MVP primary path가 아닙니다.
+
+[ADR-008](adr/0008-initial-github-event-ingestion.md)의 polling-first와 [ADR-009](adr/0009-worker-process-supervision.md)의 tmux PoC는 `Proposed`입니다. polling, claim, Claude Code invocation, 자동 comment와 notification은 아직 동작하지 않습니다.
 
 ## Canonical Task Input
 
@@ -78,10 +83,16 @@ Codex Cloud는 사람이 직접 전달하는 manual executor 또는 secondary �
 - 실패와 재시도 소진
 - 승인 후 완료
 
+## Long-running Project UX
+
+Project는 product goal, context, roadmap, Epic, 여러 Task와 반복 PR을 포함할 수 있습니다. Planner는 roadmap과 Task batch를 제안할 수 있지만 사람은 실행 전에 roadmap 또는 batch를 승인합니다. MVP 모바일 흐름은 한 번에 한 Task와 한 PR만 전달하며 fully autonomous planning과 승인 없는 production deployment를 제공하지 않습니다.
+
+AI Trading은 향후 onboarding UX를 검증할 예시 Project일 뿐 Atlas에 구현된 trading 기능이 아닙니다. 정규 lifecycle은 [Project Lifecycle Specification](specs/project-lifecycle.md)을 따릅니다.
+
 ## UX Subtasks
 
 - [x] GitHub Issue Template 작성
-- [ ] Task parsing 규칙 작성
+- [x] Task parsing과 polling ingestion contract 작성
 - [ ] 상태 라벨 정의
 - [ ] Issue comment 진행 로그 포맷 작성
 - [ ] 모바일용 PR 요약 템플릿 작성
@@ -89,6 +100,8 @@ Codex Cloud는 사람이 직접 전달하는 manual executor 또는 secondary �
 - [ ] command와 label automation 구현 여부 및 권한 확정
 - [x] 초기 알림·검토 channel을 GitHub Issue/PR로 결정
 - [ ] 휴대전화 기준 E2E 사용성 테스트
+- [ ] approved/queued Task polling과 idempotent claim 구현
+- [ ] Run 결과를 redacted mobile summary로 전달
 
 ## Future UX
 
