@@ -2,6 +2,8 @@
 
 이 문서는 Atlas가 입력 채널의 자연어 요청을 실행 가능한 Task로 정규화할 때 사용하는 정규 데이터 계약을 정의합니다. 현재 문서는 구현 명세이며 특정 언어, framework, database schema를 선택하지 않습니다.
 
+[ADR-002](../adr/0002-initial-mobile-task-channel.md)에 따라 canonical intake는 GitHub Issues의 Atlas Task Issue Form입니다. Current manual workflow에서는 사람이 form을 확인하고 Executor에게 전달합니다. Target MVP에서는 Atlas worker가 같은 schema를 검증하고 claim합니다.
+
 ## 설계 목표
 
 - 모든 Run이 하나의 Workspace와 Project에 명확히 속하도록 합니다.
@@ -34,6 +36,7 @@
 - 위험 분류와 필요한 capability
 - 적용 정책과 컨텍스트 출처
 - 전달 브랜치와 승인 요구사항
+- current/target dispatch mode와 선택된 Executor policy
 
 ## Canonical Fields
 
@@ -59,6 +62,7 @@
 | `context_refs` | object[] | ContextReady 전 | source, revision, selection reason, trust level |
 | `validation_plan` | object[] | Intake | 검사 ID, 종류, 필수 여부, 성공 조건 |
 | `delivery` | object | Planned 전 | base branch, PR 요구 여부, 승인 정책 |
+| `execution` | object | Planned 전 | dispatch mode, primary/selected Adapter, claim 정보 |
 | `audit` | object | 생성 | 생성·수정 actor와 timestamp, correlation ID |
 
 ## Risk Level
@@ -150,6 +154,22 @@ context_refs:
 
 Context에는 secret 원문, 전체 인증 로그, 다른 Project의 자료를 넣지 않습니다.
 
+## Execution Policy
+
+```yaml
+execution:
+  dispatch_mode: manual
+  primary_adapter: claude_code_self_hosted
+  selected_adapter: codex_cloud
+  claim_id: null
+  claimed_by: human:project-owner
+```
+
+- Current manual workflow의 `dispatch_mode`는 `manual`이며 사람이 `selected_adapter`와 전달 시점을 기록합니다.
+- Target MVP의 `dispatch_mode`는 `worker`이며 기본 `primary_adapter`는 `claude_code_self_hosted`입니다.
+- Codex Cloud는 `manual` 또는 명시적인 secondary 선택일 때만 사용합니다. 자동 fallback은 아직 결정되지 않았습니다.
+- claim을 구현하면 `claim_id`, `claimed_by`, lease와 idempotency evidence를 함께 기록합니다.
+
 ## Complete Example
 
 ```yaml
@@ -200,6 +220,12 @@ delivery:
   base_branch: main
   pull_request_required: true
   human_merge_approval_required: true
+execution:
+  dispatch_mode: manual
+  primary_adapter: claude_code_self_hosted
+  selected_adapter: codex_cloud
+  claim_id: null
+  claimed_by: human:hongwon1031
 audit:
   created_by: github:hongwon1031
   created_at: 2026-08-31T00:00:00Z
@@ -228,6 +254,7 @@ Issue body는 신뢰되지 않은 사용자 입력입니다. Parser는 heading l
 ## Invariants
 
 - 하나의 Task는 정확히 하나의 `workspace_id`, `project_id`, `repository`에 속합니다.
+- 초기 source channel은 `github_issue`이며 Issue body는 신뢰되지 않은 입력입니다.
 - `main`은 delivery base일 수 있지만 AI의 직접 write target일 수 없습니다.
 - 모든 Acceptance Criterion은 실행 결과에서 evidence 또는 명시적인 미충족 상태를 가집니다.
 - `secrets_deployment`는 MVP에서 자동으로 `Queued` 또는 `Running`으로 전이할 수 없습니다.
@@ -240,3 +267,5 @@ Issue body는 신뢰되지 않은 사용자 입력입니다. Parser는 heading l
 - `workspace_id`와 `project_id` registry의 정규 저장 위치
 - schema version의 호환성과 migration 정책
 - path glob 해석과 대소문자 정규화 방식
+- worker claim lease와 heartbeat 필드의 정확한 schema
+- webhook과 polling 중 어떤 source event를 canonical intake event로 사용할지

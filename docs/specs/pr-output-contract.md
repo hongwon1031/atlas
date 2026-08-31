@@ -2,6 +2,8 @@
 
 이 문서는 Atlas Agent가 사람에게 전달하는 Pull Request의 최소 품질과 정보 계약을 정의합니다. `.github/pull_request_template.md`는 이 계약의 작성 인터페이스이며, 이 문서가 의미의 정규 정의입니다.
 
+이 계약은 Current manual workflow와 Target MVP 모두에 적용됩니다. 현재는 사람이 Issue를 Executor에게 전달하고 Executor가 PR을 엽니다. Target MVP에서는 self-hosted Claude Code worker와 Delivery Adapter가 같은 계약으로 PR을 생성합니다.
+
 ## Purpose
 
 Pull Request만 읽어도 Reviewer가 다음을 판단할 수 있어야 합니다.
@@ -44,6 +46,8 @@ Pull Request만 읽어도 Reviewer가 다음을 판단할 수 있어야 합니�
 - Objective와 사용자에게 제공되는 결과
 - 3~5개의 핵심 변경
 - application code, dependency, CI, infrastructure 변경 여부
+- workflow mode: `manual` 또는 `automated`
+- 실제 Executor와 Adapter; Target MVP primary는 `claude_code_self_hosted`, Codex Cloud는 manual/secondary
 
 ### Scope
 
@@ -109,13 +113,16 @@ Pull Request만 읽어도 Reviewer가 다음을 판단할 수 있어야 합니�
 task_id: ATLAS-0001
 run_id: run-0001
 agent_role: Implementer
-executor_adapter: codex
+executor_adapter: claude_code_self_hosted
+workflow_mode: automated
 base_sha: <sha>
 head_sha: <sha>
 started_at: <timestamp>
 completed_at: <timestamp>
 validation_summary: <artifact-uri>
 ```
+
+Target MVP primary 예시의 `executor_adapter` 값은 `claude_code_self_hosted`입니다. Codex Cloud로 수동 수행한 PR은 `workflow_mode: manual`, `executor_adapter: codex_cloud`로 사실대로 기록합니다.
 
 비용과 token 사용량은 비밀정보가 아니고 정확히 측정할 수 있을 때만 요약합니다.
 
@@ -137,7 +144,7 @@ validation_summary: <artifact-uri>
 
 ## Failure Delivery
 
-PR을 만들 수 없으면 Delivery Adapter는 연결된 Issue에 다음을 보고합니다.
+Current manual workflow에서 PR을 만들 수 없으면 Executor가 연결된 Issue 또는 사람에게 다음을 보고합니다. Target MVP에서는 Delivery Adapter가 같은 내용을 Issue에 기록합니다.
 
 - 실패한 단계와 분류된 원인
 - 실행한 검증과 마지막 안전 상태
@@ -152,3 +159,4 @@ PR을 만들 수 없으면 Delivery Adapter는 연결된 Issue에 다음을 보�
 - automated Run metadata를 PR body와 별도 artifact 중 어디에 둘지
 - commit signature와 provenance attestation을 MVP에 포함할지
 - Reviewer approval 뒤 head 변경 시 자동 dismiss 정책을 branch protection으로 강제할지
+- manual Run과 automated Run의 metadata 필수 수준을 다르게 둘지

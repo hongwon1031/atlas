@@ -1,9 +1,22 @@
 # GitHub Issue Command Contract v0.1
 
-이 문서는 GitHub Issue를 Atlas의 초기 모바일 Task channel로 사용할 때 comment와 label이 Task 상태를 변경하는 규칙을 정의합니다. ADR-002가 Accepted되기 전까지 이 계약은 Proposed MVP 명세입니다.
+이 문서는 GitHub Issue를 Atlas의 초기 모바일 Task channel로 사용할 때 comment와 label이 Task 상태를 변경하는 Target MVP 규칙을 정의합니다. [ADR-002](../adr/0002-initial-mobile-task-channel.md)는 GitHub Issues와 기존 Atlas Task Issue Form을 Accepted intake로 확정했습니다.
+
+이 계약의 command와 label automation은 아직 구현되지 않았습니다. Current manual workflow에서 `/atlas` comment나 `atlas:*` label은 실행을 시작하지 않습니다.
+
+## Current Manual Workflow
+
+1. 사람이 Atlas Task Issue Form으로 Issue를 생성합니다.
+2. 사람이 Task 필드와 권한을 확인합니다.
+3. 사람이 Issue URL과 지시를 선택한 Executor에게 전달합니다.
+4. Executor가 branch, 작업, 검증, PR을 수행합니다.
+5. 사람과 Executor가 필요한 상태를 Issue/PR comment로 직접 기록합니다.
+
+자동 처리로 오인되지 않도록 command를 현재 운영 절차의 필수 단계로 요구하지 않습니다.
 
 ## Goals
 
+- Target MVP에서 Atlas worker가 처리할 command contract를 고정합니다.
 - 휴대전화에서 짧고 예측 가능한 명령으로 Task를 제어합니다.
 - GitHub permission과 Atlas policy를 모두 확인합니다.
 - 중복 webhook과 comment 재전송에도 같은 결과를 반환합니다.
@@ -21,6 +34,8 @@
 
 ## Commands
 
+다음 command는 Target MVP worker가 구현된 뒤에만 효력이 있습니다.
+
 | Command | 허용 상태 | 결과 |
 | --- | --- | --- |
 | `/atlas status` | 모든 상태 | 현재 Task, Run, 필요한 사람 action 요약 |
@@ -33,6 +48,8 @@
 여러 줄의 수정 지시는 첫 줄을 `/atlas revise`로 쓰고 다음 줄부터 본문으로 제공할 수 있습니다. 명령 이름 뒤와 후속 본문을 합친 값이 비어 있으면 거부합니다.
 
 ## Label Trigger
+
+다음 규칙은 Target MVP에 적용됩니다. 현재 label 추가는 Task를 claim하거나 Executor를 호출하지 않습니다.
 
 `atlas:queued` label 추가는 `/atlas queue`와 같은 의도를 나타냅니다. 다음 조건을 모두 충족할 때만 transition을 수행합니다.
 
@@ -100,11 +117,11 @@ Atlas는 모든 명령 comment에 하나의 구조화된 응답을 남깁니다.
 - `atlas:cancelled`
 - `atlas:completed`
 
-이 Sprint는 label을 생성하거나 automation을 구현하지 않습니다.
+현재 repository는 label automation을 구현하지 않았습니다.
 
 ## Notification Rules
 
-다음 사건에는 Issue comment 또는 연결된 모바일 notification이 필요합니다.
+Target MVP에서 다음 사건에는 Issue comment 또는 연결된 모바일 notification이 필요합니다. Current manual workflow에서는 사람이 필요한 comment와 PR link를 기록합니다.
 
 - Task 접수와 정규화 결과
 - 사용자 질문 필요
@@ -130,3 +147,4 @@ Atlas는 모든 명령 comment에 하나의 구조화된 응답을 남깁니다.
 - Issue author에게 제한적인 `cancel` 권한을 허용할지
 - label set을 repository bootstrap 과정에서 자동 생성할지
 - 장문의 revision instruction에 별도 form 또는 attachment가 필요한지
+- worker가 Issue를 webhook과 polling 중 어떤 방식으로 감지할지

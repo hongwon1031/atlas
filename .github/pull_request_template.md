@@ -2,6 +2,8 @@
 
 - Issue:
 - Task ID:
+- Workflow mode: `manual` / `automated`
+- Executor / Adapter:
 
 ## Summary
 
