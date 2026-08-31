@@ -1,0 +1,135 @@
+name: Atlas Task
+description: Atlas가 계획하고 실행할 수 있는 구조화된 작업을 제안합니다.
+title: "[Atlas Task] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Atlas Task는 목표, 범위, 완료 조건이 명확해야 합니다. 비밀정보나 회사 내부 자료를 입력하지 마세요.
+
+  - type: input
+    id: project
+    attributes:
+      label: Project
+      description: 작업 대상 Project를 입력하세요.
+      placeholder: atlas
+      value: atlas
+    validations:
+      required: true
+
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: 달성하려는 결과를 한 가지 검증 가능한 목표로 설명하세요.
+      placeholder: 사용자가 얻게 될 결과와 해결할 문제를 작성하세요.
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: 기술, 일정, 호환성, 보안, 비목표 등의 제약을 작성하세요.
+      placeholder: |
+        - 문서만 변경
+        - application code와 dependency 추가 금지
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: 완료 여부를 판단할 수 있는 체크리스트를 작성하세요.
+      placeholder: |
+        - [ ] 요구 문서가 생성됐다.
+        - [ ] 링크와 형식 검증이 통과했다.
+    validations:
+      required: true
+
+  - type: textarea
+    id: allowed_scope
+    attributes:
+      label: Allowed Scope
+      description: 변경해도 되는 경로와 작업 유형을 명시하세요.
+      placeholder: |
+        - AGENTS.md
+        - .github/**
+        - docs/**
+    validations:
+      required: true
+
+  - type: textarea
+    id: forbidden_scope
+    attributes:
+      label: Forbidden Scope
+      description: 반드시 제외할 경로, 시스템, 작업을 명시하세요.
+      placeholder: |
+        - application code
+        - secrets/**
+        - production deployment
+    validations:
+      required: true
+
+  - type: dropdown
+    id: risk_level
+    attributes:
+      label: Risk Level
+      description: 가장 높은 관련 위험 수준을 선택하세요.
+      options:
+        - read_only
+        - documentation
+        - code
+        - dependency
+        - ci_infrastructure
+        - secrets_deployment
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - low
+        - normal
+        - high
+        - urgent
+      default: 1
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: 실행해야 할 테스트, 검사, 사람 검토를 작성하세요.
+      placeholder: Markdown 형식 검사, 링크 확인, 변경 범위 확인
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and References
+      description: 관련 문서, ADR, Issue, PR 링크와 필요한 배경을 작성하세요.
+      placeholder: docs/prd.md, docs/adr/0002-initial-mobile-task-channel.md
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Risk / Notes
+      description: 알려진 위험, 미해결 질문, Reviewer가 집중할 부분을 작성하세요.
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Safety Confirmations
+      options:
+        - label: 이 Task에는 secret, 개인정보, 회사 내부 정보가 포함되지 않았습니다.
+          required: true
+        - label: AI가 `main`에 직접 push하거나 merge해서는 안 된다는 점을 확인했습니다.
+          required: true
+        - label: 완료 조건과 허용 범위를 사람이 검토할 수 있을 만큼 구체적으로 작성했습니다.
+          required: true
