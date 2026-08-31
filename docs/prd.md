@@ -47,8 +47,9 @@ Atlas는 모바일에서 받은 개발 지시를 프로젝트 단위의 실행 �
 
 - Workspace 1개, Project 1개 등록
 - GitHub 저장소 연결
-- 모바일 친화적 Task 생성 인터페이스
-- 단일 기본 Executor(Codex Cloud 또는 선택된 원격 코딩 에이전트)
+- GitHub Issues의 Atlas Task Form을 사용하는 모바일 친화적 Task 생성 인터페이스
+- primary automated Executor: always-available server의 self-hosted Claude Code worker
+- manual/secondary Executor: Codex Cloud
 - 정적 규칙 기반 Context Builder
 - 별도 브랜치 생성, 파일 수정, 테스트 실행, PR 생성
 - 작업 상태와 결과 요약
@@ -61,13 +62,22 @@ Atlas는 모바일에서 받은 개발 지시를 프로젝트 단위의 실행 �
 - 사용량 API가 없는 서비스의 완전 자동 잔여량 탐지
 - Notion ↔ GitHub 양방향 실시간 동기화
 
-## Primary User Flow
+## Current Manual Workflow
 
-1. 사용자가 휴대전화에서 Project와 작업 내용을 선택합니다.
-2. Atlas가 Task를 정규화하고 위험도와 필요 역량을 분류합니다.
+1. 사용자가 GitHub Issue의 Atlas Task Form으로 Task를 등록합니다.
+2. 사람이 Task를 검토하고 선택한 Executor에게 전달합니다.
+3. Executor가 별도 branch에서 작업·검증하고 PR을 생성합니다.
+4. 사람이 PR을 검토하고 merge하거나 수정을 요청합니다.
+
+자동 worker, claim, validation, GitHub delivery는 아직 구현되지 않았습니다.
+
+## Target MVP User Flow
+
+1. 사용자가 휴대전화에서 GitHub Issue의 Atlas Task Form으로 작업을 생성합니다.
+2. Atlas worker가 Task를 정규화하고 위험도와 필요 역량을 분류한 뒤 claim합니다.
 3. Context Builder가 정책 문서, 관련 코드, 최근 Issue/PR, 테스트 정보를 수집합니다.
-4. Router가 사용 가능한 Executor를 선택합니다.
-5. Runner가 격리된 브랜치 또는 Workspace에서 작업합니다.
+4. Router가 primary self-hosted Claude Code Executor를 선택합니다.
+5. always-available server의 Runner가 격리된 branch 또는 workspace에서 작업합니다.
 6. Validator가 테스트, lint, diff 제한, 비밀정보 검사를 수행합니다.
 7. Atlas가 PR과 모바일용 결과 요약을 생성합니다.
 8. 사용자가 휴대전화에서 승인, 수정 요청, 폐기를 선택합니다.
@@ -141,7 +151,11 @@ Atlas는 모바일에서 받은 개발 지시를 프로젝트 단위의 실행 �
 
 ## Open Questions
 
-- 초기 Executor를 Codex Cloud로 고정할지, 로컬/VPS Runner를 먼저 만들지
-- 모바일 입력 채널을 GitHub Issue, Telegram, 웹 UI 중 무엇으로 시작할지
-- Claude 구독 세션의 가용성을 자동 탐지할 수 없는 경우 수동 상태 입력을 허용할지
-- Notion 문서를 실행 컨텍스트의 원본으로 둘지 GitHub 문서를 원본으로 전환할지
+- Atlas worker가 Issue를 webhook과 polling 중 어떤 방식으로 감지할지
+- always-available server의 hosting 위치와 process supervision 방식
+- self-hosted Claude Code worker의 인증 방식과 availability 확인 정책
+- Codex Cloud secondary fallback을 자동화할지 사람 배정으로만 둘지
+- Atlas의 초기 개발 언어와 Control Plane 배포 위치
+- network egress, secret scanning, branch protection의 구체적인 policy
+
+문서 원본, 초기 intake channel, primary automated Executor 결정은 각각 ADR-001, ADR-002, ADR-003에서 Accepted됐습니다.

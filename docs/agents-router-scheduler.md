@@ -2,6 +2,8 @@
 
 > 출처: [04. Agent Roles, Router & Scheduler](https://app.notion.com/p/3cd9f036b30781818330ffa40507c20d) (2026-08-31 동기화)
 
+> 실행 환경 결정: [ADR-003](adr/0003-initial-execution-environment.md) Accepted
+
 ## Role Model
 
 역할은 모델 계정과 분리합니다. 동일한 Claude 또는 Codex 실행기가 상황에 따라 Researcher, Implementer, Reviewer 역할을 수행할 수 있습니다.
@@ -62,13 +64,33 @@ capabilities:
 - 최근 성공률
 - 데이터 위치와 보안 등급
 
+## Current Manual Routing
+
+현재 Atlas Router와 Scheduler는 구현되지 않았습니다.
+
+1. 사람이 GitHub Issue의 Project, Objective, Scope, Acceptance Criteria를 확인합니다.
+2. 사람이 Issue를 Claude Code, Codex Cloud 또는 다른 선택된 Executor에게 전달합니다.
+3. Executor가 Task branch에서 작업하고 PR을 생성합니다.
+4. 사람의 재배정이 fallback routing을 대신합니다.
+
+Issue 생성, `/atlas` command, label 변경만으로 실행이 자동 시작되지는 않습니다.
+
+## Target MVP Routing
+
+1. Atlas worker가 GitHub Issue를 검증하고 idempotent claim을 획득합니다.
+2. Router는 primary `claude_code_self_hosted` Adapter를 선택합니다.
+3. self-hosted Claude Code worker가 always-available server의 격리 workspace에서 실행합니다.
+4. primary worker를 사용할 수 없으면 Task를 실패 또는 사람 확인 상태로 반환합니다.
+5. Codex Cloud는 사람이 선택하는 manual/secondary executor로 유지합니다. 자동 fallback은 별도 결정 전까지 수행하지 않습니다.
+
 ## MVP Routing Policy
 
-1. 문서·설계 작업은 기본 PM/Research Executor에 배정합니다.
-2. 코드 구현은 PR을 생성할 수 있는 Executor에 배정합니다.
-3. 다른 Executor를 사용할 수 있으면 구현과 리뷰를 분리합니다.
-4. 고위험 변경은 자동 실행을 금지하거나 사람 승인 후 실행합니다.
-5. 사용량이 불명확하면 보수적인 수동 availability 상태를 사용합니다.
+1. Target MVP의 primary automated executor는 self-hosted Claude Code worker입니다.
+2. 역할은 Executor와 분리하므로 같은 worker가 PM, Researcher, Implementer 역할을 수행할 수 있습니다.
+3. Codex Cloud는 manual/secondary executor이며 자동 primary routing 대상이 아닙니다.
+4. 다른 Executor를 사용할 수 있으면 구현과 리뷰를 분리합니다.
+5. 고위험 변경은 자동 실행을 금지하거나 사람 승인 후 실행합니다.
+6. 사용량이나 worker 상태가 불명확하면 보수적으로 실행하지 않고 사람에게 반환합니다.
 
 ## Usage State
 
@@ -82,10 +104,11 @@ capabilities:
 
 ## Fallback Policy
 
-- 1차 Executor 실패 → 동일 Executor 1회 재시도
-- 인증·사용량 오류 → 다른 Adapter로 재라우팅
-- 테스트 실패 → 동일 Task의 revision run
-- 프로젝트 불명확 → 실행 중단 후 사용자 질문
+- Current manual workflow: primary Executor 실패 시 사람이 재시도 또는 Codex Cloud를 포함한 다른 Executor로 재배정합니다.
+- Target MVP: transient Claude Code worker 실패는 동일 Executor 1회 재시도 후보입니다.
+- 인증·사용량·worker offline 오류는 자동 Codex fallback을 수행하지 않고 redacted 원인과 함께 사람에게 반환합니다.
+- 테스트 실패는 동일 Task의 revision run 후보입니다.
+- 프로젝트가 불명확하거나 claim guard가 실패하면 실행을 중단하고 사용자에게 질문합니다.
 
 ## Anti-Patterns
 
@@ -98,9 +121,10 @@ capabilities:
 
 - [ ] Role 정의 파일 포맷 설계
 - [ ] Capability taxonomy 확정
-- [ ] Agent Registry 스키마 작성
+- [ ] Agent Registry에 `claude_code_self_hosted` primary와 `codex_cloud` manual/secondary 등록
 - [ ] Availability 수동 입력 API 작성
-- [ ] 규칙 기반 Router 구현
+- [ ] primary-only 규칙 기반 Router 최소 구현
+- [ ] worker claim lease와 heartbeat 정책 구현
 - [ ] 재시도·Fallback 정책 구현
 - [ ] 동일 브랜치 동시 실행 Lock 구현
 - [ ] Reviewer 분리 정책 구현

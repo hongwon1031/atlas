@@ -69,7 +69,7 @@ Expected Output Contract
 
 ### Canonical Memory
 
-사람이 승인한 PRD, Architecture, ADR, 정책입니다. 가장 높은 신뢰도를 가집니다.
+merge된 GitHub Markdown의 Constitution, PRD, Architecture, spec, Accepted ADR, 정책입니다. 가장 높은 신뢰도를 가집니다. Notion은 선택적인 human-friendly mirror이며 GitHub와 다를 때 canonical memory를 덮어쓸 수 없습니다.
 
 ### Episodic Memory
 
