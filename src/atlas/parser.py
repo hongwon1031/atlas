@@ -95,13 +95,17 @@ def parse_issue_body(body: str) -> ParsedBody:
                 buffer.append(line)
             continue
 
-        flush()
         label = _normalize_label(heading.group(1))
         field = FIELD_LABELS.get(label)
         if field is None:
+            # 알려진 label만 section 경계입니다. 사용자가 textarea에 쓴 `###`
+            # 제목이 뒤따르는 내용을 잘라내지 않도록 값의 일부로 보존합니다.
             unknown.append(heading.group(1).strip())
-            current, buffer = None, []
+            if current is not None:
+                buffer.append(line)
             continue
+
+        flush()
         if field in sections:
             duplicates.append(heading.group(1).strip())
         current, buffer = field, []

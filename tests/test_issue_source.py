@@ -31,6 +31,23 @@ class ErrorClassificationTest(unittest.TestCase):
         error = self.classify(403, {"X-RateLimit-Remaining": "0"})
         self.assertEqual(error.category, "rate_limited")
 
+    def test_429_is_rate_limited_even_without_ratelimit_header(self):
+        """secondary rate limit 응답은 X-RateLimit-Remaining을 포함하지 않습니다."""
+
+        self.assertEqual(self.classify(429).category, "rate_limited")
+
+    def test_retry_after_seconds_are_captured(self):
+        error = self.classify(429, {"Retry-After": "60"})
+
+        self.assertEqual(error.category, "rate_limited")
+        self.assertEqual(error.retry_after, 60)
+
+    def test_http_date_retry_after_is_ignored_not_crashed(self):
+        error = self.classify(429, {"Retry-After": "Wed, 01 Sep 2026 00:00:00 GMT"})
+
+        self.assertEqual(error.category, "rate_limited")
+        self.assertIsNone(error.retry_after)
+
     def test_messages_never_leak_credentials(self):
         for status in (401, 403, 404, 500, 418):
             message = self.classify(status).message

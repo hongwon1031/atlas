@@ -132,6 +132,36 @@ class InvalidIssueTest(unittest.TestCase):
         )
         self.assert_rejected(make_issue(body=body), "safety_confirmation_unchecked")
 
+    def test_arbitrary_checkbox_cannot_substitute_for_confirmations(self):
+        """개수만 세면 임의 문구로 바꿔치기할 수 있으므로 문구를 대조해야 합니다."""
+
+        body = body_replacing("Safety Confirmations", "- [X] 아무 확인")
+        result = self.assert_rejected(make_issue(body=body), "missing_safety_confirmation")
+
+        missing = [issue.message for issue in result.errors if issue.code == "missing_safety_confirmation"]
+        self.assertEqual(len(missing), 3)
+
+    def test_partially_substituted_confirmations_are_rejected(self):
+        body = VALID_BODY.replace(
+            "- [X] 완료 조건과 허용 범위를 사람이 검토할 수 있을 만큼 구체적으로 작성했습니다.",
+            "- [X] 대충 확인했습니다.",
+        )
+        self.assert_rejected(make_issue(body=body), "missing_safety_confirmation")
+
+    def test_confirmations_tolerate_whitespace_and_backtick_differences(self):
+        body = VALID_BODY.replace(
+            "- [X] AI가 `main`에 직접 push하거나 merge해서는 안 된다는 점을 확인했습니다.",
+            "- [X]  AI가 main에  직접 push하거나 merge해서는 안 된다는 점을 확인했습니다.",
+        )
+        self.assertTrue(run(make_issue(body=body)).is_valid)
+
+    def test_unknown_heading_content_is_kept_not_dropped(self):
+        body = body_replacing("Objective", "서두를 쓴다.\n\n### Detail\n\n핵심 목표는 여기에 있다.")
+        result = run(make_issue(body=body))
+
+        self.assertTrue(result.is_valid)
+        self.assertIn("핵심 목표는 여기에 있다.", result.task.objective)
+
     def test_duplicate_section(self):
         self.assert_rejected(make_issue(body=VALID_BODY + "\n### Objective\n\nsecond\n"), "duplicate_field")
 

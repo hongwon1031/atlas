@@ -66,16 +66,21 @@ def derive_task_id(issue_number: int) -> str:
 
 
 class InProcessIntakeCache:
-    """같은 source identity를 다시 보면 이전 결과를 그대로 돌려줍니다."""
+    """같은 source identity를 다시 보면 이전 결과를 그대로 돌려줍니다.
+
+    `guard`는 `issue_revision`에 포함되지 않지만 validation 결과를 바꾸는 값
+    (예: Issue state)입니다. guard가 달라지면 다른 항목으로 취급해 stale 결과를
+    반환하지 않습니다.
+    """
 
     def __init__(self) -> None:
-        self._entries: dict[str, Any] = {}
+        self._entries: dict[tuple[str, tuple], Any] = {}
 
-    def get(self, key: IdempotencyKey) -> Any | None:
-        return self._entries.get(key.fingerprint())
+    def get(self, key: IdempotencyKey, guard: tuple = ()) -> Any | None:
+        return self._entries.get((key.fingerprint(), guard))
 
-    def put(self, key: IdempotencyKey, result: Any) -> None:
-        self._entries.setdefault(key.fingerprint(), result)
+    def put(self, key: IdempotencyKey, result: Any, guard: tuple = ()) -> None:
+        self._entries.setdefault((key.fingerprint(), guard), result)
 
     def __len__(self) -> int:
         return len(self._entries)

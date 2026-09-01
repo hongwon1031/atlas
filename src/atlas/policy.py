@@ -37,6 +37,26 @@ EXTERNAL_SYSTEMS = frozenset({"production", "staging"})
 # docs/adr/0003-initial-execution-environment.md에서 Accepted된 primary adapter.
 PRIMARY_ADAPTER = "claude_code_self_hosted"
 
+# .github/ISSUE_TEMPLATE/atlas-task.yml의 Safety Confirmations 문구.
+# 개수만 세면 임의의 체크박스로 대체할 수 있으므로 문구 자체를 대조합니다.
+REQUIRED_SAFETY_CONFIRMATIONS: tuple[tuple[str, str], ...] = (
+    ("secret_free", "이 Task에는 secret, 개인정보, 회사 내부 정보가 포함되지 않았습니다."),
+    (
+        "no_direct_main_write",
+        "AI가 `main`에 직접 push하거나 merge해서는 안 된다는 점을 확인했습니다.",
+    ),
+    (
+        "reviewable_criteria",
+        "완료 조건과 허용 범위를 사람이 검토할 수 있을 만큼 구체적으로 작성했습니다.",
+    ),
+)
+
+
+def normalize_confirmation(text: str) -> str:
+    """공백과 backtick 표기 차이를 무시하고 confirmation 문구를 비교합니다."""
+
+    return " ".join(text.replace("`", "").split()).casefold()
+
 
 def repository_policy(repository: str) -> RepositoryPolicy | None:
     return REPOSITORY_ALLOWLIST.get(repository)

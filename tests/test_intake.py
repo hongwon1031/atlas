@@ -24,6 +24,29 @@ class IntakeFlowTest(unittest.TestCase):
         self.assertEqual(caught.exception.category, "not_found")
 
 
+class RepositoryBoundaryTest(unittest.TestCase):
+    def test_repository_outside_allowlist_is_rejected_without_fetching(self):
+        """경계 확인 전에 다른 repository를 읽으면 안 됩니다."""
+
+        source = FakeIssueSource(make_issue())
+        result = IssueIntake(source).intake(42, repository="someone/private-repo")
+
+        self.assertEqual(source.calls, 0)
+        self.assertFalse(result.is_valid)
+        self.assertEqual({issue.code for issue in result.errors}, {"repository_not_allowed"})
+
+    def test_pre_fetch_rejection_has_no_idempotency_fingerprint(self):
+        result = IssueIntake(FakeIssueSource()).intake(42, repository="someone/private-repo")
+
+        self.assertIsNone(result.idempotency_fingerprint)
+
+    def test_allowed_repository_still_fetches(self):
+        source = FakeIssueSource(make_issue())
+        IssueIntake(source).intake(42)
+
+        self.assertEqual(source.calls, 1)
+
+
 class DeduplicationTest(unittest.TestCase):
     def test_second_intake_of_same_revision_is_deduplicated(self):
         intake = IssueIntake(FakeIssueSource(make_issue()))
@@ -55,6 +78,26 @@ class DeduplicationTest(unittest.TestCase):
 
         self.assertFalse(second.deduplicated)
         self.assertNotEqual(first.idempotency_fingerprint, second.idempotency_fingerprint)
+
+    def test_closing_the_issue_invalidates_the_cached_result(self):
+        """state는 내용 hash에 없으므로 cache가 stale Draft를 돌려주면 안 됩니다."""
+
+        cache = InProcessIntakeCache()
+        first = IssueIntake(FakeIssueSource(make_issue()), cache).intake(42)
+        second = IssueIntake(FakeIssueSource(make_issue(state="closed")), cache).intake(42)
+
+        self.assertTrue(first.is_valid)
+        self.assertFalse(second.deduplicated)
+        self.assertFalse(second.is_valid)
+        self.assertIn("issue_not_open", {issue.code for issue in second.errors})
+
+    def test_becoming_a_pull_request_invalidates_the_cached_result(self):
+        cache = InProcessIntakeCache()
+        IssueIntake(FakeIssueSource(make_issue()), cache).intake(42)
+        second = IssueIntake(FakeIssueSource(make_issue(is_pull_request=True)), cache).intake(42)
+
+        self.assertFalse(second.deduplicated)
+        self.assertIn("issue_is_pull_request", {issue.code for issue in second.errors})
 
     def test_edited_issue_body_produces_a_new_key(self):
         cache = InProcessIntakeCache()

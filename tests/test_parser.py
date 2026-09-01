@@ -44,12 +44,33 @@ class ParseIssueBodyTest(unittest.TestCase):
 
         self.assertEqual(parsed.duplicate_labels, ("Objective",))
 
-    def test_unknown_label_is_reported_and_ignored(self):
+    def test_unknown_label_is_reported_but_kept_as_content(self):
         body = "### Objective\n\nvalue\n\n### Secret Backdoor\n\npayload\n"
         parsed = parse_issue_body(body)
 
         self.assertEqual(parsed.unknown_labels, ("Secret Backdoor",))
-        self.assertEqual(parsed.text("objective"), "value")
+        self.assertIn("value", parsed.text("objective"))
+        self.assertIn("payload", parsed.text("objective"))
+
+    def test_unknown_heading_does_not_truncate_the_field(self):
+        """알 수 없는 `###` 뒤의 사용자 내용이 조용히 사라지면 안 됩니다."""
+
+        body = (
+            "### Objective\n\n서두를 쓴다.\n\n"
+            "### Detail\n\n핵심 목표는 여기에 있다.\n\n"
+            "### Priority\n\nnormal\n"
+        )
+        parsed = parse_issue_body(body)
+
+        self.assertIn("서두를 쓴다.", parsed.text("objective"))
+        self.assertIn("핵심 목표는 여기에 있다.", parsed.text("objective"))
+        self.assertEqual(parsed.text("priority"), "normal")
+
+    def test_unknown_heading_before_any_known_label_is_dropped(self):
+        parsed = parse_issue_body("### Preamble\n\nnoise\n\n### Project\n\natlas\n")
+
+        self.assertEqual(parsed.unknown_labels, ("Preamble",))
+        self.assertEqual(parsed.text("project"), "atlas")
 
     def test_non_h3_headings_do_not_split_sections(self):
         body = "### Objective\n\nintro\n\n#### Detail\n\nmore\n"

@@ -43,10 +43,11 @@ class IssueRecord:
 class IssueSourceError(Exception):
     """분류된 source 오류. provider 응답 원문을 포함하지 않습니다."""
 
-    def __init__(self, category: str, message: str) -> None:
+    def __init__(self, category: str, message: str, retry_after: int | None = None) -> None:
         super().__init__(message)
         self.category = category
         self.message = message
+        self.retry_after = retry_after
 
 
 class IssueSource(Protocol):
@@ -127,9 +128,16 @@ class GitHubRestIssueSource:
     def _classify(status: int, headers) -> IssueSourceError:
         """HTTP 상태를 분류합니다. 응답 body는 읽지도 기록하지도 않습니다."""
 
-        remaining = (headers or {}).get("X-RateLimit-Remaining")
-        if status in (403, 429) and remaining == "0":
-            return IssueSourceError("rate_limited", "GitHub API rate limit에 도달했습니다.")
+        headers = headers or {}
+        remaining = headers.get("X-RateLimit-Remaining")
+        retry_after = _parse_retry_after(headers.get("Retry-After"))
+
+        # 429는 header가 없어도 항상 rate limit입니다. secondary rate limit 응답은
+        # X-RateLimit-Remaining을 포함하지 않습니다.
+        if status == 429 or (status == 403 and remaining == "0"):
+            return IssueSourceError(
+                "rate_limited", "GitHub API rate limit에 도달했습니다.", retry_after=retry_after
+            )
         if status in (401, 403):
             return IssueSourceError(
                 "authentication",
@@ -143,3 +151,12 @@ class GitHubRestIssueSource:
         if status >= 500:
             return IssueSourceError("provider_unavailable", "GitHub가 일시적으로 응답하지 않습니다.")
         return IssueSourceError("provider_error", f"GitHub 요청이 실패했습니다. (HTTP {status})")
+
+
+def _parse_retry_after(value: str | None) -> int | None:
+    """`Retry-After`의 초 단위 표기만 해석합니다. HTTP-date 형식은 무시합니다."""
+
+    try:
+        return max(0, int(str(value).strip()))
+    except (TypeError, ValueError):
+        return None

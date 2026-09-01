@@ -105,6 +105,38 @@ def build_validation_plan(text: str) -> tuple[ValidationCheck, ...]:
     )
 
 
+def _validate_safety_confirmations(text: str) -> list[ValidationIssue]:
+    """필수 confirmation 세 개가 모두 존재하고 체크됐는지 확인합니다.
+
+    체크박스 개수만 세면 임의의 문구로 바꿔치기할 수 있으므로 문구를 대조합니다.
+    """
+
+    found = {
+        policy.normalize_confirmation(box.label): box.checked for box in parse_checkboxes(text)
+    }
+
+    issues: list[ValidationIssue] = []
+    for confirmation_id, label in policy.REQUIRED_SAFETY_CONFIRMATIONS:
+        checked = found.get(policy.normalize_confirmation(label))
+        if checked is None:
+            issues.append(
+                _error(
+                    "missing_safety_confirmation",
+                    f"필수 Safety Confirmation이 없습니다 ({confirmation_id}): {label}",
+                    field="safety_confirmations",
+                )
+            )
+        elif not checked:
+            issues.append(
+                _error(
+                    "safety_confirmation_unchecked",
+                    f"확인하지 않은 Safety Confirmation이 있습니다 ({confirmation_id}): {label}",
+                    field="safety_confirmations",
+                )
+            )
+    return issues
+
+
 def validate_intake(issue: IssueRecord, parsed: ParsedBody, key: IdempotencyKey) -> IntakeResult:
     errors: list[ValidationIssue] = []
     advisories: list[ValidationIssue] = []
@@ -144,7 +176,11 @@ def validate_intake(issue: IssueRecord, parsed: ParsedBody, key: IdempotencyKey)
         )
     for label in parsed.unknown_labels:
         advisories.append(
-            _advisory("unknown_section", f"인식하지 못한 항목 `{label}`은 무시했습니다.", field=label)
+            _advisory(
+                "unknown_section",
+                f"인식하지 못한 제목 `### {label}`은 값의 일부로 보존했습니다.",
+                field=label,
+            )
         )
 
     for field, label in REQUIRED_FIELDS:
@@ -182,24 +218,7 @@ def validate_intake(issue: IssueRecord, parsed: ParsedBody, key: IdempotencyKey)
             )
         )
 
-    checkboxes = parse_checkboxes(parsed.text("safety_confirmations"))
-    if not checkboxes:
-        errors.append(
-            _error(
-                "missing_safety_confirmations",
-                "Safety Confirmations 항목이 없습니다.",
-                field="safety_confirmations",
-            )
-        )
-    for box in checkboxes:
-        if not box.checked:
-            errors.append(
-                _error(
-                    "safety_confirmation_unchecked",
-                    f"확인하지 않은 Safety Confirmation이 있습니다: {box.label}",
-                    field="safety_confirmations",
-                )
-            )
+    errors.extend(_validate_safety_confirmations(parsed.text("safety_confirmations")))
 
     allowed_scope = classify_scope(split_items(parsed.text("allowed_scope")))
     forbidden_scope = classify_scope(split_items(parsed.text("forbidden_scope")))

@@ -145,7 +145,8 @@ class IntakeResult:
     """
 
     status: TaskStatus
-    idempotency_fingerprint: str
+    # allowlist 밖 repository처럼 source를 관찰하기 전에 거부한 경우 `None`입니다.
+    idempotency_fingerprint: str | None
     task: Task | None = None
     errors: tuple[ValidationIssue, ...] = ()
     advisories: tuple[ValidationIssue, ...] = ()

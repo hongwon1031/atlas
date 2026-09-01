@@ -115,7 +115,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 ## Current Limitations
 
 - polling이나 webhook ingestion이 없습니다. Issue 번호를 사람이 직접 지정해야 합니다.
-- idempotent claim과 lease가 없습니다. 중복 방지는 한 process 안에서만 동작합니다.
+- idempotent claim과 lease가 없습니다. 중복 방지는 한 process 안에서만 동작하며 Issue state가 바뀌면 무효화됩니다.
 - Task 상태를 저장하지 않습니다. intake 결과는 출력 후 사라집니다.
 - Issue 작성자와 comment actor의 repository permission을 확인하지 않습니다.
 - worker process supervision, persistence, heartbeat, crash recovery가 없습니다.
