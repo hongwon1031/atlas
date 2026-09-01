@@ -13,7 +13,8 @@ from dataclasses import dataclass
 # GitHub Issue Form은 label을 항상 `###`으로 렌더링합니다. 다른 heading level을
 # 인식하지 않으면 사용자가 값 안에 쓴 Markdown이 section을 쪼개지 않습니다.
 _HEADING = re.compile(r"^### +(.+?) *$")
-_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_OPENING_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_CLOSING_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 _BULLET = re.compile(r"^ *[-*+] +(.*)$")
 _CHECKBOX = re.compile(r"^ *[-*+] +\[([ xX])\] *(.*)$")
 
@@ -67,7 +68,8 @@ def parse_issue_body(body: str) -> ParsedBody:
     current: str | None = None
     buffer: list[str] = []
     in_fence = False
-    fence_marker = ""
+    fence_char = ""
+    fence_length = 0
 
     def flush() -> None:
         if current is None:
@@ -78,16 +80,25 @@ def parse_issue_body(body: str) -> ParsedBody:
         sections[current] = value
 
     for line in (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        fence = _FENCE.match(line)
-        if fence:
-            marker = fence.group(1)[0]
-            if not in_fence:
-                in_fence, fence_marker = True, marker
-            elif marker == fence_marker:
-                in_fence, fence_marker = False, ""
+        if in_fence:
+            closing = _CLOSING_FENCE.match(line)
+            if closing:
+                marker = closing.group(1)
+                if marker[0] == fence_char and len(marker) >= fence_length:
+                    in_fence, fence_char, fence_length = False, "", 0
             if current is not None:
                 buffer.append(line)
             continue
+
+        opening = _OPENING_FENCE.match(line)
+        if opening:
+            marker, info = opening.groups()
+            # CommonMark에서 backtick fence의 info string에는 backtick을 쓸 수 없습니다.
+            if marker[0] != "`" or "`" not in info:
+                in_fence, fence_char, fence_length = True, marker[0], len(marker)
+                if current is not None:
+                    buffer.append(line)
+                continue
 
         heading = None if in_fence else _HEADING.match(line)
         if heading is None:

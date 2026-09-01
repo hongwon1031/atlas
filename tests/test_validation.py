@@ -138,7 +138,11 @@ class InvalidIssueTest(unittest.TestCase):
         body = body_replacing("Safety Confirmations", "- [X] 아무 확인")
         result = self.assert_rejected(make_issue(body=body), "missing_safety_confirmation")
 
-        missing = [issue.message for issue in result.errors if issue.code == "missing_safety_confirmation"]
+        missing = [
+            issue.message
+            for issue in result.errors
+            if issue.code == "missing_safety_confirmation"
+        ]
         self.assertEqual(len(missing), 3)
 
     def test_partially_substituted_confirmations_are_rejected(self):
@@ -147,6 +151,19 @@ class InvalidIssueTest(unittest.TestCase):
             "- [X] 대충 확인했습니다.",
         )
         self.assert_rejected(make_issue(body=body), "missing_safety_confirmation")
+
+    def test_duplicate_confirmation_cannot_override_unchecked_value(self):
+        label = "이 Task에는 secret, 개인정보, 회사 내부 정보가 포함되지 않았습니다."
+        body = VALID_BODY.replace(f"- [X] {label}", f"- [ ] {label}")
+        body += f"\n- [X] {label}\n"
+
+        self.assert_rejected(make_issue(body=body), "duplicate_safety_confirmation")
+
+    def test_duplicate_checked_confirmation_is_rejected(self):
+        label = "이 Task에는 secret, 개인정보, 회사 내부 정보가 포함되지 않았습니다."
+        body = VALID_BODY + f"\n- [X] {label}\n"
+
+        self.assert_rejected(make_issue(body=body), "duplicate_safety_confirmation")
 
     def test_confirmations_tolerate_whitespace_and_backtick_differences(self):
         body = VALID_BODY.replace(
@@ -163,7 +180,10 @@ class InvalidIssueTest(unittest.TestCase):
         self.assertIn("핵심 목표는 여기에 있다.", result.task.objective)
 
     def test_duplicate_section(self):
-        self.assert_rejected(make_issue(body=VALID_BODY + "\n### Objective\n\nsecond\n"), "duplicate_field")
+        self.assert_rejected(
+            make_issue(body=VALID_BODY + "\n### Objective\n\nsecond\n"),
+            "duplicate_field",
+        )
 
     def test_scope_conflict(self):
         self.assert_rejected(

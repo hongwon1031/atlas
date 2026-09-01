@@ -38,6 +38,39 @@ class ParseIssueBodyTest(unittest.TestCase):
         self.assertNotIn("allowed_scope", parsed.sections)
         self.assertIn("### Allowed Scope", parsed.text("objective"))
 
+    def test_shorter_fence_inside_long_fence_does_not_close_it(self):
+        body = (
+            "### Objective\n\n"
+            "````markdown\n"
+            "```python\n"
+            "### Allowed Scope\n"
+            "example\n"
+            "```\n"
+            "````\n\n"
+            "### Priority\n\nnormal\n"
+        )
+        parsed = parse_issue_body(body)
+
+        self.assertNotIn("allowed_scope", parsed.sections)
+        self.assertIn("### Allowed Scope", parsed.text("objective"))
+        self.assertEqual(parsed.text("priority"), "normal")
+
+    def test_fence_with_trailing_text_does_not_close_it(self):
+        body = (
+            "### Objective\n\n"
+            "```markdown\n"
+            "```not-a-closing-fence\n"
+            "### Priority\n"
+            "urgent\n"
+            "```\n\n"
+            "### Priority\n\nnormal\n"
+        )
+        parsed = parse_issue_body(body)
+
+        self.assertEqual(parsed.duplicate_labels, ())
+        self.assertIn("### Priority", parsed.text("objective"))
+        self.assertEqual(parsed.text("priority"), "normal")
+
     def test_duplicate_label_is_reported(self):
         body = "### Objective\n\nfirst\n\n### Objective\n\nsecond\n"
         parsed = parse_issue_body(body)

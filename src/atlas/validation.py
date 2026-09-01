@@ -111,14 +111,15 @@ def _validate_safety_confirmations(text: str) -> list[ValidationIssue]:
     체크박스 개수만 세면 임의의 문구로 바꿔치기할 수 있으므로 문구를 대조합니다.
     """
 
-    found = {
-        policy.normalize_confirmation(box.label): box.checked for box in parse_checkboxes(text)
-    }
+    found: dict[str, list[bool]] = {}
+    for box in parse_checkboxes(text):
+        normalized = policy.normalize_confirmation(box.label)
+        found.setdefault(normalized, []).append(box.checked)
 
     issues: list[ValidationIssue] = []
     for confirmation_id, label in policy.REQUIRED_SAFETY_CONFIRMATIONS:
-        checked = found.get(policy.normalize_confirmation(label))
-        if checked is None:
+        matches = found.get(policy.normalize_confirmation(label), [])
+        if not matches:
             issues.append(
                 _error(
                     "missing_safety_confirmation",
@@ -126,7 +127,15 @@ def _validate_safety_confirmations(text: str) -> list[ValidationIssue]:
                     field="safety_confirmations",
                 )
             )
-        elif not checked:
+        elif len(matches) != 1:
+            issues.append(
+                _error(
+                    "duplicate_safety_confirmation",
+                    f"필수 Safety Confirmation이 중복됐습니다 ({confirmation_id}): {label}",
+                    field="safety_confirmations",
+                )
+            )
+        elif not matches[0]:
             issues.append(
                 _error(
                     "safety_confirmation_unchecked",
