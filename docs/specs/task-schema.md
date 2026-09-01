@@ -2,7 +2,7 @@
 
 이 문서는 Atlas가 입력 채널의 자연어 요청을 실행 가능한 Task로 정규화할 때 사용하는 정규 데이터 계약을 정의합니다. 현재 문서는 구현 명세이며 특정 언어, framework, database schema를 선택하지 않습니다.
 
-[ADR-002](../adr/0002-initial-mobile-task-channel.md)에 따라 canonical intake는 GitHub Issues의 Atlas Task Issue Form입니다. Current manual workflow에서는 사람이 form을 확인하고 Executor에게 전달합니다. Target MVP에서는 Atlas worker가 같은 schema를 검증하고 claim합니다.
+[ADR-002](../adr/0002-initial-mobile-task-channel.md)에 따라 canonical intake는 GitHub Issues의 Atlas Task Issue Form입니다. Current manual workflow에서는 사람이 form을 확인하고 Executor에게 전달하며, 구현된 manual CLI는 지정된 Issue 한 건을 이 schema의 `Draft` 또는 `NeedsClarification` 결과로 변환합니다. Target MVP에서는 Atlas worker가 같은 schema를 검증하고 claim합니다.
 
 ## 설계 목표
 

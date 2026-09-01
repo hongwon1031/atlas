@@ -69,7 +69,7 @@ Atlas는 모바일에서 받은 개발 지시를 프로젝트 단위의 실행 �
 3. Executor가 별도 branch에서 작업·검증하고 PR을 생성합니다.
 4. 사람이 PR을 검토하고 merge하거나 수정을 요청합니다.
 
-자동 worker, claim, validation, GitHub delivery는 아직 구현되지 않았습니다. Codex Cloud의 사람 prompt → branch 변경 → PR 생성 → 사람 merge 흐름은 수동으로 입증됐습니다. Atlas-to-Codex automated invocation은 feasibility가 검증되지 않았고, self-hosted Claude Code primary automated path는 계획됐지만 구현되지 않았습니다.
+사람이 번호를 지정한 GitHub Issue 한 건을 fetch·parse·schema validation하는 intake core는 구현됐습니다. 자동 worker, polling, claim, persistence, Run validation, GitHub delivery는 아직 구현되지 않았습니다. Codex Cloud의 사람 prompt → branch 변경 → PR 생성 → 사람 merge 흐름은 수동으로 입증됐습니다. Atlas-to-Codex automated invocation은 feasibility가 검증되지 않았고, self-hosted Claude Code primary automated path는 계획됐지만 구현되지 않았습니다.
 
 ## Target MVP User Flow
 
@@ -94,6 +94,8 @@ Atlas는 모바일에서 받은 개발 지시를 프로젝트 단위의 실행 �
 - 자연어 작업 설명을 수신합니다.
 - 목표, 제약, 완료 조건, 우선순위 필드를 구조화합니다.
 - 불명확한 고위험 요청은 실행 전에 질문합니다.
+
+현재 구현은 manual CLI로 지정한 단건 GitHub Issue를 `Draft` 또는 `NeedsClarification`으로 정규화하는 단계까지입니다. candidate discovery, permission 확인, approval/queue signal, claim은 후속 범위입니다.
 
 ### FR-03 Context Builder
 

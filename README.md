@@ -45,7 +45,7 @@ PYTHONPATH=src python -m atlas 12
 | 초기 문서·거버넌스 foundation | Complete | Agent guide, Task/PR contract, ADR register 존재 |
 | Codex Cloud manual delivery | Proven Manually | 사람 prompt → Codex branch 변경 → Codex PR → 사람 merge |
 | Runtime·isolation·ingestion specification | In Progress | ADR-008~010은 Proposed이며 구현 전 사람 승인 필요 |
-| Issue intake (parse·validate) | Complete | `src/atlas/`가 Issue를 Task 후보로 변환; 단위 테스트 60건 통과 |
+| Issue intake core | In Progress | 수동 지정한 단건 Issue fetch·parse·validate와 회귀 테스트 구현; valid Atlas Task live E2E 확인 필요 |
 | self-hosted Claude Code automated path | Planned | primary automated executor로 결정됐지만 invocation 미구현 |
 | Atlas-to-Codex Cloud automation | Feasibility Unverified | adapter로 표시하기 전 integration validation 필요 |
 | Polling, claim, recovery, routing, validation delivery | Not Implemented | 문서 계약만 존재 |
@@ -116,6 +116,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 
 - polling이나 webhook ingestion이 없습니다. Issue 번호를 사람이 직접 지정해야 합니다.
 - idempotent claim과 lease가 없습니다. 중복 방지는 한 process 안에서만 동작하며 Issue state가 바뀌면 무효화됩니다.
+- public GitHub REST 경로는 실제 응답으로 확인했지만 valid Atlas Task Issue의 live E2E는 아직 수행하지 않았습니다.
 - Task 상태를 저장하지 않습니다. intake 결과는 출력 후 사라집니다.
 - Issue 작성자와 comment actor의 repository permission을 확인하지 않습니다.
 - worker process supervision, persistence, heartbeat, crash recovery가 없습니다.
@@ -237,7 +238,7 @@ atlas/
 | 제품 정의 | Complete | Accepted ADR-001~003 반영 |
 | 운영 명세 | In Progress | Proposed ADR-008~010 검토와 open question 해소 |
 | 수동 delivery | Proven Manually | Codex branch → PR → human merge 재현 |
-| Issue intake | Complete | Issue → Task 후보 parse·검증과 단위 테스트 |
+| Issue intake | In Progress | 단건 fetch·parse·검증 구현; valid Task live E2E 확인 필요 |
 | 자동 실행 환경 | Not Implemented | mock vertical slice 이후 Claude Code integration 검증 |
 
 ## 문서 운영

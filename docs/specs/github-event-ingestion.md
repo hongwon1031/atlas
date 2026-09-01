@@ -1,6 +1,6 @@
 # GitHub Event Ingestion Specification v0.1
 
-이 문서는 GitHub Issue를 Atlas Task 후보로 발견하고 exactly-one active Run으로 연결하기 위한 Target MVP 계약입니다. [ADR-008](../adr/0008-initial-github-event-ingestion.md)은 polling-first를 제안하며 아직 `Proposed`입니다. Poller와 webhook은 구현되지 않았습니다.
+이 문서는 GitHub Issue를 Atlas Task 후보로 발견하고 exactly-one active Run으로 연결하기 위한 Target MVP 계약입니다. [ADR-008](../adr/0008-initial-github-event-ingestion.md)은 polling-first를 제안하며 아직 `Proposed`입니다. 현재는 사람이 번호를 지정한 단건 Issue의 fetch·parse·validation과 process-local duplicate detection만 구현됐습니다. Poller, webhook, approval signal, persistent idempotency, claim은 구현되지 않았습니다.
 
 ## Scope
 

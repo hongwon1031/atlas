@@ -10,7 +10,7 @@
 
 현재 가능한 운영 흐름은 **GitHub Issue 생성 → 사람이 Issue를 Executor에게 전달 → Executor가 branch에서 작업·검증 → PR 생성 → 사람 review/merge**입니다.
 
-Atlas worker, webhook/polling, 자동 claim, self-hosted Claude Code invocation, validation automation, GitHub delivery automation은 아직 구현되지 않았습니다.
+사람이 번호를 지정한 GitHub Issue 한 건의 fetch·parse·schema validation core는 구현됐습니다. Atlas worker, webhook/polling, 자동 claim, persistence, self-hosted Claude Code invocation, Run validation automation, GitHub delivery automation은 아직 구현되지 않았습니다.
 
 Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge** 흐름은 `Proven Manually`입니다. Atlas-to-Codex automated invocation은 `Feasibility Unverified`이며 adapter backlog로 이동하기 전에 별도 integration validation이 필요합니다.
 
@@ -173,7 +173,7 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 ## Recommended Next Implementation Sprint
 
 1. ~~Atlas GitHub Issue를 parse하고 validate합니다.~~ (완료 — `src/atlas/`)
-2. approved 또는 queued Task를 polling합니다.
+2. valid Atlas Task Issue의 live E2E를 확인하고 approved 또는 queued Task polling을 구현합니다.
 3. 한 Task를 idempotent하게 claim합니다.
 4. 최소 Task와 Run 상태를 persist합니다.
 5. 격리된 worktree와 branch를 생성합니다.
