@@ -21,6 +21,8 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 - 현재 workflow는 사람이 Issue를 Executor에게 전달하고, Executor가 branch에서 작업한 뒤 PR을 여는 수동 흐름입니다.
 - Target MVP에서는 Atlas worker가 Issue를 검증·claim하고 always-available server의 self-hosted Claude Code worker가 primary automated executor로 실행됩니다.
 - Codex Cloud는 manual/secondary executor입니다. 다른 Adapter를 배제하지 않지만 primary automated path로 간주하지 않습니다.
+- Atlas Control Plane의 초기 구현 언어는 [ADR-011](docs/adr/0011-initial-implementation-language.md)에 따라 Python 3.11 이상입니다.
+- `src/atlas/`의 현재 구현은 사람이 지정한 GitHub Issue 한 건을 fetch·parse·validate하는 manual intake slice입니다. 자동 polling이나 Task claim이 아닙니다.
 - polling-first ingestion, tmux PoC supervision, Task/Run isolation은 ADR-008~010의 `Proposed` 방향입니다. 승인된 구현 근거로 취급하지 않습니다.
 - worker, webhook, polling, command automation, Claude Code invocation은 아직 구현되지 않았습니다. 현재 존재한다고 주장하거나 문서 Task에서 구현하지 않습니다.
 
@@ -43,7 +45,7 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 1. `AGENTS.md`
 2. `README.md`
 3. `docs/constitution.md`
-4. Accepted ADR-001, ADR-002, ADR-003
+4. Accepted ADR-001, ADR-002, ADR-003, ADR-011
 5. `docs/prd.md`
 6. `docs/architecture.md`
 7. `docs/security-governance.md`
@@ -65,6 +67,7 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 - Task가 문서·거버넌스 전용이면 application code, dependency, CI, infrastructure를 추가하지 않습니다.
 - 현재 manual workflow에서는 사람이 해당 GitHub Issue를 이 Executor에게 명시적으로 전달했는지 확인합니다. Issue가 존재한다는 사실만으로 자동 claim하지 않습니다.
 - Target MVP의 worker가 구현되기 전에는 `/atlas` command나 `atlas:*` label이 작업을 자동 시작한다고 가정하지 않습니다.
+- `python -m atlas <issue-number>`는 단건 validation 결과만 출력하며 Task를 queue하거나 실행하지 않습니다.
 - polling, Task claim, lease, worker recovery, usage detection, routing, automated validation이나 mobile notification이 구현됐다고 가정하지 않습니다.
 
 ## 브랜치와 커밋 규칙

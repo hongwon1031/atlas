@@ -72,5 +72,5 @@ Sprint 1은 GitHub Issue Form과 comment command 계약을 문서화했지만 �
 
 - [x] Project owner가 GitHub Issues와 기존 Atlas Task Issue Form을 초기 intake channel로 승인
 - [ ] 필요한 `atlas:*` label 목록과 provisioning 방식 확정
-- [ ] Issue parser와 schema validation acceptance test 정의
+- [x] Issue parser와 schema validation acceptance test 정의 및 단건 manual intake 구현
 - [ ] 휴대전화 기준 Issue → PR 사용성 시험

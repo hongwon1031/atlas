@@ -1,0 +1,18 @@
+[project]
+name = "atlas"
+version = "0.1.0"
+description = "Atlas Issue intake vertical slice"
+requires-python = ">=3.11"
+# 런타임 dependency 없음. 표준 라이브러리만 사용합니다.
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]

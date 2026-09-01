@@ -2,9 +2,9 @@
 
 Atlas는 사람이 휴대전화에서 업무를 지시하면 여러 AI 개발 에이전트가 올바른 프로젝트 컨텍스트를 불러오고, 격리된 환경에서 작업하고, 검증 가능한 결과와 Pull Request를 생성하도록 조율하는 AI Workforce Operating System입니다.
 
-> **현재 작업 단계:** In Progress — architecture와 operations contract를 문서화했으며 자동 worker는 아직 구현하지 않았습니다.
+> **현재 작업 단계:** In Progress — architecture와 operations contract를 문서화했고 첫 vertical slice인 Issue intake를 구현했습니다. 자동 worker는 아직 구현하지 않았습니다.
 >
-> 이 저장소는 현재 제품 정의, 실행 계약, 기여 거버넌스만 포함합니다. worker, webhook, polling, Claude Code invocation, GitHub automation, application code는 아직 구현하지 않았습니다.
+> 이 저장소는 제품 정의, 실행 계약, 기여 거버넌스와 함께 GitHub Issue를 Task 후보로 parse·검증하는 intake 코드를 포함합니다. polling, 자동 claim, persistence, worktree, Claude Code invocation, PR delivery automation은 아직 구현하지 않았습니다.
 
 ## 핵심 MVP
 
@@ -21,7 +21,22 @@ Atlas에 기여하는 사람과 AI Agent는 application stack을 먼저 만들�
 5. Task 전용 branch에서 작업하고 [PR template](.github/pull_request_template.md)에 변경 파일, 검증, 위험, open question을 기록합니다.
 6. 사람의 검토와 승인 전에는 `main`에 merge하지 않습니다.
 
-현재 단계에서는 별도 설치나 실행 명령이 없습니다. 언어, framework, database, deployment 환경은 Accepted ADR과 명시적인 구현 Task 없이 선택하지 않습니다.
+[ADR-011](docs/adr/0011-initial-implementation-language.md)에 따라 Control Plane의 구현 언어는 Python 3.11 이상이며 런타임 dependency는 없습니다. database와 deployment 환경은 Accepted ADR과 명시적인 구현 Task 없이 선택하지 않습니다.
+
+### Issue Intake 실행
+
+구현된 범위는 GitHub Issue 하나를 Atlas Task 후보로 parse하고 검증하는 것까지입니다.
+
+```bash
+# 테스트 (설치 불필요)
+python -m unittest discover -s tests -t .
+
+# Issue 하나를 Task 후보로 검증
+export ATLAS_GITHUB_TOKEN=<repository read 권한 토큰>
+PYTHONPATH=src python -m atlas 12
+```
+
+결과는 JSON으로 출력됩니다. exit code는 `0` valid, `1` validation 실패, `2` source 오류입니다. token은 저장소에 두지 않고 환경변수로만 주입합니다. public repository의 Issue는 token 없이도 조회되지만 rate limit이 훨씬 낮습니다.
 
 ## Project Status
 
@@ -30,6 +45,7 @@ Atlas에 기여하는 사람과 AI Agent는 application stack을 먼저 만들�
 | 초기 문서·거버넌스 foundation | Complete | Agent guide, Task/PR contract, ADR register 존재 |
 | Codex Cloud manual delivery | Proven Manually | 사람 prompt → Codex branch 변경 → Codex PR → 사람 merge |
 | Runtime·isolation·ingestion specification | In Progress | ADR-008~010은 Proposed이며 구현 전 사람 승인 필요 |
+| Issue intake core | In Progress | 수동 지정한 단건 Issue fetch·parse·validate와 회귀 테스트 구현; valid Atlas Task live E2E 확인 필요 |
 | self-hosted Claude Code automated path | Planned | primary automated executor로 결정됐지만 invocation 미구현 |
 | Atlas-to-Codex Cloud automation | Feasibility Unverified | adapter로 표시하기 전 integration validation 필요 |
 | Polling, claim, recovery, routing, validation delivery | Not Implemented | 문서 계약만 존재 |
@@ -98,8 +114,11 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 
 ## Current Limitations
 
-- polling이나 webhook ingestion이 없습니다.
-- Issue parser, 자동 schema validation, idempotent claim과 lease가 없습니다.
+- polling이나 webhook ingestion이 없습니다. Issue 번호를 사람이 직접 지정해야 합니다.
+- idempotent claim과 lease가 없습니다. 중복 방지는 한 process 안에서만 동작하며 Issue state가 바뀌면 무효화됩니다.
+- public GitHub REST 경로는 실제 응답으로 확인했지만 valid Atlas Task Issue의 live E2E는 아직 수행하지 않았습니다.
+- Task 상태를 저장하지 않습니다. intake 결과는 출력 후 사라집니다.
+- Issue 작성자와 comment actor의 repository permission을 확인하지 않습니다.
 - worker process supervision, persistence, heartbeat, crash recovery가 없습니다.
 - self-hosted Claude Code invocation과 Codex automated adapter가 없습니다.
 - automated context building, routing, usage detection, validation, PR delivery, mobile notification이 없습니다.
@@ -110,7 +129,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 
 다음 Sprint는 provider invocation보다 먼저 mock executor로 worker control path를 검증합니다.
 
-1. Atlas GitHub Issue를 parse하고 validate합니다.
+1. ~~Atlas GitHub Issue를 parse하고 validate합니다.~~ (완료 — `src/atlas/`)
 2. approved 또는 queued Task를 polling합니다.
 3. 한 Task를 idempotent하게 claim합니다.
 4. 최소 Task·Run·lease·heartbeat 상태를 persist합니다.
@@ -160,11 +179,23 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 atlas/
 ├── AGENTS.md                         # AI Agent 작업·리뷰·보안 규칙
 ├── README.md                         # 프로젝트 진입점과 문서 지도
+├── pyproject.toml                    # Python packaging metadata (dependency 없음)
 ├── .github/
 │   ├── ISSUE_TEMPLATE/
 │   │   └── atlas-task.yml            # 구조화된 Atlas Task 입력
 │   └── pull_request_template.md      # PR 결과와 검증 보고 형식
+├── src/atlas/                        # Issue intake vertical slice
+│   ├── policy.py                     # repository allowlist와 scope 어휘
+│   ├── schema.py                     # Task domain model과 상태
+│   ├── parser.py                     # Issue Form body parser
+│   ├── validation.py                 # 필수 필드와 invariant 검증
+│   ├── idempotency.py                # idempotency key와 in-process 중복 방지
+│   ├── issue_source.py               # IssueSource 경계와 GitHub REST adapter
+│   ├── intake.py                     # fetch → parse → validate 조립
+│   └── cli.py                        # `python -m atlas <issue-number>`
+├── tests/                            # 단위 테스트 (표준 unittest)
 └── docs/
+    ├── vision.md                     # Mission, 핵심 가치, 성공 상태
     ├── constitution.md               # 저장소의 최상위 운영 원칙
     ├── prd.md                        # 목표, 범위, 요구사항, 성공 조건
     ├── architecture.md               # 컴포넌트, 데이터, 상태 개요
@@ -172,9 +203,10 @@ atlas/
     ├── agents-router-scheduler.md    # 역할, capability, routing 정책
     ├── mobile-workflow.md            # 모바일 Task와 review 흐름
     ├── security-governance.md        # 격리, 권한, 승인, 위협 모델
-    ├── specs/                         # Task, runtime, registry, ingestion의 정규 계약
-    ├── adr/                           # Accepted/Proposed 결정, 대안, 영향, 후속 작업
-    └── research/                      # 외부 시스템 조사와 Build/Adopt 근거
+    ├── roadmap.md                    # Milestone, Epic, 백로그
+    ├── specs/                        # Task, runtime, registry, ingestion의 정규 계약
+    ├── adr/                          # Accepted/Proposed 결정, 대안, 영향, 후속 작업
+    └── research/                     # 외부 시스템 조사와 Build/Adopt 근거
 ```
 
 `docs/specs/`는 실행 가능한 계약을 제품 방향 문서와 분리합니다. 기존 문서 경로는 이동하지 않아 링크 호환성을 유지하고, ADR은 인덱스와 개별 파일을 함께 관리합니다.
@@ -194,6 +226,7 @@ atlas/
 - [x] GitHub Issues와 Atlas Task Issue Form을 초기 mobile intake로 승인
 - [x] self-hosted Claude Code worker를 primary automated executor로 승인
 - [x] Codex Cloud를 manual/secondary executor로 분류
+- [x] 초기 구현 언어를 Python으로 확정 (ADR-011)
 - [ ] ADR-008 polling-first ingestion 제안 검토
 - [ ] ADR-009 tmux PoC와 stable supervisor 전환 제안 검토
 - [ ] ADR-010 Task/Run isolation 제안 검토
@@ -205,6 +238,7 @@ atlas/
 | 제품 정의 | Complete | Accepted ADR-001~003 반영 |
 | 운영 명세 | In Progress | Proposed ADR-008~010 검토와 open question 해소 |
 | 수동 delivery | Proven Manually | Codex branch → PR → human merge 재현 |
+| Issue intake | In Progress | 단건 fetch·parse·검증 구현; valid Task live E2E 확인 필요 |
 | 자동 실행 환경 | Not Implemented | mock vertical slice 이후 Claude Code integration 검증 |
 
 ## 문서 운영
