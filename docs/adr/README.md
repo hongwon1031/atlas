@@ -33,6 +33,7 @@ Follow-up Tasks
 | [ADR-008: Initial GitHub Event Ingestion](0008-initial-github-event-ingestion.md) | Proposed | Initial MVP polling-first, webhook deferred 제안 |
 | [ADR-009: Worker Process Supervision](0009-worker-process-supervision.md) | Proposed | tmux PoC, stable systemd 또는 Docker 전환 제안 |
 | [ADR-010: Task Execution Isolation](0010-task-execution-isolation.md) | Proposed | Task별 branch, worktree/clone, process, Run, log 격리 제안 |
+| [ADR-011: Initial Implementation Language](0011-initial-implementation-language.md) | Accepted | Control Plane 초기 구현 언어는 Python 3.11 이상, dependency 0개 |
 
 ## Status Definitions
 
@@ -52,12 +53,11 @@ Follow-up Tasks
 
 ## Open Decisions Requiring User Input
 
-1. Atlas의 초기 개발 언어
-2. always-available server의 hosting 위치
-3. ADR-008의 polling interval, backoff, rate-limit, production scaling policy
-4. ADR-009의 stable supervisor로 systemd와 Docker 중 무엇을 선택할지
-5. self-hosted Claude Code worker의 인증 방식과 account 사용 기준
-6. Task claim lease duration, heartbeat, restart recovery, artifact retention 기본값
-7. Codex Cloud automated invocation feasibility와 secondary fallback 정책
-8. 공개 저장소에서 공개할 설계 범위
-9. network egress, secret scanning, branch protection의 구체적인 정책
+1. always-available server의 hosting 위치
+2. ADR-008의 polling interval, backoff, rate-limit, production scaling policy
+3. ADR-009의 stable supervisor로 systemd와 Docker 중 무엇을 선택할지
+4. self-hosted Claude Code worker의 인증 방식과 account 사용 기준
+5. Task claim lease duration, heartbeat, restart recovery, artifact retention 기본값
+6. Codex Cloud automated invocation feasibility와 secondary fallback 정책
+7. 공개 저장소에서 공개할 설계 범위
+8. network egress, secret scanning, branch protection의 구체적인 정책

@@ -27,6 +27,7 @@ Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge*
 - [x] self-hosted Claude Code primary / Codex Cloud manual-secondary 결정
 - [x] AI Agent guide, Task contract, PR contract, ADR 문서 foundation
 - [x] execution runtime, Agent Registry, usage, polling ingestion, Project lifecycle specification 초안
+- [x] 초기 구현 언어를 Python으로 확정 (ADR-011)
 - [ ] Proposed ADR-004~010 검토; ADR-004~007은 계속 Proposed
 
 ## Milestone M1 — Automated Issue-to-PR Vertical Slice
@@ -38,8 +39,8 @@ Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge*
 - [x] GitHub Issue Template 생성
 - [x] Task Schema와 Issue Command Contract 작성
 - [ ] ADR-008 polling-first 제안 승인
-- [ ] Issue payload parser와 Task 필수 필드 검증
-- [ ] repository permission과 Project allowlist 확인
+- [x] Issue payload parser와 Task 필수 필드 검증
+- [x] Project allowlist 확인 (actor repository permission 확인은 claim 단계로 남음)
 - [ ] idempotent claim, lease, duplicate event 방지
 - [ ] polling cursor, backoff, pagination, rate-limit handling
 - [ ] 수동 workflow를 유지하는 safe rollout flag
@@ -171,7 +172,7 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 
 ## Recommended Next Implementation Sprint
 
-1. Atlas GitHub Issue를 parse하고 validate합니다.
+1. ~~Atlas GitHub Issue를 parse하고 validate합니다.~~ (완료 — `src/atlas/`)
 2. approved 또는 queued Task를 polling합니다.
 3. 한 Task를 idempotent하게 claim합니다.
 4. 최소 Task와 Run 상태를 persist합니다.
