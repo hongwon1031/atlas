@@ -177,7 +177,7 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 1. ~~Atlas GitHub Issue를 parse하고 validate합니다.~~ (완료 — `src/atlas/`)
 2. ~~approved 또는 queued Task polling을 구현합니다.~~ (완료 — `polling.py`)
 3. ~~한 Task를 idempotent하게 claim합니다.~~ (완료 — `store.py`)
-4. valid Atlas Task Issue의 live E2E를 확인하고 Run record와 heartbeat를 추가합니다.
+4. ~~valid Atlas Task Issue의 live E2E를 확인합니다.~~ (완료 — Issue #7) Run record와 heartbeat를 추가합니다.
 5. 격리된 worktree와 branch를 생성합니다.
 6. Task별 새 process에서 mock executor를 호출합니다.
 7. 결과를 validate하고 draft PR을 생성합니다.

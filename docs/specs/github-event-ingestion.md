@@ -70,6 +70,8 @@ approval을 polling 시점의 필터로만 쓰면 label이 제거된 뒤에도 �
 
 회수는 polling pass에서 일어나므로 label 제거와 회수 사이에 interval만큼의 창이 있습니다. claim 직전에 GitHub 최신 상태를 재조회하지는 않습니다.
 
+GitHub Issue 목록 endpoint는 eventual consistency를 가지므로 변경 직후 pass가 이를 관찰하지 못할 수 있습니다. 따라서 회수 지연은 polling interval과 provider 인덱싱 지연의 합으로 보아야 합니다.
+
 ## Polling Operations
 
 - cursor, last-observed timestamp, conditional request metadata를 persistence에 저장합니다.

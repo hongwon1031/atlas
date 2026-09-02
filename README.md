@@ -72,8 +72,8 @@ token은 저장소에 두지 않고 환경변수로만 주입합니다. database
 | 초기 문서·거버넌스 foundation | Complete | Agent guide, Task/PR contract, ADR register 존재 |
 | Codex Cloud manual delivery | Proven Manually | 사람 prompt → Codex branch 변경 → Codex PR → 사람 merge |
 | Runtime·isolation specification | In Progress | ADR-009~010은 Proposed이며 구현 전 사람 승인 필요 |
-| Issue intake core | In Progress | 단건 fetch·parse·validate와 회귀 테스트 구현; valid Atlas Task live E2E 확인 필요 |
-| Polling, persistence, claim, lease | In Progress | polling·SQLite store·atomic claim·lease 구현; live valid Task로 end-to-end 확인 필요 |
+| Issue intake core | Complete | 단건 fetch·parse·validate와 회귀 테스트 구현; Issue #7로 live 확인 |
+| Polling, persistence, claim, lease | Complete | polling·SQLite store·atomic claim·lease·승인 회수 구현; Issue #7로 live E2E 확인 |
 | self-hosted Claude Code automated path | Planned | primary automated executor로 결정됐지만 invocation 미구현 |
 | Atlas-to-Codex Cloud automation | Feasibility Unverified | adapter로 표시하기 전 integration validation 필요 |
 | Polling, claim, recovery, routing, validation delivery | Not Implemented | 문서 계약만 존재 |
@@ -145,11 +145,12 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 - webhook ingestion이 없습니다. polling만 있으며 지연은 interval에 좌우됩니다.
 - Run record를 만들지 않습니다. claim은 Task lease까지이고 `active_run_id`는 계속 null입니다.
 - heartbeat와 worker restart reconciliation이 없습니다. lease는 TTL 만료와 grace period로만 회수됩니다.
-- public GitHub REST 조회·목록 경로는 실제 응답으로 확인했지만 valid Atlas Task Issue의 live E2E는 아직 수행하지 않았습니다.
+- live E2E는 Issue #7로 확인했습니다: poll 등록 → 중복 미생성 → claim → active lease 차단 → label 제거 후 승인 회수 → claim 거부 → label 재부착 후 복구 → Issue 종료 후 회수.
 - operational store는 단일 SQLite 파일이라 여러 host가 공유할 수 없습니다.
 - schema migration runner가 없습니다. `schema_meta.schema_version`만 기록합니다.
 - `atlas:queued` label을 추가한 actor의 repository permission을 Atlas가 직접 재확인하지 않습니다. GitHub의 label 권한 제한에 의존합니다.
 - 승인 회수는 polling pass에서 일어나므로 label 제거와 회수 사이에 interval만큼의 창이 있습니다. claim 직전에 GitHub 최신 상태를 재조회하지는 않습니다.
+- GitHub Issue 목록 endpoint는 eventual consistency를 가집니다. live 검증에서 Issue를 닫은 직후 poll은 변경을 보지 못했고 다음 pass에서 반영됐습니다. 회수 지연은 polling interval에 이 인덱싱 지연이 더해집니다.
 - reconciliation을 위해 닫힌 Issue까지 조회하므로 첫 polling pass의 API 호출량이 늘어납니다.
 - worker process supervision, persistence, heartbeat, crash recovery가 없습니다.
 - self-hosted Claude Code invocation과 Codex automated adapter가 없습니다.
@@ -274,7 +275,7 @@ atlas/
 | 제품 정의 | Complete | Accepted ADR-001~003 반영 |
 | 운영 명세 | In Progress | Proposed ADR-004~007·009~010 검토와 open question 해소 |
 | 수동 delivery | Proven Manually | Codex branch → PR → human merge 재현 |
-| Issue intake | In Progress | 단건 fetch·parse·검증 구현; valid Task live E2E 확인 필요 |
+| Issue intake | Complete | 단건 fetch·parse·검증과 live E2E 확인 |
 | 자동 실행 환경 | Not Implemented | mock vertical slice 이후 Claude Code integration 검증 |
 
 ## 문서 운영

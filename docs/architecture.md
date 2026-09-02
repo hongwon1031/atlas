@@ -234,7 +234,7 @@ stateDiagram-v2
 
 ## Recommended Next Sprint Scope
 
-1. valid Atlas Task Issue 한 건으로 live polling·claim E2E를 확인합니다.
+1. ~~valid Atlas Task Issue 한 건으로 live polling·claim E2E를 확인합니다.~~ (완료 — Issue #7)
 2. Run record와 heartbeat를 추가하고 worker restart reconciliation을 구현합니다.
 3. duplicate Run/PR 방지를 구현합니다.
 4. schema migration 절차를 정의합니다.
