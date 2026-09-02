@@ -16,7 +16,7 @@ from .issue_source import (
     IssueSourceError,
 )
 from .parser import ParsedBody, parse_issue_body
-from .polling import IssuePoller, PollReport, is_task_candidate
+from .polling import IssuePoller, PollReport, candidate_rejection, is_task_candidate
 from .schema import (
     IntakeResult,
     Priority,
@@ -52,6 +52,7 @@ __all__ = [
     "TaskStore",
     "ValidationIssue",
     "WorkerConfig",
+    "candidate_rejection",
     "is_task_candidate",
     "parse_issue_body",
     "validate_intake",

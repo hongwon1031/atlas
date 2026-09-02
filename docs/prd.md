@@ -153,7 +153,7 @@ Atlas는 모바일에서 받은 개발 지시를 프로젝트 단위의 실행 �
 
 ## Open Questions
 
-- Proposed polling-first ingestion의 interval, backoff, production scaling policy
+- Accepted polling-first ingestion의 rate-limit budget과 production scaling policy
 - always-available server의 hosting 위치와 stable supervisor로 systemd/Docker 중 무엇을 선택할지
 - self-hosted Claude Code worker의 인증 방식과 availability 확인 정책
 - Codex Cloud secondary fallback을 자동화할지 사람 배정으로만 둘지

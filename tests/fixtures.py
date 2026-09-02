@@ -144,7 +144,7 @@ class FakeIssueSource:
         except KeyError:
             raise IssueSourceError("not_found", "Issue를 찾을 수 없습니다.") from None
 
-    def list_open_issues(
+    def list_issues(
         self, repository: str, since: str | None = None, per_page: int = 50, max_pages: int = 10
     ) -> list[IssueRecord]:
         self.list_calls.append(since)

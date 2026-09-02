@@ -123,7 +123,7 @@ def _option(args: argparse.Namespace, name: str, default: Any = None) -> Any:
     return getattr(args, name, default)
 
 
-def _emit(payload: dict[str, Any], indent: int) -> None:
+def _emit(payload: dict[str, Any], indent: int | None) -> None:
     json.dump(payload, sys.stdout, ensure_ascii=False, indent=indent, default=str)
     sys.stdout.write("\n")
 
@@ -192,7 +192,8 @@ def _run_poll(args: argparse.Namespace, config: WorkerConfig) -> int:
             def emit_pass(report) -> None:
                 nonlocal failed
                 failed = failed or report.error is not None
-                _emit({"status": "Polled", **report.to_dict()}, 0)
+                # NDJSON: pass마다 정확히 한 줄. `indent=0`은 줄바꿈을 넣습니다.
+                _emit({"status": "Polled", **report.to_dict()}, None)
                 sys.stdout.flush()
 
             poller.run(max_iterations=args.iterations, on_report=emit_pass)
@@ -244,6 +245,10 @@ def _run_tasks(args: argparse.Namespace, config: WorkerConfig) -> int:
                     "fingerprint": row["fingerprint"],
                     "issue_number": row["issue_number"],
                     "status": row["status"],
+                    "approved": bool(row["approved"]),
+                    "approval_signal": row["approval_signal"],
+                    "revoke_reason": row["revoke_reason"],
+                    "claimable": bool(row["approved"]) and claim is None,
                     "issue_revision": row["issue_revision"],
                     "created_at": row["created_at"],
                     "claim": (

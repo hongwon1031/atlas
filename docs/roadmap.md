@@ -165,8 +165,9 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 - [x] MVP primary automated Executor를 self-hosted Claude Code worker로 결정
 - [ ] 공개 저장소에 노출하면 안 되는 개인 정보 제거
 - [x] GitHub Markdown canonical / Notion optional mirror 결정
-- [ ] ADR-008 polling-first, ADR-009 tmux PoC, ADR-010 isolation 제안 검토
-- [ ] polling interval, server hosting, stable supervisor, network egress 결정
+- [x] ADR-008 polling-first 승인
+- [ ] ADR-009 tmux PoC, ADR-010 isolation 제안 검토
+- [ ] server hosting, stable supervisor, network egress, rate-limit budget 결정
 - [ ] 첫 Atlas Task Issue 세트 생성
 - [ ] mock executor 문서 Task PR 실험 수행
 - [ ] 별도 후속 PR에서 self-hosted Claude Code worker 문서 Task 실험 수행

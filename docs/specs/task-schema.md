@@ -278,4 +278,4 @@ Issue body는 신뢰되지 않은 사용자 입력입니다. Parser는 heading l
 - schema version의 호환성과 migration 정책
 - path glob 해석과 대소문자 정규화 방식
 - worker claim lease duration과 heartbeat interval
-- Proposed polling-first ingestion의 interval, backoff, approval/queue signal
+- polling-first ingestion의 rate-limit budget과 production scaling policy

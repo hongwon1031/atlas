@@ -23,7 +23,7 @@ from typing import Any
 from .idempotency import IdempotencyKey
 from .schema import IntakeResult, Priority, TaskStatus
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 _PRIORITY_RANK = {
     Priority.LOW: 0,
@@ -54,6 +54,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     previous_fingerprint TEXT,
     is_current           INTEGER NOT NULL DEFAULT 1,
     superseded_at        TEXT,
+    -- approval은 polling 시점의 필터가 아니라 지속 상태입니다. claim은 이 값을
+    -- 다시 확인하고, poller는 signal이 사라지면 회수합니다.
+    approved             INTEGER NOT NULL DEFAULT 0,
+    approval_signal      TEXT,
+    approved_at          TEXT,
+    revoked_at           TEXT,
+    revoke_reason        TEXT,
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL
 );
@@ -118,6 +125,7 @@ class Registration:
     fingerprint: str
     task_id: str
     previous_fingerprint: str | None = None
+    approved: bool = False
 
     @property
     def created_task(self) -> bool:
@@ -161,11 +169,33 @@ class TaskStore:
             # 여러 worker process가 같은 파일을 열 때 reader/writer 충돌을 줄입니다.
             self._connection.execute("PRAGMA journal_mode = WAL")
         self._connection.executescript(_SCHEMA)
+        self._migrate()
+        self._connection.commit()
+
+    def _migrate(self) -> None:
+        """누락된 컬럼만 추가합니다.
+
+        schema v1 database에는 approval 컬럼이 없습니다. 기본값 0으로 추가하므로
+        승인 근거가 없는 기존 Task는 자동으로 claim 대상에서 제외됩니다.
+        """
+
+        existing = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(tasks)")
+        }
+        for column, ddl in (
+            ("approved", "approved INTEGER NOT NULL DEFAULT 0"),
+            ("approval_signal", "approval_signal TEXT"),
+            ("approved_at", "approved_at TEXT"),
+            ("revoked_at", "revoked_at TEXT"),
+            ("revoke_reason", "revoke_reason TEXT"),
+        ):
+            if column not in existing:
+                self._connection.execute(f"ALTER TABLE tasks ADD COLUMN {ddl}")
         self._connection.execute(
-            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
+            "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (SCHEMA_VERSION,),
         )
-        self._connection.commit()
 
     def close(self) -> None:
         self._connection.close()
@@ -186,9 +216,15 @@ class TaskStore:
         repository: str,
         issue_number: int,
         labels: tuple[str, ...] = (),
+        approved: bool = False,
+        approval_signal: str | None = None,
         now: datetime | None = None,
     ) -> Registration:
-        """valid Task를 등록합니다. 같은 revision을 다시 등록해도 중복 생성하지 않습니다."""
+        """valid Task를 등록합니다. 같은 revision을 다시 등록해도 중복 생성하지 않습니다.
+
+        `approved`는 관찰 시점의 approval signal 유무입니다. 매 pass마다 다시
+        전달되므로 signal이 사라지면 승인도 유지되지 않습니다.
+        """
 
         if not result.is_valid or result.task is None:
             raise ValueError("invalid intake result는 저장하지 않습니다")
@@ -208,7 +244,11 @@ class TaskStore:
             ).fetchone()
 
             if existing is not None and existing["is_current"] == 1:
-                return Registration("unchanged", fingerprint, key.task_id)
+                # 내용은 같아도 approval signal은 바뀔 수 있으므로 최신 관찰을 반영합니다.
+                self._sync_approval(
+                    connection, key.task_id, fingerprint, approved, approval_signal, moment
+                )
+                return Registration("unchanged", fingerprint, key.task_id, None, approved)
 
             previous = current["fingerprint"] if current is not None else None
             if previous is not None:
@@ -229,14 +269,17 @@ class TaskStore:
                     "WHERE fingerprint = ?",
                     (moment, fingerprint),
                 )
+                self._sync_approval(
+                    connection, key.task_id, fingerprint, approved, approval_signal, moment
+                )
             else:
                 connection.execute(
                     "INSERT INTO tasks("
                     " fingerprint, task_id, repository, issue_number, issue_id,"
                     " issue_revision, signal_type, signal_id, status, priority_rank,"
                     " labels, task_json, previous_fingerprint, is_current,"
-                    " created_at, updated_at"
-                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)",
+                    " approved, approval_signal, approved_at, created_at, updated_at"
+                    ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)",
                     (
                         fingerprint,
                         key.task_id,
@@ -251,6 +294,9 @@ class TaskStore:
                         json.dumps(list(labels), ensure_ascii=False),
                         json.dumps(task.to_dict(), ensure_ascii=False, default=str),
                         previous,
+                        1 if approved else 0,
+                        approval_signal if approved else None,
+                        moment if approved else None,
                         moment,
                         moment,
                     ),
@@ -263,9 +309,101 @@ class TaskStore:
                 moment=moment,
                 task_id=key.task_id,
                 fingerprint=fingerprint,
-                detail={"issue_revision": key.issue_revision, "previous": previous},
+                detail={
+                    "issue_revision": key.issue_revision,
+                    "previous": previous,
+                    "approved": approved,
+                    "approval_signal": approval_signal if approved else None,
+                },
             )
-            return Registration(action, fingerprint, key.task_id, previous)
+            return Registration(action, fingerprint, key.task_id, previous, approved)
+
+    def revoke_approval(
+        self, task_id: str, reason: str, now: datetime | None = None
+    ) -> bool:
+        """승인을 회수하고 active claim을 해제합니다.
+
+        approval signal(label)이 사라지거나 Issue가 닫히면 poller가 호출합니다.
+        회수된 Task는 claim 대상에서 제외되지만 감사를 위해 보존합니다.
+        """
+
+        moment = to_iso(now or utcnow())
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT fingerprint FROM tasks "
+                "WHERE task_id = ? AND is_current = 1 AND approved = 1",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+
+            connection.execute(
+                "UPDATE tasks SET approved = 0, revoked_at = ?, revoke_reason = ?, "
+                "updated_at = ? WHERE fingerprint = ?",
+                (moment, reason, moment, row["fingerprint"]),
+            )
+            self._release_active(connection, task_id, f"approval_revoked:{reason}", moment)
+            self._record(
+                connection,
+                kind="approval_revoked",
+                moment=moment,
+                task_id=task_id,
+                fingerprint=row["fingerprint"],
+                detail={"reason": reason},
+            )
+            return True
+
+    def _sync_approval(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        fingerprint: str,
+        approved: bool,
+        approval_signal: str | None,
+        moment: str,
+    ) -> None:
+        """이미 저장된 revision의 승인 상태를 최신 관찰에 맞춥니다."""
+
+        row = connection.execute(
+            "SELECT approved FROM tasks WHERE fingerprint = ?", (fingerprint,)
+        ).fetchone()
+        was_approved = bool(row["approved"]) if row is not None else False
+        if was_approved == approved:
+            return
+
+        if approved:
+            connection.execute(
+                "UPDATE tasks SET approved = 1, approval_signal = ?, approved_at = ?, "
+                "revoked_at = NULL, revoke_reason = NULL, updated_at = ? "
+                "WHERE fingerprint = ?",
+                (approval_signal, moment, moment, fingerprint),
+            )
+            self._record(
+                connection,
+                kind="approval_granted",
+                moment=moment,
+                task_id=task_id,
+                fingerprint=fingerprint,
+                detail={"approval_signal": approval_signal},
+            )
+        else:
+            connection.execute(
+                "UPDATE tasks SET approved = 0, revoked_at = ?, "
+                "revoke_reason = 'approval_signal_absent', updated_at = ? "
+                "WHERE fingerprint = ?",
+                (moment, moment, fingerprint),
+            )
+            self._release_active(
+                connection, task_id, "approval_revoked:approval_signal_absent", moment
+            )
+            self._record(
+                connection,
+                kind="approval_revoked",
+                moment=moment,
+                task_id=task_id,
+                fingerprint=fingerprint,
+                detail={"reason": "approval_signal_absent"},
+            )
 
     # -- claim and lease -------------------------------------------------
 
@@ -297,9 +435,11 @@ class TaskStore:
         expires = to_iso(moment + timedelta(seconds=lease_ttl_seconds))
 
         with self._write() as connection:
+            # approval은 claim 시점에 다시 확인합니다. signal이 사라졌거나
+            # 승인 근거 없이 저장된 Task(schema v1 migration 포함)는 제외됩니다.
             query = (
                 "SELECT fingerprint, task_id FROM tasks "
-                "WHERE is_current = 1 AND status = ?"
+                "WHERE is_current = 1 AND approved = 1 AND status = ?"
             )
             params: list[Any] = [TaskStatus.DRAFT.value]
             if task_id is not None:

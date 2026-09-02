@@ -290,6 +290,106 @@ class UnboundedWatchTest(PollerTestCase):
         self.assertEqual(len(reports), 2)
 
 
+class ApprovalReconciliationTest(PollerTestCase):
+    """label 제거와 Issue 종료가 승인 회수로 이어져야 합니다."""
+
+    def test_removing_the_label_revokes_approval_and_blocks_claim(self):
+        poller = self.poller(make_approved_issue())
+        first = poller.poll_once()
+        self.assertEqual(first.stored, 1)
+        self.assertIsNotNone(self.store.claim("worker-a", 900))
+        self.store.release(self.store.active_claim("ATLAS-0042")["claim_id"], "test")
+
+        self.source.replace(make_issue(labels=()))
+        second = poller.poll_once()
+
+        self.assertEqual(second.not_candidate, 1)
+        self.assertEqual(second.revoked, ("ATLAS-0042",))
+        self.assertIsNone(self.store.claim("worker-b", 900))
+
+    def test_removing_the_label_releases_an_active_claim(self):
+        poller = self.poller(make_approved_issue())
+        poller.poll_once()
+        self.store.claim("worker-a", 900)
+
+        self.source.replace(make_issue(labels=()))
+        poller.poll_once()
+
+        self.assertIsNone(self.store.active_claim("ATLAS-0042"))
+
+    def test_closing_the_issue_revokes_approval(self):
+        poller = self.poller(make_approved_issue())
+        poller.poll_once()
+
+        self.source.replace(make_approved_issue(state="closed"))
+        report = poller.poll_once()
+
+        self.assertEqual(report.revoked, ("ATLAS-0042",))
+        self.assertIsNone(self.store.claim("worker-a", 900))
+
+    def test_issue_becoming_invalid_revokes_approval(self):
+        poller = self.poller(make_approved_issue())
+        poller.poll_once()
+
+        self.source.replace(make_approved_issue(body=body_without("Objective")))
+        report = poller.poll_once()
+
+        self.assertEqual(report.invalid, 1)
+        self.assertEqual(report.revoked, ("ATLAS-0042",))
+        self.assertIsNone(self.store.claim("worker-a", 900))
+
+    def test_restoring_the_label_restores_claimability(self):
+        poller = self.poller(make_approved_issue())
+        poller.poll_once()
+        self.source.replace(make_issue(labels=()))
+        poller.poll_once()
+
+        self.source.replace(make_approved_issue())
+        poller.poll_once()
+
+        self.assertIsNotNone(self.store.claim("worker-a", 900))
+
+    def test_revocation_is_not_repeated_on_every_pass(self):
+        poller = self.poller(make_approved_issue())
+        poller.poll_once()
+        self.source.replace(make_issue(labels=()))
+
+        first = poller.poll_once()
+        second = poller.poll_once()
+
+        self.assertEqual(first.revoked, ("ATLAS-0042",))
+        self.assertEqual(second.revoked, ())
+
+    def test_unknown_issue_losing_its_label_reports_nothing(self):
+        poller = self.poller(make_issue(labels=()))
+
+        report = poller.poll_once()
+
+        self.assertEqual(report.not_candidate, 1)
+        self.assertEqual(report.revoked, ())
+
+
+class ApprovalGateBypassTest(PollerTestCase):
+    """--no-queue-label은 등록만 허용하고 approval 정책을 우회하지 못합니다."""
+
+    def test_gate_disabled_registers_but_does_not_approve(self):
+        poller = self.poller(make_issue(), config=PollingConfig(require_queue_label=False))
+
+        report = poller.poll_once()
+
+        self.assertEqual(report.stored, 1)
+        self.assertIsNone(self.store.claim("worker-a", 900))
+
+    def test_gate_disabled_still_approves_labeled_issues(self):
+        poller = self.poller(
+            make_approved_issue(), config=PollingConfig(require_queue_label=False)
+        )
+
+        poller.poll_once()
+
+        self.assertIsNotNone(self.store.claim("worker-a", 900))
+
+
 class PollLoopTest(PollerTestCase):
     def test_run_uses_the_configured_interval_between_passes(self):
         poller = self.poller(make_approved_issue(), config=PollingConfig(interval_seconds=30.0))

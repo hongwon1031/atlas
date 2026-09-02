@@ -1,6 +1,6 @@
 # GitHub Event Ingestion Specification v0.1
 
-이 문서는 GitHub Issue를 Atlas Task 후보로 발견하고 exactly-one active Run으로 연결하기 위한 Target MVP 계약입니다. [ADR-008](../adr/0008-initial-github-event-ingestion.md)의 polling-first는 `Accepted`이며 poller, persistent idempotency, atomic claim, lease가 구현됐습니다. webhook, approval/queue signal 확정, Run 생성은 아직 구현되지 않았습니다.
+이 문서는 GitHub Issue를 Atlas Task 후보로 발견하고 exactly-one active Run으로 연결하기 위한 Target MVP 계약입니다. [ADR-008](../adr/0008-initial-github-event-ingestion.md)의 polling-first는 `Accepted`이며 poller, persistent idempotency, atomic claim, lease가 구현됐습니다. approval signal은 `atlas:queued` label로 확정됐습니다. webhook과 Run 생성은 아직 구현되지 않았습니다.
 
 ## Scope
 
@@ -27,7 +27,9 @@
 - Issue가 존재한다는 사실만으로 실행하지 않습니다.
 - Issue Form marker, supported repository, explicit approval/queue signal을 모두 확인합니다.
 - `atlas:queued` label은 approval signal로 동작합니다. `/atlas` comment command는 아직 자동 효과가 없습니다.
-- Target MVP signal의 canonical 조합은 아직 확정되지 않았습니다. `atlas:queued` label 요구는 `require_queue_label` 설정으로 구현했으나 기본값은 비활성입니다.
+- approval signal은 `atlas:queued` label로 확정했고 기본으로 필수입니다. GitHub가 label 추가를 triage 이상 권한자로 제한하므로 label이 authorization gate 역할을 합니다.
+- `require_queue_label`을 끄면 label 없는 후보도 **등록**되지만 승인되지 않으므로 claim 대상이 되지 않습니다. 설정으로 approval 정책을 우회할 수 없습니다.
+- label을 추가한 actor의 repository permission을 Atlas가 직접 재확인하지는 않습니다.
 - Issue edit는 기존 승인을 자동으로 재사용하지 않습니다. 실행에 영향을 주는 field가 바뀌면 validation revision과 재승인이 필요합니다.
 
 ## Idempotency Keys
@@ -38,7 +40,7 @@
 repository_id: github-repository-id
 issue_id: github-issue-id
 issue_revision: normalized-content-hash
-signal_type: queue-command-or-label
+signal_type: queue-command-or-label   # 현재 구현: queue_label:atlas:queued
 signal_id: github-event-or-comment-id
 task_id: ATLAS-0001
 ```
@@ -47,6 +49,26 @@ task_id: ATLAS-0001
 - active lease 또는 delivered PR이 있으면 새 Run을 만들지 않습니다.
 - source content가 바뀌면 기존 Task와의 revision relationship을 기록합니다.
 - failed Run retry는 ingestion duplicate가 아니라 명시적인 retry decision으로 생성합니다.
+
+## Ingestion Claim Lease
+
+claim은 ingestion 단계의 lease이며 [Task State Machine](task-state-machine.md)의 실행 claim과 구분됩니다.
+
+- Task 상태를 `Queued`나 `Running`으로 옮기지 않습니다. 현재 구현은 `Draft`를 유지합니다.
+- Run record를 만들지 않으며 `active_run_id`는 null입니다.
+- executor를 실행하지 않습니다.
+- 목적은 "한 Task를 한 worker만 처리한다"를 보장하는 것입니다.
+
+### Approval은 지속 상태입니다
+
+approval을 polling 시점의 필터로만 쓰면 label이 제거된 뒤에도 과거 승인으로 claim할 수 있습니다. 따라서 다음을 요구합니다.
+
+- approval 여부와 signal 식별자를 Task와 함께 저장합니다.
+- claim은 저장된 approval을 다시 확인합니다. 승인되지 않은 Task는 claim 대상이 아닙니다.
+- poller는 후보 조건을 잃은 Issue(label 제거, Issue 종료, marker 변경, 내용이 invalid로 변경)를 관찰하면 승인을 회수하고 active claim을 해제합니다.
+- 승인 근거 없이 저장된 과거 Task는 claim 대상이 아닙니다.
+
+회수는 polling pass에서 일어나므로 label 제거와 회수 사이에 interval만큼의 창이 있습니다. claim 직전에 GitHub 최신 상태를 재조회하지는 않습니다.
 
 ## Polling Operations
 
@@ -79,7 +101,7 @@ webhook 도입 전 signature validation, replay window, delivery retry, endpoint
 ## Open Questions
 
 - polling interval, jitter, backoff, rate-limit budget
-- approval/queue signal의 최종 형태와 필요한 permission
+- label을 추가한 actor의 permission을 Atlas가 직접 재확인할지
 - Issue edit 후 재승인 규칙
 - multi-repository polling fairness
 - webhook migration 시점과 reconciliation 기간

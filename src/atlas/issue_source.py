@@ -59,7 +59,7 @@ class IssueSource(Protocol):
 class IssueLister(Protocol):
     """polling이 사용하는 목록 조회 경계."""
 
-    def list_open_issues(
+    def list_issues(
         self, repository: str, since: str | None = None, per_page: int = 50, max_pages: int = 10
     ) -> list[IssueRecord]: ...
 
@@ -95,19 +95,23 @@ class GitHubRestIssueSource:
         issue = self._get(f"/repos/{repository}/issues/{number}")
         return self._to_record(repository, repository_id, issue, fallback_number=number)
 
-    def list_open_issues(
+    def list_issues(
         self, repository: str, since: str | None = None, per_page: int = 50, max_pages: int = 10
     ) -> list[IssueRecord]:
-        """open Issue를 `updated` 오름차순으로 조회합니다.
+        """Issue를 `updated` 오름차순으로 조회합니다.
 
         `since`는 polling cursor입니다. Pull Request는 결과에서 제외합니다.
+
+        닫힌 Issue도 포함합니다. label 제거나 Issue 종료를 poller가 관찰해 승인을
+        회수할 수 있어야 하기 때문입니다. open만 조회하면 닫힌 Issue가 목록에서
+        사라져 reconciliation이 불가능합니다.
         """
 
         repository_id = self._repository_id(repository)
         records: list[IssueRecord] = []
         for page in range(1, max(1, max_pages) + 1):
             query = [
-                "state=open",
+                "state=all",
                 "sort=updated",
                 "direction=asc",
                 f"per_page={max(1, min(per_page, 100))}",
@@ -190,9 +194,11 @@ class GitHubRestIssueSource:
         remaining = headers.get("X-RateLimit-Remaining")
         retry_after = _parse_retry_after(headers.get("Retry-After"))
 
-        # 429는 header가 없어도 항상 rate limit입니다. secondary rate limit 응답은
-        # X-RateLimit-Remaining을 포함하지 않습니다.
-        if status == 429 or (status == 403 and remaining == "0"):
+        # 429는 header가 없어도 항상 rate limit입니다. 403은 quota 소진
+        # (remaining == "0")이거나 secondary rate limit(Retry-After 제공)일 때
+        # rate limit으로 분류합니다. secondary rate limit 응답은
+        # X-RateLimit-Remaining을 포함하지 않으므로 remaining만 보면 놓칩니다.
+        if status == 429 or (status == 403 and (remaining == "0" or retry_after is not None)):
             return IssueSourceError(
                 "rate_limited", "GitHub API rate limit에 도달했습니다.", retry_after=retry_after
             )

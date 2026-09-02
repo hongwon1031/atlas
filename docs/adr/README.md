@@ -55,7 +55,7 @@ Follow-up Tasks
 ## Open Decisions Requiring User Input
 
 1. always-available server의 hosting 위치
-2. ADR-008의 approval/queue signal 확정, rate-limit budget, production scaling policy
+2. ADR-008의 rate-limit budget, production scaling policy, label actor permission 재확인 여부
 3. ADR-009의 stable supervisor로 systemd와 Docker 중 무엇을 선택할지
 4. self-hosted Claude Code worker의 인증 방식과 account 사용 기준
 5. Task claim lease duration, heartbeat, restart recovery, artifact retention 기본값

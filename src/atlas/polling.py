@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from . import policy
 from .config import PollingConfig
+from .idempotency import derive_task_id
 from .intake import IssueIntake, build_idempotency_key
 from .issue_source import IssueLister, IssueRecord, IssueSourceError
 from .store import TaskStore
@@ -28,6 +29,7 @@ class PollReport:
     registered: tuple[str, ...] = ()
     revised: tuple[str, ...] = ()
     unchanged: int = 0
+    revoked: tuple[str, ...] = ()
     error: str | None = None
     # provider가 지정한 재시도 대기 시간(초). backoff의 최소값으로 사용합니다.
     retry_after: float | None = None
@@ -44,6 +46,7 @@ class PollReport:
             "registered": list(self.registered),
             "revised": list(self.revised),
             "unchanged": self.unchanged,
+            "revoked": list(self.revoked),
             "stored": self.stored,
             "error": self.error,
             "retry_after": self.retry_after,
@@ -58,22 +61,42 @@ class _Counters:
     unchanged: int = 0
     registered: list[str] = field(default_factory=list)
     revised: list[str] = field(default_factory=list)
+    revoked: list[str] = field(default_factory=list)
 
 
-def is_task_candidate(issue: IssueRecord, config: PollingConfig) -> bool:
-    """Issue Form marker와 선택적 queue label로 후보를 좁힙니다.
+def candidate_rejection(issue: IssueRecord, config: PollingConfig) -> str | None:
+    """후보가 아니면 사유를, 후보면 `None`을 돌려줍니다.
 
     Issue가 존재한다는 사실만으로 후보가 되지 않습니다
     (docs/specs/github-event-ingestion.md의 Candidate and Approval Rules).
+    사유는 승인 회수 event의 근거로 기록됩니다.
     """
 
-    if issue.is_pull_request or issue.state != "open":
-        return False
+    if issue.is_pull_request:
+        return "became_pull_request"
+    if issue.state != "open":
+        return "issue_not_open"
     if not issue.title.startswith(policy.ISSUE_TITLE_MARKER):
-        return False
+        return "task_form_marker_absent"
     if config.require_queue_label and config.queue_label not in issue.labels:
-        return False
-    return True
+        return "queue_label_absent"
+    return None
+
+
+def is_task_candidate(issue: IssueRecord, config: PollingConfig) -> bool:
+    return candidate_rejection(issue, config) is None
+
+
+def approval_signal(issue: IssueRecord, config: PollingConfig) -> str | None:
+    """관찰된 approval signal. 없으면 `None`이며 Task는 claim 대상이 아닙니다.
+
+    `require_queue_label`을 끄더라도 label 없는 Task는 승인되지 않습니다. 설정은
+    등록 여부만 바꾸고 approval 정책(ADR-008)을 우회하지 못합니다.
+    """
+
+    if config.queue_label in issue.labels:
+        return f"queue_label:{config.queue_label}"
+    return None
 
 
 class IssuePoller:
@@ -106,7 +129,7 @@ class IssuePoller:
 
         cursor = self._store.cursor(repository)
         try:
-            issues = self._lister.list_open_issues(
+            issues = self._lister.list_issues(
                 repository,
                 since=cursor,
                 per_page=self._config.per_page,
@@ -122,22 +145,31 @@ class IssuePoller:
             counters.scanned += 1
             latest = _max_timestamp(latest, issue.updated_at)
 
-            if not is_task_candidate(issue, self._config):
+            rejection = candidate_rejection(issue, self._config)
+            if rejection is not None:
                 counters.not_candidate += 1
+                # 후보 조건을 잃은 Issue의 승인을 회수합니다. label 제거, Issue
+                # 종료, marker 변경이 모두 여기서 reconcile됩니다.
+                self._revoke(counters, issue, rejection, now)
                 continue
 
             result = self._intake.intake_record(issue)
             if not result.is_valid:
-                # invalid Issue는 저장하거나 claim하지 않습니다.
+                # invalid Issue는 저장하거나 claim하지 않습니다. 이미 저장된
+                # revision이 있으면 기존 승인을 재사용하지 않도록 회수합니다.
                 counters.invalid += 1
+                self._revoke(counters, issue, "source_became_invalid", now)
                 continue
 
+            signal = approval_signal(issue, self._config)
             registration = self._store.register(
                 result,
                 build_idempotency_key(issue),
                 repository=issue.repository,
                 issue_number=issue.number,
                 labels=issue.labels,
+                approved=signal is not None,
+                approval_signal=signal,
                 now=now,
             )
             if registration.action == "registered":
@@ -155,7 +187,15 @@ class IssuePoller:
             registered=tuple(counters.registered),
             revised=tuple(counters.revised),
             unchanged=counters.unchanged,
+            revoked=tuple(counters.revoked),
         )
+
+    def _revoke(
+        self, counters: _Counters, issue: IssueRecord, reason: str, now: datetime | None
+    ) -> None:
+        task_id = derive_task_id(issue.number)
+        if self._store.revoke_approval(task_id, reason, now=now):
+            counters.revoked.append(task_id)
 
     def run(
         self,

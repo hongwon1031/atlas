@@ -186,6 +186,6 @@ evidence:
 - PR approval과 merge를 각각 상태로 분리할지
 - timeout과 retry budget의 Task별 기본값
 - Issue label을 상태의 source of truth로 사용할지 projection으로만 사용할지
-- Proposed polling-first trigger의 interval, backoff, production scaling policy
+- polling-first trigger의 rate-limit budget과 production scaling policy
 - claim lease duration, heartbeat, abandoned Run recovery 정책
 - polling interval, source revision과 approval signal idempotency key

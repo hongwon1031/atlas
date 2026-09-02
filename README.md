@@ -50,7 +50,9 @@ python -m atlas release <claim-id> --reason done
 
 결과는 JSON으로 출력됩니다. exit code는 `0` 성공, `1` validation 실패 또는 claim 대상 없음, `2` source 오류입니다.
 
-**approval gate:** `atlas:queued` label이 없는 Issue는 후보가 되지 않습니다. GitHub는 label 추가를 triage 이상 권한자로 제한하므로, 공개 저장소에서 임의 사용자가 유효한 form을 작성해도 label을 달 수 없어 claim 대상이 되지 않습니다. `--no-queue-label`로 끌 수 있지만 그러면 approval gate가 사라집니다.
+**approval gate:** `atlas:queued` label이 approval signal입니다. GitHub는 label 추가를 triage 이상 권한자로 제한하므로, 공개 저장소에서 임의 사용자가 유효한 form을 작성해도 label을 달 수 없어 claim 대상이 되지 않습니다.
+
+승인은 polling 시점의 필터가 아니라 **Task에 저장되는 지속 상태**입니다. `claim`은 저장된 승인을 다시 확인하고, poller는 label이 제거되거나 Issue가 닫히면 승인을 회수하고 진행 중인 claim까지 해제합니다. `--no-queue-label`은 label 없는 후보의 **등록만** 허용하며 승인하지는 않으므로 approval 정책을 우회할 수 없습니다.
 
 | 환경변수 | 기본값 | 설명 |
 | --- | --- | --- |
@@ -147,6 +149,8 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 - operational store는 단일 SQLite 파일이라 여러 host가 공유할 수 없습니다.
 - schema migration runner가 없습니다. `schema_meta.schema_version`만 기록합니다.
 - `atlas:queued` label을 추가한 actor의 repository permission을 Atlas가 직접 재확인하지 않습니다. GitHub의 label 권한 제한에 의존합니다.
+- 승인 회수는 polling pass에서 일어나므로 label 제거와 회수 사이에 interval만큼의 창이 있습니다. claim 직전에 GitHub 최신 상태를 재조회하지는 않습니다.
+- reconciliation을 위해 닫힌 Issue까지 조회하므로 첫 polling pass의 API 호출량이 늘어납니다.
 - worker process supervision, persistence, heartbeat, crash recovery가 없습니다.
 - self-hosted Claude Code invocation과 Codex automated adapter가 없습니다.
 - automated context building, routing, usage detection, validation, PR delivery, mobile notification이 없습니다.
@@ -258,7 +262,8 @@ atlas/
 - [x] self-hosted Claude Code worker를 primary automated executor로 승인
 - [x] Codex Cloud를 manual/secondary executor로 분류
 - [x] 초기 구현 언어를 Python으로 확정 (ADR-011)
-- [ ] ADR-008 polling-first ingestion 제안 검토
+- [x] ADR-008 polling-first ingestion 승인
+- [x] ADR-012 operational state store 승인
 - [ ] ADR-009 tmux PoC와 stable supervisor 전환 제안 검토
 - [ ] ADR-010 Task/Run isolation 제안 검토
 - [ ] always-available server의 hosting 위치와 stable 운영 policy 결정

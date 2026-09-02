@@ -38,7 +38,7 @@ flowchart LR
 ```mermaid
 flowchart TD
     U["Mobile User"] --> GI["GitHub Issue / Atlas Task Form"]
-    GI --> W["Atlas Worker polling - proposed"]
+    GI --> W["Atlas Worker polling"]
     W --> I["Parse, Validate & Idempotent Claim"]
     I --> P["Planner & Risk Classifier"]
     P --> C["Context Builder"]
@@ -215,7 +215,7 @@ stateDiagram-v2
 - always-available server에서 실행합니다.
 - Atlas worker가 검증·claim한 Task를 Claude Code Adapter에 전달합니다.
 - Task별 branch, worktree/clone, 새 process, Run log, timeout, command policy, redaction이 필요합니다.
-- polling-first, tmux PoC, isolation은 Proposed ADR이며 server hosting 위치와 stable supervisor는 미결정입니다.
+- polling-first는 Accepted이고 구현됐습니다. tmux PoC와 isolation은 Proposed ADR이며 server hosting 위치와 stable supervisor는 미결정입니다.
 
 ### Manual / Secondary — Codex Cloud
 

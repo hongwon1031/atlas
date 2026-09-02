@@ -62,7 +62,7 @@ Atlas는 개인 PC가 꺼져 있어도 GitHub Issue를 처리할 수 있어야 �
 ## Follow-up Tasks
 
 - [x] Project owner가 self-hosted Claude Code worker primary / Codex Cloud manual-secondary 결정을 승인
-- [ ] ADR-008 polling-first trigger 제안 검토
+- [x] ADR-008 polling-first trigger 승인
 - [ ] ADR-009 worker process supervision 제안 검토
 - [ ] ADR-010 Task execution isolation 제안 검토
 - [ ] always-available server의 hosting 위치와 운영 책임 정의

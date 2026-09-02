@@ -30,7 +30,7 @@
 ## Target MVP Workflow
 
 1. 휴대전화에서 기존 Atlas Task Issue Form으로 GitHub Issue를 생성합니다.
-2. Proposed polling worker가 approved 또는 queued Issue를 찾고 구조화 정보를 parse·validate합니다.
+2. polling worker가 `atlas:queued` label이 붙은 Issue를 찾고 구조화 정보를 parse·validate합니다. (구현됨)
 3. Planner가 plan과 risk를 분류하고 Context Builder가 Project context를 구성합니다.
 4. Router가 Executor를 선택하고 worker가 Task를 lease로 idempotent하게 claim합니다.
 5. worker가 전용 worktree/clone과 branch를 만들고 Task별 새 executor process를 시작합니다.
@@ -100,7 +100,7 @@ AI Trading은 향후 onboarding UX를 검증할 예시 Project일 뿐 Atlas에 �
 - [ ] command와 label automation 구현 여부 및 권한 확정
 - [x] 초기 알림·검토 channel을 GitHub Issue/PR로 결정
 - [ ] 휴대전화 기준 E2E 사용성 테스트
-- [ ] approved/queued Task polling과 idempotent claim 구현
+- [x] approved/queued Task polling과 idempotent claim 구현
 - [ ] Run 결과를 redacted mobile summary로 전달
 
 ## Future UX
