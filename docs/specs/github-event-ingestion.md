@@ -1,10 +1,10 @@
 # GitHub Event Ingestion Specification v0.1
 
-이 문서는 GitHub Issue를 Atlas Task 후보로 발견하고 exactly-one active Run으로 연결하기 위한 Target MVP 계약입니다. [ADR-008](../adr/0008-initial-github-event-ingestion.md)은 polling-first를 제안하며 아직 `Proposed`입니다. 현재는 사람이 번호를 지정한 단건 Issue의 fetch·parse·validation과 process-local duplicate detection만 구현됐습니다. Poller, webhook, approval signal, persistent idempotency, claim은 구현되지 않았습니다.
+이 문서는 GitHub Issue를 Atlas Task 후보로 발견하고 exactly-one active Run으로 연결하기 위한 Target MVP 계약입니다. [ADR-008](../adr/0008-initial-github-event-ingestion.md)의 polling-first는 `Accepted`이며 poller, persistent idempotency, atomic claim, lease가 구현됐습니다. webhook, approval/queue signal 확정, Run 생성은 아직 구현되지 않았습니다.
 
 ## Scope
 
-- initial transport: polling 제안
+- initial transport: polling (구현됨)
 - source: 허용된 repository의 GitHub Issues와 comment/label metadata
 - output: parsed Task candidate, validation result, idempotent claim request
 - 제외: executor invocation, validation execution, PR delivery 구현
@@ -20,12 +20,14 @@
 7. 정확히 한 개의 Run record를 만들고 runtime queue에 전달합니다.
 8. 같은 candidate를 다시 보면 기존 validation, claim, Run 결과를 반환합니다.
 
+현재 구현은 6단계까지입니다. valid Task를 등록하고 lease 기반 claim을 획득하지만 Run record는 만들지 않습니다(`active_run_id`는 null). 7단계는 후속 slice입니다.
+
 ## Candidate and Approval Rules
 
 - Issue가 존재한다는 사실만으로 실행하지 않습니다.
 - Issue Form marker, supported repository, explicit approval/queue signal을 모두 확인합니다.
 - Current manual workflow에서 label과 `/atlas` command는 자동 효과가 없습니다.
-- Target MVP signal의 canonical 조합은 implementation Task에서 확정해야 합니다.
+- Target MVP signal의 canonical 조합은 아직 확정되지 않았습니다. `atlas:queued` label 요구는 `require_queue_label` 설정으로 구현했으나 기본값은 비활성입니다.
 - Issue edit는 기존 승인을 자동으로 재사용하지 않습니다. 실행에 영향을 주는 field가 바뀌면 validation revision과 재승인이 필요합니다.
 
 ## Idempotency Keys

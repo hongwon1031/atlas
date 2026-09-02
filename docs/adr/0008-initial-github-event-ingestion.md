@@ -1,22 +1,41 @@
 # ADR-008: Initial GitHub Event Ingestion
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-31
+- Accepted: 2026-09-02
 - Decision owners: Project owner
 
 ## Context
 
 Atlas의 Target MVP는 GitHub Issue에서 승인되거나 queue된 Task를 감지해야 합니다. GitHub webhook은 낮은 지연 시간을 제공하지만 public inbound endpoint, signature 검증, delivery 재처리, network 운영이 필요합니다. Polling은 지연이 더 크지만 always-available server에서 outbound GitHub access만으로 시작할 수 있습니다.
 
-현재는 webhook과 polling 어느 쪽도 구현되지 않았습니다.
+polling은 이 ADR 승인 후 구현됐고 webhook은 아직 구현되지 않았습니다.
 
-## Proposed Decision
+## Accepted Scope (2026-09-02)
+
+Project owner가 polling 구현을 지시하면서 이 ADR을 `Accepted`로 승인했습니다. 구현하면서 확정한 값과 계속 열려 있는 값을 구분합니다.
+
+**확정**
+
+- transport는 polling이며 webhook은 후속 transport로 남깁니다.
+- candidate 판정은 open Issue + Pull Request 제외 + `[Atlas Task]` 제목 marker입니다.
+- interval, backoff, per-page, max-page는 코드에 고정하지 않고 `PollingConfig`로 노출합니다. 초기 기본값은 interval 60초, backoff 5초에서 최대 300초까지 2배 증가입니다.
+- polling cursor는 repository별 최신 `updated_at`을 store에 저장하고 다음 pass의 `since`로 사용합니다.
+- source 오류(rate limit, 인증, network)는 Task를 실패로 표시하지 않고 backoff 후 재시도합니다.
+
+**계속 열림**
+
+- approval/queue signal의 canonical 조합. `atlas:queued` label 요구를 `require_queue_label` 설정으로 구현했지만 기본값은 비활성이며, 최종 정책과 필요한 permission은 미결입니다.
+- production scaling policy와 multi-repository fairness.
+- webhook migration 시점.
+
+## Decision
 
 - Initial MVP는 GitHub polling으로 candidate Issue를 조회합니다.
-- worker는 candidate Issue 중 승인되거나 queue된 Task만 parse·validate하고, idempotent claim을 획득한 뒤 정확히 하나의 Run을 시작합니다.
+- worker는 candidate Issue만 parse·validate하고 valid Task를 idempotent하게 등록한 뒤 atomic claim으로 하나의 lease만 허용합니다. Run 생성은 후속 slice입니다.
 - Issue number, source revision, command 또는 label event identity를 idempotency key에 포함합니다.
 - 같은 Issue나 command를 반복해서 관찰해도 중복 Run 또는 PR을 만들지 않습니다.
-- polling interval, backoff, pagination, rate-limit budget, production scaling policy는 구현 전 open question으로 유지합니다.
+- polling interval, backoff, pagination은 설정으로 노출합니다. rate-limit budget과 production scaling policy는 계속 open question입니다.
 - webhook은 초기 vertical slice가 검증된 뒤 동일한 ingestion contract를 호출하는 후속 transport로 추가합니다.
 
 ## Conceptual Flow
@@ -60,8 +79,11 @@ Atlas의 Target MVP는 GitHub Issue에서 승인되거나 queue된 Task를 감�
 
 ## Follow-up Tasks
 
-- [ ] Project owner가 polling-first 제안을 승인
-- [ ] candidate Issue filter와 approval/queue signal 확정
-- [ ] polling interval, backoff, pagination, rate-limit policy 결정
-- [ ] claim과 duplicate Run/PR acceptance test 작성
+- [x] Project owner가 polling-first 제안을 승인
+- [x] candidate Issue filter 확정 (open + non-PR + `[Atlas Task]` marker)
+- [x] polling interval, backoff, pagination을 설정으로 노출
+- [x] duplicate Task registration acceptance test 작성
+- [ ] approval/queue signal의 canonical 조합과 필요한 permission 확정
+- [ ] duplicate Run/PR acceptance test 작성 (Run 생성은 아직 미구현)
+- [ ] rate-limit budget과 production scaling policy 결정
 - [ ] webhook migration trigger와 보안 요구사항 정의

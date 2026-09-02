@@ -7,3 +7,9 @@ build/
 dist/
 .venv/
 venv/
+
+# operational state store (ADR-012)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3

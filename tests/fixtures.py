@@ -97,6 +97,8 @@ def make_issue(
     repository: str = "hongwon1031/atlas",
     state: str = "open",
     is_pull_request: bool = False,
+    labels: tuple[str, ...] = (),
+    updated_at: str = "2026-09-01T00:00:00Z",
 ) -> IssueRecord:
     return IssueRecord(
         repository=repository,
@@ -108,17 +110,20 @@ def make_issue(
         state=state,
         author="github:hongwon1031",
         created_at="2026-09-01T00:00:00Z",
-        updated_at="2026-09-01T00:00:00Z",
+        updated_at=updated_at,
         is_pull_request=is_pull_request,
+        labels=labels,
     )
 
 
 class FakeIssueSource:
-    """호출 횟수를 세는 in-memory `IssueSource`."""
+    """호출 횟수를 세는 in-memory `IssueSource` + `IssueLister`."""
 
-    def __init__(self, *issues: IssueRecord) -> None:
+    def __init__(self, *issues: IssueRecord, list_error: IssueSourceError | None = None) -> None:
         self._issues = {(issue.repository, issue.number): issue for issue in issues}
+        self._list_error = list_error
         self.calls = 0
+        self.list_calls: list[str | None] = []
 
     def fetch_issue(self, repository: str, number: int) -> IssueRecord:
         self.calls += 1
@@ -126,3 +131,23 @@ class FakeIssueSource:
             return self._issues[(repository, number)]
         except KeyError:
             raise IssueSourceError("not_found", "Issue를 찾을 수 없습니다.") from None
+
+    def list_open_issues(
+        self, repository: str, since: str | None = None, per_page: int = 50, max_pages: int = 10
+    ) -> list[IssueRecord]:
+        self.list_calls.append(since)
+        if self._list_error is not None:
+            raise self._list_error
+        issues = [
+            issue
+            for (repo, _), issue in sorted(self._issues.items(), key=lambda item: item[0][1])
+            if repo == repository and not issue.is_pull_request
+        ]
+        if since:
+            issues = [issue for issue in issues if issue.updated_at >= since]
+        return issues
+
+    def replace(self, issue: IssueRecord) -> None:
+        """같은 Issue 번호의 내용을 갈아끼웁니다(Issue edit 시뮬레이션)."""
+
+        self._issues[(issue.repository, issue.number)] = issue

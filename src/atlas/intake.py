@@ -49,7 +49,14 @@ class IssueIntake:
         if policy.repository_policy(repository) is None:
             return _repository_rejected(repository)
 
-        issue = self._source.fetch_issue(repository, issue_number)
+        return self.intake_record(self._source.fetch_issue(repository, issue_number))
+
+    def intake_record(self, issue: IssueRecord) -> IntakeResult:
+        """이미 조회한 Issue를 검증합니다. polling이 body를 재조회하지 않도록 분리했습니다."""
+
+        if policy.repository_policy(issue.repository) is None:
+            return _repository_rejected(issue.repository)
+
         key = build_idempotency_key(issue)
         # state와 is_pull_request는 내용 hash에 포함되지 않는 validation 입력이므로
         # cache 식별자에 함께 넣어 stale 결과를 돌려주지 않습니다.

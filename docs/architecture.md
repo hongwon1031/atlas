@@ -17,7 +17,7 @@
 
 ## Current Manual Workflow
 
-현재 repository에는 사람이 Issue 번호를 지정해 실행하는 manual intake CLI가 있습니다. 이 slice는 allowlist 안의 GitHub Issue 한 건을 fetch하고 Task 후보로 parse·validate합니다. Atlas worker, webhook/polling, 자동 claim, persistence, Claude Code invocation, Run validation automation은 없습니다.
+현재 repository에는 Issue polling, Task persistence, atomic claim을 수행하는 worker가 있습니다. allowlist 안의 candidate Issue를 polling해 Task 후보로 parse·validate하고 SQLite에 저장한 뒤 lease 기반으로 claim합니다. webhook, Run record, worktree, Claude Code invocation, Run validation automation, PR delivery는 없습니다.
 
 ```mermaid
 flowchart LR
@@ -59,7 +59,7 @@ flowchart TD
 
 ### 1. Task Intake
 
-Accepted intake channel인 GitHub Issues의 Atlas Task Form을 공통 Task Schema로 변환합니다. 현재 `src/atlas/`는 사람이 지정한 단건 Issue의 repository allowlist, form marker, 필수 field, scope, enum, Safety Confirmation을 검증하고 `Draft` 또는 `NeedsClarification` 결과를 출력합니다. in-process cache만 있으며 Task state를 저장하거나 claim하지 않습니다. Target MVP에서는 [ADR-008](adr/0008-initial-github-event-ingestion.md)의 Proposed 방향에 따라 worker가 approved/queued Issue를 polling한 뒤 같은 parser와 validator를 사용합니다.
+Accepted intake channel인 GitHub Issues의 Atlas Task Form을 공통 Task Schema로 변환합니다. `src/atlas/`는 repository allowlist, form marker, 필수 field, scope, enum, Safety Confirmation을 검증하고 `Draft` 또는 `NeedsClarification` 결과를 만듭니다. [ADR-008](adr/0008-initial-github-event-ingestion.md)에 따라 poller가 candidate Issue를 조회해 같은 parser와 validator를 사용하며, valid Task만 [ADR-012](adr/0012-operational-state-store.md)의 SQLite store에 등록합니다. invalid Issue는 저장하거나 claim하지 않습니다.
 
 ### 2. Planner & Risk Classifier
 
@@ -228,14 +228,14 @@ stateDiagram-v2
 
 ## Recommended MVP
 
-[ADR-003](adr/0003-initial-execution-environment.md)에 따라 primary automated path는 **GitHub Issue → Atlas worker → self-hosted Claude Code worker → validation → PR → human review/merge**입니다. Codex Cloud는 manual/secondary로 유지합니다. 현재 이 경로 중 단건 Issue fetch·parse·validation core만 구현됐고 나머지 구성 요소는 구현되지 않았습니다.
+[ADR-003](adr/0003-initial-execution-environment.md)에 따라 primary automated path는 **GitHub Issue → Atlas worker → self-hosted Claude Code worker → validation → PR → human review/merge**입니다. Codex Cloud는 manual/secondary로 유지합니다. 현재 이 경로 중 polling, parse·validation, Task persistence, atomic claim까지 구현됐고 Run 실행 이후 구성 요소는 구현되지 않았습니다.
 
 ## Recommended Next Sprint Scope
 
-1. valid Atlas Task Issue 한 건으로 live fetch·parse·validation E2E를 확인합니다.
-2. approved 또는 queued Task polling을 구현합니다.
-3. idempotent claim과 duplicate Run/PR 방지를 구현합니다.
-4. 최소 Task, Run, lease, heartbeat 상태를 persist합니다.
+1. valid Atlas Task Issue 한 건으로 live polling·claim E2E를 확인합니다.
+2. Run record와 heartbeat를 추가하고 worker restart reconciliation을 구현합니다.
+3. duplicate Run/PR 방지를 구현합니다.
+4. schema migration 절차를 정의합니다.
 5. repository allowlist 아래 격리 worktree와 branch를 만듭니다.
 6. provider-neutral contract를 따르는 mock executor를 새 process로 호출합니다.
 7. scope·forbidden path·secret validation을 수행하고 draft PR을 생성합니다.

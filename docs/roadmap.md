@@ -38,17 +38,17 @@ Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge*
 
 - [x] GitHub Issue Template 생성
 - [x] Task Schema와 Issue Command Contract 작성
-- [ ] ADR-008 polling-first 제안 승인
+- [x] ADR-008 polling-first 승인
 - [x] Issue payload parser와 Task 필수 필드 검증
 - [x] Project allowlist 확인 (actor repository permission 확인은 claim 단계로 남음)
-- [ ] idempotent claim, lease, duplicate event 방지
-- [ ] polling cursor, backoff, pagination, rate-limit handling
+- [x] idempotent claim, lease, duplicate event 방지
+- [x] polling cursor, backoff, pagination handling (rate-limit budget은 미결)
 - [ ] 수동 workflow를 유지하는 safe rollout flag
 
 ### Epic 2. Isolated Worker Runtime
 
 - [ ] provider-neutral Executor Adapter 최소 interface
-- [ ] 최소 Task, Run, claim lease, heartbeat persistence
+- [x] 최소 Task, claim lease persistence (Run과 heartbeat는 후속)
 - [ ] Task별 worktree/clone, branch, process, Run ID, log scope
 - [ ] mock executor invocation
 - [ ] timeout, cancel, retry, process/worktree cleanup
@@ -173,9 +173,9 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 ## Recommended Next Implementation Sprint
 
 1. ~~Atlas GitHub Issue를 parse하고 validate합니다.~~ (완료 — `src/atlas/`)
-2. valid Atlas Task Issue의 live E2E를 확인하고 approved 또는 queued Task polling을 구현합니다.
-3. 한 Task를 idempotent하게 claim합니다.
-4. 최소 Task와 Run 상태를 persist합니다.
+2. ~~approved 또는 queued Task polling을 구현합니다.~~ (완료 — `polling.py`)
+3. ~~한 Task를 idempotent하게 claim합니다.~~ (완료 — `store.py`)
+4. valid Atlas Task Issue의 live E2E를 확인하고 Run record와 heartbeat를 추가합니다.
 5. 격리된 worktree와 branch를 생성합니다.
 6. Task별 새 process에서 mock executor를 호출합니다.
 7. 결과를 validate하고 draft PR을 생성합니다.
