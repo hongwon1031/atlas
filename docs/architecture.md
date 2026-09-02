@@ -6,7 +6,9 @@
 
 > 운영 모델: [ADR-001](adr/0001-documentation-source-of-truth.md), [ADR-002](adr/0002-initial-mobile-task-channel.md), [ADR-003](adr/0003-initial-execution-environment.md) Accepted
 >
-> 검토 중인 runtime 방향: [ADR-008 polling-first](adr/0008-initial-github-event-ingestion.md), [ADR-009 process supervision](adr/0009-worker-process-supervision.md), [ADR-010 Task isolation](adr/0010-task-execution-isolation.md) Proposed
+> 운영 모델 추가: [ADR-008 polling-first](adr/0008-initial-github-event-ingestion.md), [ADR-011 구현 언어](adr/0011-initial-implementation-language.md), [ADR-012 operational store](adr/0012-operational-state-store.md) Accepted
+>
+> 검토 중인 runtime 방향: [ADR-009 process supervision](adr/0009-worker-process-supervision.md), [ADR-010 Task isolation](adr/0010-task-execution-isolation.md) Proposed
 
 ## Architecture Principles
 

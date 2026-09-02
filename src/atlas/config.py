@@ -17,6 +17,16 @@ DEFAULT_DATABASE_PATH = "atlas.db"
 QUEUE_LABEL = "atlas:queued"
 
 
+def _require_positive(name: str, value: float) -> None:
+    if value <= 0:
+        raise ValueError(f"{name}는 0보다 커야 합니다: {value!r}")
+
+
+def _require_non_negative(name: str, value: float) -> None:
+    if value < 0:
+        raise ValueError(f"{name}는 0 이상이어야 합니다: {value!r}")
+
+
 @dataclass(frozen=True)
 class PollingConfig:
     repository: str = DEFAULT_REPOSITORY
@@ -27,10 +37,20 @@ class PollingConfig:
     backoff_initial_seconds: float = 5.0
     backoff_max_seconds: float = 300.0
     backoff_multiplier: float = 2.0
-    # approval/queue signal의 canonical 조합은 ingestion spec의 open question입니다.
-    # 결정 전까지 label gating을 기본 비활성으로 두고 설정으로만 켭니다.
-    require_queue_label: bool = False
+    # approval/queue signal. GitHub는 label 추가를 triage 이상 권한자로 제한하므로
+    # label 요구가 곧 GitHub가 강제하는 authorization gate입니다. 임의 사용자가
+    # valid form을 작성해도 label을 달 수 없어 후보가 되지 않습니다.
+    # 끄면 approval gate가 사라지므로 신뢰된 repository에서만 사용해야 합니다.
+    require_queue_label: bool = True
     queue_label: str = QUEUE_LABEL
+
+    def __post_init__(self) -> None:
+        _require_positive("interval_seconds", self.interval_seconds)
+        _require_positive("per_page", self.per_page)
+        _require_positive("max_pages", self.max_pages)
+        _require_positive("backoff_initial_seconds", self.backoff_initial_seconds)
+        _require_positive("backoff_max_seconds", self.backoff_max_seconds)
+        _require_positive("backoff_multiplier", self.backoff_multiplier)
 
     def backoff_delay(self, attempt: int) -> float:
         """`attempt`(1부터)에 해당하는 backoff 지연을 계산합니다."""
@@ -49,6 +69,10 @@ class ClaimConfig:
     # 범위 밖이므로 grace period를 확장 지점으로 남깁니다.
     grace_period_seconds: float = 0.0
 
+    def __post_init__(self) -> None:
+        _require_positive("lease_ttl_seconds", self.lease_ttl_seconds)
+        _require_non_negative("grace_period_seconds", self.grace_period_seconds)
+
 
 @dataclass(frozen=True)
 class WorkerConfig:
@@ -66,8 +90,9 @@ class WorkerConfig:
             polling = replace(polling, repository=repository)
         if interval := _read_float(env, "ATLAS_POLL_INTERVAL_SECONDS"):
             polling = replace(polling, interval_seconds=interval)
-        if env.get("ATLAS_REQUIRE_QUEUE_LABEL", "").strip().lower() in ("1", "true", "yes"):
-            polling = replace(polling, require_queue_label=True)
+        # approval gate는 기본 활성입니다. 끄는 방향만 환경변수로 노출합니다.
+        if env.get("ATLAS_DISABLE_QUEUE_LABEL", "").strip().lower() in ("1", "true", "yes"):
+            polling = replace(polling, require_queue_label=False)
 
         claim = config.claim
         if ttl := _read_float(env, "ATLAS_LEASE_TTL_SECONDS"):

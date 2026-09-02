@@ -5,6 +5,8 @@
 - Accepted: 2026-09-02
 - Decision owners: Project owner
 
+Project owner가 PR #6 리뷰 과정에서 SQLite 선택의 장단점과 되돌리기 비용을 확인한 뒤 명시적으로 승인했습니다.
+
 ## Context
 
 [ADR-005](0005-project-memory-storage.md)는 Task, Run, event, availability 같은 운영 상태를 relational database에 저장하는 방향을 `Proposed`로 제안했지만 구체적인 기술은 정하지 않았습니다. Issue polling과 claim을 구현하려면 process 재시작 후에도 유지되는 store와 원자적 claim이 필요하므로 이제 기술을 확정해야 합니다.
@@ -24,7 +26,15 @@
 - 파일 database에는 `journal_mode = WAL`을 적용해 reader와 writer 경합을 줄입니다.
 - append-only `events` 테이블로 registration, claim, lease 만료, release를 감사합니다. [ADR-004](0004-workflow-engine.md)의 append-only event 요구를 따릅니다.
 - canonical documentation은 계속 Git Markdown입니다. 이 store는 운영 상태만 담고 Constitution·PRD·spec·ADR을 대체하지 않습니다.
-- PostgreSQL, Redis, ORM은 도입하지 않습니다. 다중 worker 동시성이나 원격 접근이 실제 요구사항이 되면 별도 ADR로 재검토합니다.
+- PostgreSQL, Redis, ORM은 도입하지 않습니다.
+
+### 재검토 트리거
+
+다음 중 하나가 결정되면 즉시 이 ADR을 재검토합니다.
+
+- Control Plane과 worker를 서로 다른 host로 분리 배포하기로 결정 (Open Decision의 hosting 위치와 직결됩니다)
+- 여러 worker가 같은 Task queue를 동시에 처리해야 하는 요구 발생
+- store를 network로 접근해야 하는 요구 발생
 
 ## Alternatives Considered
 

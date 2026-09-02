@@ -13,7 +13,7 @@ polling은 이 ADR 승인 후 구현됐고 webhook은 아직 구현되지 않았
 
 ## Accepted Scope (2026-09-02)
 
-Project owner가 polling 구현을 지시하면서 이 ADR을 `Accepted`로 승인했습니다. 구현하면서 확정한 값과 계속 열려 있는 값을 구분합니다.
+Project owner가 PR #6 리뷰 과정에서 polling-first 방식의 장단점을 확인한 뒤 명시적으로 승인했습니다. 구현 지시 자체를 승인으로 해석한 것이 아니며, 승인 질의와 답변을 근거로 상태를 변경했습니다. 확정한 값과 계속 열려 있는 값을 구분합니다.
 
 **확정**
 
@@ -25,7 +25,7 @@ Project owner가 polling 구현을 지시하면서 이 ADR을 `Accepted`로 승�
 
 **계속 열림**
 
-- approval/queue signal의 canonical 조합. `atlas:queued` label 요구를 `require_queue_label` 설정으로 구현했지만 기본값은 비활성이며, 최종 정책과 필요한 permission은 미결입니다.
+- approval/queue signal로 `atlas:queued` label을 **필수로 확정**했습니다. GitHub가 label 추가를 triage 이상 권한자로 제한하므로 label 자체가 authorization gate 역할을 합니다. 다만 label을 추가한 actor의 권한을 Atlas가 직접 재확인하지는 않으며, 그 검증은 후속 과제입니다.
 - production scaling policy와 multi-repository fairness.
 - webhook migration 시점.
 
@@ -83,7 +83,8 @@ Project owner가 polling 구현을 지시하면서 이 ADR을 `Accepted`로 승�
 - [x] candidate Issue filter 확정 (open + non-PR + `[Atlas Task]` marker)
 - [x] polling interval, backoff, pagination을 설정으로 노출
 - [x] duplicate Task registration acceptance test 작성
-- [ ] approval/queue signal의 canonical 조합과 필요한 permission 확정
+- [x] approval/queue signal을 `atlas:queued` label 필수로 확정
+- [ ] label을 추가한 actor의 repository permission을 Atlas가 직접 재확인
 - [ ] duplicate Run/PR acceptance test 작성 (Run 생성은 아직 미구현)
 - [ ] rate-limit budget과 production scaling policy 결정
 - [ ] webhook migration trigger와 보안 요구사항 정의

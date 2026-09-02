@@ -231,6 +231,28 @@ class ClaimTest(StoreTestCase):
         claim = self.store.claim("worker-a", 900, task_id="ATLAS-0001")
         self.assertEqual(claim.task_id, "ATLAS-0001")
 
+    def test_non_positive_lease_ttl_is_rejected(self):
+        self.register()
+
+        with self.assertRaises(ValueError):
+            self.store.claim("worker-a", 0)
+        with self.assertRaises(ValueError):
+            self.store.claim("worker-a", -1)
+        self.assertIsNone(self.store.active_claim("ATLAS-0042"))
+
+    def test_negative_grace_period_is_rejected(self):
+        self.register()
+
+        with self.assertRaises(ValueError):
+            self.store.claim("worker-a", 900, grace_period_seconds=-1)
+
+    def test_non_positive_renew_ttl_is_rejected(self):
+        self.register()
+        claim = self.store.claim("worker-a", 900)
+
+        with self.assertRaises(ValueError):
+            self.store.renew_lease(claim.claim_id, -1)
+
     def test_release_of_unknown_claim_is_false(self):
         self.assertFalse(self.store.release("claim-nope", "x"))
 

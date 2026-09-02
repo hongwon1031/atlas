@@ -25,7 +25,7 @@
 4. Executor가 branch를 만들고 작업·검증한 뒤 PR을 생성합니다.
 5. 사용자가 PR에서 승인, 수정 요청, 폐기를 선택합니다.
 
-현재 `/atlas` command, `atlas:queued` label trigger, 자동 상태 comment, worker notification은 동작하지 않습니다.
+`atlas:queued` label을 붙이면 poller가 Task로 등록하고 claim 대상으로 삼습니다. `/atlas` command, 자동 상태 comment, worker notification은 동작하지 않습니다.
 
 ## Target MVP Workflow
 
@@ -41,7 +41,7 @@
 
 Codex Cloud는 사람이 직접 전달하는 manual executor 또는 secondary 경로이며 Target MVP primary path가 아닙니다.
 
-[ADR-008](adr/0008-initial-github-event-ingestion.md)의 polling-first와 [ADR-009](adr/0009-worker-process-supervision.md)의 tmux PoC는 `Proposed`입니다. polling, claim, Claude Code invocation, 자동 comment와 notification은 아직 동작하지 않습니다.
+[ADR-008](adr/0008-initial-github-event-ingestion.md)의 polling-first는 `Accepted`이며 polling과 claim은 동작합니다. `atlas:queued` label을 붙인 Issue만 후보가 됩니다. [ADR-009](adr/0009-worker-process-supervision.md)의 tmux PoC는 `Proposed`이고, Claude Code invocation, 자동 comment와 notification은 아직 동작하지 않습니다.
 
 ## Canonical Task Input
 

@@ -116,6 +116,18 @@ def make_issue(
     )
 
 
+QUEUE_LABEL = "atlas:queued"
+
+
+def make_approved_issue(*args, **kwargs) -> IssueRecord:
+    """approval gate(`atlas:queued` label)를 통과하는 후보 Issue."""
+
+    labels = tuple(kwargs.pop("labels", ()))
+    if QUEUE_LABEL not in labels:
+        labels += (QUEUE_LABEL,)
+    return make_issue(*args, labels=labels, **kwargs)
+
+
 class FakeIssueSource:
     """호출 횟수를 세는 in-memory `IssueSource` + `IssueLister`."""
 

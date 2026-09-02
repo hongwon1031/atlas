@@ -38,8 +38,9 @@ export PYTHONPATH=src
 python -m atlas 12
 
 # 후보 Issue를 polling해 valid Task를 저장
+# 후보 조건: open + non-PR + `[Atlas Task]` 제목 + `atlas:queued` label
 python -m atlas poll
-python -m atlas poll --watch --interval 60
+python -m atlas poll --watch --interval 60   # pass마다 한 줄씩 즉시 출력
 
 # 저장된 Task 확인과 claim
 python -m atlas tasks
@@ -49,6 +50,8 @@ python -m atlas release <claim-id> --reason done
 
 결과는 JSON으로 출력됩니다. exit code는 `0` 성공, `1` validation 실패 또는 claim 대상 없음, `2` source 오류입니다.
 
+**approval gate:** `atlas:queued` label이 없는 Issue는 후보가 되지 않습니다. GitHub는 label 추가를 triage 이상 권한자로 제한하므로, 공개 저장소에서 임의 사용자가 유효한 form을 작성해도 label을 달 수 없어 claim 대상이 되지 않습니다. `--no-queue-label`로 끌 수 있지만 그러면 approval gate가 사라집니다.
+
 | 환경변수 | 기본값 | 설명 |
 | --- | --- | --- |
 | `ATLAS_GITHUB_TOKEN` 또는 `GITHUB_TOKEN` | 없음 | repository read 권한 토큰 |
@@ -56,7 +59,7 @@ python -m atlas release <claim-id> --reason done
 | `ATLAS_REPOSITORY` | `hongwon1031/atlas` | polling 대상 |
 | `ATLAS_POLL_INTERVAL_SECONDS` | `60` | `--watch` 간격 |
 | `ATLAS_LEASE_TTL_SECONDS` | `900` | claim lease TTL |
-| `ATLAS_REQUIRE_QUEUE_LABEL` | 미설정 | `atlas:queued` label을 후보 조건으로 요구 |
+| `ATLAS_DISABLE_QUEUE_LABEL` | 미설정 | approval gate 해제. 신뢰된 repository에서만 사용 |
 
 token은 저장소에 두지 않고 환경변수로만 주입합니다. database 파일도 commit하지 않습니다. public repository의 Issue는 token 없이도 조회되지만 rate limit이 훨씬 낮습니다.
 
@@ -66,7 +69,7 @@ token은 저장소에 두지 않고 환경변수로만 주입합니다. database
 | --- | --- | --- |
 | 초기 문서·거버넌스 foundation | Complete | Agent guide, Task/PR contract, ADR register 존재 |
 | Codex Cloud manual delivery | Proven Manually | 사람 prompt → Codex branch 변경 → Codex PR → 사람 merge |
-| Runtime·isolation·ingestion specification | In Progress | ADR-008~010은 Proposed이며 구현 전 사람 승인 필요 |
+| Runtime·isolation specification | In Progress | ADR-009~010은 Proposed이며 구현 전 사람 승인 필요 |
 | Issue intake core | In Progress | 단건 fetch·parse·validate와 회귀 테스트 구현; valid Atlas Task live E2E 확인 필요 |
 | Polling, persistence, claim, lease | In Progress | polling·SQLite store·atomic claim·lease 구현; live valid Task로 end-to-end 확인 필요 |
 | self-hosted Claude Code automated path | Planned | primary automated executor로 결정됐지만 invocation 미구현 |
@@ -109,7 +112,7 @@ Codex Cloud에서 **사람 prompt → Codex branch 변경 → Codex PR → 사�
 10. Delivery Adapter가 PR과 mobile-friendly result summary를 생성합니다.
 11. 사람이 승인, 수정 요청, 취소 중 하나를 선택하고 merge를 결정합니다.
 
-Initial MVP ingestion은 [ADR-008](docs/adr/0008-initial-github-event-ingestion.md)에서 polling-first로 제안합니다. ADR이 승인되고 구현되기 전까지 comment command, label trigger, polling, webhook, 자동 claim은 동작하지 않습니다.
+Initial MVP ingestion은 [ADR-008](docs/adr/0008-initial-github-event-ingestion.md)의 polling-first이며 Accepted입니다. polling, Task 등록, atomic claim은 동작합니다. `atlas:queued` label이 approval signal이고, comment command, webhook, Run 실행, PR delivery는 아직 동작하지 않습니다.
 
 ## Executor and Model Support
 
@@ -143,7 +146,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 - public GitHub REST 조회·목록 경로는 실제 응답으로 확인했지만 valid Atlas Task Issue의 live E2E는 아직 수행하지 않았습니다.
 - operational store는 단일 SQLite 파일이라 여러 host가 공유할 수 없습니다.
 - schema migration runner가 없습니다. `schema_meta.schema_version`만 기록합니다.
-- Issue 작성자와 comment actor의 repository permission을 확인하지 않습니다.
+- `atlas:queued` label을 추가한 actor의 repository permission을 Atlas가 직접 재확인하지 않습니다. GitHub의 label 권한 제한에 의존합니다.
 - worker process supervision, persistence, heartbeat, crash recovery가 없습니다.
 - self-hosted Claude Code invocation과 Codex automated adapter가 없습니다.
 - automated context building, routing, usage detection, validation, PR delivery, mobile notification이 없습니다.
@@ -264,7 +267,7 @@ atlas/
 | 영역 | 상태 | 완료 기준 |
 | --- | --- | --- |
 | 제품 정의 | Complete | Accepted ADR-001~003 반영 |
-| 운영 명세 | In Progress | Proposed ADR-008~010 검토와 open question 해소 |
+| 운영 명세 | In Progress | Proposed ADR-004~007·009~010 검토와 open question 해소 |
 | 수동 delivery | Proven Manually | Codex branch → PR → human merge 재현 |
 | Issue intake | In Progress | 단건 fetch·parse·검증 구현; valid Task live E2E 확인 필요 |
 | 자동 실행 환경 | Not Implemented | mock vertical slice 이후 Claude Code integration 검증 |

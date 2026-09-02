@@ -278,7 +278,19 @@ class TaskStore:
         grace_period_seconds: float = 0.0,
         now: datetime | None = None,
     ) -> Claim | None:
-        """claim 가능한 Task 하나를 원자적으로 claim합니다. 없으면 `None`입니다."""
+        """claim 가능한 Task 하나를 원자적으로 claim합니다. 없으면 `None`입니다.
+
+        docs/specs/github-event-ingestion.md의 "Ingestion Claim Lease" 계약입니다.
+        Task 상태를 `Queued`나 `Running`으로 옮기지 않으며 executor를 실행하지
+        않습니다. state machine의 실행 claim과 구분됩니다.
+        """
+
+        if lease_ttl_seconds <= 0:
+            raise ValueError(f"lease_ttl_seconds는 0보다 커야 합니다: {lease_ttl_seconds!r}")
+        if grace_period_seconds < 0:
+            raise ValueError(
+                f"grace_period_seconds는 0 이상이어야 합니다: {grace_period_seconds!r}"
+            )
 
         moment = now or utcnow()
         stamp = to_iso(moment)
@@ -370,6 +382,9 @@ class TaskStore:
         self, claim_id: str, lease_ttl_seconds: float, now: datetime | None = None
     ) -> str | None:
         """lease를 연장합니다. heartbeat 구현의 확장 지점입니다."""
+
+        if lease_ttl_seconds <= 0:
+            raise ValueError(f"lease_ttl_seconds는 0보다 커야 합니다: {lease_ttl_seconds!r}")
 
         moment = now or utcnow()
         expires = to_iso(moment + timedelta(seconds=lease_ttl_seconds))

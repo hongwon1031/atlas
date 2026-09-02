@@ -26,7 +26,7 @@
 
 - Issue가 존재한다는 사실만으로 실행하지 않습니다.
 - Issue Form marker, supported repository, explicit approval/queue signal을 모두 확인합니다.
-- Current manual workflow에서 label과 `/atlas` command는 자동 효과가 없습니다.
+- `atlas:queued` label은 approval signal로 동작합니다. `/atlas` comment command는 아직 자동 효과가 없습니다.
 - Target MVP signal의 canonical 조합은 아직 확정되지 않았습니다. `atlas:queued` label 요구는 `require_queue_label` 설정으로 구현했으나 기본값은 비활성입니다.
 - Issue edit는 기존 승인을 자동으로 재사용하지 않습니다. 실행에 영향을 주는 field가 바뀌면 validation revision과 재승인이 필요합니다.
 

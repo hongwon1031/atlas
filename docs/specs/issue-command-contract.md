@@ -1,8 +1,8 @@
 # GitHub Issue Command Contract v0.1
 
-이 문서는 GitHub Issue를 Atlas의 초기 모바일 Task channel로 사용할 때 comment와 label이 Task 상태를 변경하는 Target MVP 규칙을 정의합니다. [ADR-002](../adr/0002-initial-mobile-task-channel.md)는 GitHub Issues와 기존 Atlas Task Issue Form을 Accepted intake로 확정했고, [ADR-008](../adr/0008-initial-github-event-ingestion.md)은 polling-first 감지를 `Proposed`로 제안합니다.
+이 문서는 GitHub Issue를 Atlas의 초기 모바일 Task channel로 사용할 때 comment와 label이 Task 상태를 변경하는 Target MVP 규칙을 정의합니다. [ADR-002](../adr/0002-initial-mobile-task-channel.md)는 GitHub Issues와 기존 Atlas Task Issue Form을 Accepted intake로 확정했고, [ADR-008](../adr/0008-initial-github-event-ingestion.md)의 polling-first 감지도 Accepted입니다.
 
-이 계약의 command와 label automation은 아직 구현되지 않았습니다. Current manual workflow에서 `/atlas` comment나 `atlas:*` label은 실행을 시작하지 않습니다.
+comment command automation은 아직 구현되지 않았습니다. `/atlas` comment는 아무 효과가 없습니다. `atlas:queued` label은 poller의 approval signal로 동작해 Task 등록과 claim 대상 여부를 결정하지만, Run 실행이나 PR delivery를 시작하지는 않습니다. label을 추가한 actor의 권한을 Atlas가 직접 재확인하지는 않습니다.
 
 ## Current Manual Workflow
 
@@ -49,9 +49,9 @@
 
 ## Label Trigger
 
-다음 규칙은 Target MVP에 적용됩니다. 현재 label 추가는 Task를 claim하거나 Executor를 호출하지 않습니다.
+현재 `atlas:queued` label 추가는 poller가 Task를 등록하고 claim 대상으로 삼는 approval signal입니다. Executor 호출과 Run 실행은 아직 하지 않습니다. 아래 조건 전체 검사는 Target MVP에 적용됩니다.
 
-`atlas:queued` label 추가는 `/atlas queue`와 같은 의도를 나타냅니다. 다음 조건을 모두 충족할 때만 transition을 수행합니다.
+`atlas:queued` label 추가는 `/atlas queue`와 같은 의도를 나타내며, 현재 poller가 이를 Task 등록의 approval signal로 사용합니다. 아래 조건 전체를 검사하는 상태 transition은 Run 실행이 구현될 때 적용됩니다.
 
 - label actor가 repository에서 triage 이상의 권한을 가집니다.
 - Task가 `ContextReady`입니다.

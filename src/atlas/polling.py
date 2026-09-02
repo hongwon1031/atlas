@@ -29,6 +29,8 @@ class PollReport:
     revised: tuple[str, ...] = ()
     unchanged: int = 0
     error: str | None = None
+    # provider가 지정한 재시도 대기 시간(초). backoff의 최소값으로 사용합니다.
+    retry_after: float | None = None
 
     @property
     def stored(self) -> int:
@@ -44,6 +46,7 @@ class PollReport:
             "unchanged": self.unchanged,
             "stored": self.stored,
             "error": self.error,
+            "retry_after": self.retry_after,
         }
 
 
@@ -96,6 +99,11 @@ class IssuePoller:
         """한 번의 polling pass. source 오류는 예외 대신 report로 돌려줍니다."""
 
         repository = self._config.repository
+        # allowlist 검사는 네트워크 호출보다 먼저 수행합니다. worker token이
+        # 접근할 수 있는 다른 repository를 경계 확인 전에 읽지 않기 위한 것입니다.
+        if policy.repository_policy(repository) is None:
+            return PollReport(error="repository_not_allowed")
+
         cursor = self._store.cursor(repository)
         try:
             issues = self._lister.list_open_issues(
@@ -106,7 +114,7 @@ class IssuePoller:
             )
         except IssueSourceError as error:
             # rate limit과 provider 오류로 Task를 실패 표시하지 않습니다.
-            return PollReport(error=error.category)
+            return PollReport(error=error.category, retry_after=error.retry_after)
 
         counters = _Counters()
         latest = cursor
@@ -155,15 +163,21 @@ class IssuePoller:
         sleep: Callable[[float], None] = time.sleep,
         on_report: Callable[[PollReport], None] | None = None,
     ) -> list[PollReport]:
-        """interval 간격으로 반복 polling합니다. 오류에는 지수 backoff을 적용합니다."""
+        """interval 간격으로 반복 polling합니다. 오류에는 지수 backoff을 적용합니다.
 
+        `max_iterations`가 `None`이면 무한 실행이므로 report를 누적하지 않고
+        `on_report`로만 흘려보냅니다. 누적하면 메모리가 무한히 증가합니다.
+        """
+
+        bounded = max_iterations is not None
         reports: list[PollReport] = []
         failures = 0
         iteration = 0
-        while max_iterations is None or iteration < max_iterations:
+        while not bounded or iteration < max_iterations:
             iteration += 1
             report = self.poll_once()
-            reports.append(report)
+            if bounded:
+                reports.append(report)
             if on_report is not None:
                 on_report(report)
 
@@ -172,9 +186,10 @@ class IssuePoller:
                 delay = self._config.interval_seconds
             else:
                 failures += 1
-                delay = self._config.backoff_delay(failures)
+                # provider가 Retry-After로 지정한 대기 시간을 최소값으로 존중합니다.
+                delay = max(self._config.backoff_delay(failures), report.retry_after or 0.0)
 
-            if max_iterations is None or iteration < max_iterations:
+            if not bounded or iteration < max_iterations:
                 sleep(delay)
         return reports
 

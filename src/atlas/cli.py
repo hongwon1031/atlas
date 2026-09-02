@@ -31,6 +31,26 @@ _ISSUE_NUMBER = re.compile(r"^\d+$")
 COMMANDS = ("show", "poll", "claim", "release", "tasks")
 
 
+def _positive_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"숫자가 아닙니다: {raw!r}") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"0보다 커야 합니다: {raw!r}")
+    return value
+
+
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"정수가 아닙니다: {raw!r}") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"0보다 커야 합니다: {raw!r}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     # 공통 flag는 subcommand 앞뒤 어디에 와도 받도록 parent로 공유합니다.
     # default를 SUPPRESS로 두지 않으면 subparser의 기본값이 상위 parser가 이미
@@ -52,21 +72,25 @@ def build_parser() -> argparse.ArgumentParser:
     show = subparsers.add_parser(
         "show", parents=[common], help="Issue 한 건을 parse·검증만 합니다 (저장 없음)"
     )
-    show.add_argument("issue_number", type=int)
+    show.add_argument("issue_number", type=_positive_int)
 
     poll = subparsers.add_parser(
         "poll", parents=[common], help="후보 Issue를 polling해 valid Task를 저장합니다"
     )
     poll.add_argument("--watch", action="store_true", help="interval 간격으로 반복 실행")
-    poll.add_argument("--interval", type=float, default=None, help="polling 간격(초)")
-    poll.add_argument("--iterations", type=int, default=None, help="--watch의 최대 반복 횟수")
-    poll.add_argument("--require-queue-label", action="store_true", help="queue label 필수화")
+    poll.add_argument("--interval", type=_positive_float, default=None, help="polling 간격(초)")
+    poll.add_argument("--iterations", type=_positive_int, default=None, help="--watch의 최대 반복 횟수")
+    poll.add_argument(
+        "--no-queue-label",
+        action="store_true",
+        help="approval gate를 끕니다. queue label 없는 후보도 등록되므로 신뢰된 repository에서만 사용하세요",
+    )
 
     claim = subparsers.add_parser(
         "claim", parents=[common], help="Task 하나를 원자적으로 claim합니다"
     )
     claim.add_argument("--worker-id", default=None, help="기본값은 host 기반 식별자")
-    claim.add_argument("--lease-ttl", type=float, default=None, help="lease TTL(초)")
+    claim.add_argument("--lease-ttl", type=_positive_float, default=None, help="lease TTL(초)")
     claim.add_argument("--task-id", default=None, help="특정 Task만 claim")
 
     release = subparsers.add_parser("release", parents=[common], help="claim을 해제합니다")
@@ -113,8 +137,8 @@ def _config(args: argparse.Namespace) -> WorkerConfig:
         polling = replace(polling, repository=repository)
     if interval := _option(args, "interval"):
         polling = replace(polling, interval_seconds=interval)
-    if _option(args, "require_queue_label", False):
-        polling = replace(polling, require_queue_label=True)
+    if _option(args, "no_queue_label", False):
+        polling = replace(polling, require_queue_label=False)
     claim = config.claim
     if lease_ttl := _option(args, "lease_ttl"):
         claim = replace(claim, lease_ttl_seconds=lease_ttl)
@@ -161,9 +185,18 @@ def _run_poll(args: argparse.Namespace, config: WorkerConfig) -> int:
     with TaskStore(config.database_path) as store:
         poller = IssuePoller(source, IssueIntake(source), store, config.polling)
         if args.watch:
-            reports = poller.run(max_iterations=args.iterations)
-            _emit({"status": "Polled", "passes": [r.to_dict() for r in reports]}, _option(args, "indent", 2))
-            return 0 if all(r.error is None for r in reports) else 2
+            # 무한 watch는 종료되지 않으므로 pass마다 한 줄씩 즉시 출력합니다.
+            # `run()`도 unbounded면 report를 누적하지 않습니다.
+            failed = False
+
+            def emit_pass(report) -> None:
+                nonlocal failed
+                failed = failed or report.error is not None
+                _emit({"status": "Polled", **report.to_dict()}, 0)
+                sys.stdout.flush()
+
+            poller.run(max_iterations=args.iterations, on_report=emit_pass)
+            return 0 if not failed else 2
         report = poller.poll_once()
         _emit({"status": "Polled", **report.to_dict()}, _option(args, "indent", 2))
         return 0 if report.error is None else 2

@@ -51,7 +51,7 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 7. `docs/security-governance.md`
 8. `docs/specs/task-schema.md`와 `docs/specs/task-state-machine.md`
 9. runtime 작업은 `docs/specs/execution-runtime.md`, routing 작업은 `docs/specs/agent-registry.md`와 `docs/specs/usage-availability.md`, ingestion 작업은 `docs/specs/github-event-ingestion.md`
-10. Task에 적용되는 `docs/specs/`, `docs/adr/`, `docs/research/` 문서. ADR-008~010은 `Proposed` 상태임을 확인합니다.
+10. Task에 적용되는 `docs/specs/`, `docs/adr/`, `docs/research/` 문서. ADR-008·011·012는 `Accepted`이고 ADR-004~007·009·010은 `Proposed` 상태임을 확인합니다.
 11. `docs/context-memory.md`, `docs/agents-router-scheduler.md`, `docs/mobile-workflow.md` 중 Task 관련 문서
 12. 연결된 GitHub Issue, 이전 PR, 현재 브랜치의 변경 내용
 
@@ -65,7 +65,7 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 - 적용할 ADR의 상태가 `Accepted`인지 `Proposed`인지 구분합니다.
 - 변경에 필요한 최소 권한과 검증 방법을 먼저 결정합니다.
 - Task가 문서·거버넌스 전용이면 application code, dependency, CI, infrastructure를 추가하지 않습니다.
-- 현재 manual workflow에서는 사람이 해당 GitHub Issue를 이 Executor에게 명시적으로 전달했는지 확인합니다. Issue가 존재한다는 사실만으로 자동 claim하지 않습니다.
+- Issue가 존재한다는 사실만으로 Task 후보가 되지 않습니다. `atlas:queued` label이 approval signal이며, GitHub가 label 추가를 triage 이상 권한자로 제한하는 것이 현재의 authorization gate입니다.
 - Target MVP의 worker가 구현되기 전에는 `/atlas` command나 `atlas:*` label이 작업을 자동 시작한다고 가정하지 않습니다.
 - `python -m atlas <issue-number>`는 단건 validation 결과만 출력하며 저장하지 않습니다. `poll`은 valid Task를 저장하고 `claim`은 lease를 잡지만 어느 쪽도 executor를 실행하지 않습니다.
 - worker recovery, heartbeat, usage detection, routing, automated validation, mobile notification이 구현됐다고 가정하지 않습니다.

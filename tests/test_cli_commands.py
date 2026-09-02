@@ -103,13 +103,48 @@ class CommonOptionTest(unittest.TestCase):
         self.assertEqual(_option(args, "indent", 2), 0)
 
 
+class NegativeArgumentTest(unittest.TestCase):
+    """음수 interval과 lease TTL은 argparse 단계에서 거부해야 합니다."""
+
+    def parse(self, argv):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return build_parser().parse_args(argv)
+
+    def test_negative_interval_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["poll", "--interval", "-1"])
+
+    def test_zero_interval_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["poll", "--interval", "0"])
+
+    def test_negative_lease_ttl_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["claim", "--lease-ttl", "-1"])
+
+    def test_negative_iterations_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["poll", "--watch", "--iterations", "-1"])
+
+    def test_non_positive_issue_number_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.parse(_normalize(["0"]))
+
+    def test_positive_values_are_accepted(self):
+        args = self.parse(["poll", "--interval", "5", "--iterations", "2"])
+
+        self.assertEqual(args.interval, 5.0)
+        self.assertEqual(args.iterations, 2)
+
+
 class ConfigTest(unittest.TestCase):
     def test_defaults_are_conservative(self):
         config = WorkerConfig()
 
         self.assertEqual(config.database_path, "atlas.db")
         self.assertEqual(config.polling.repository, "hongwon1031/atlas")
-        self.assertFalse(config.polling.require_queue_label)
+        # approval gate는 기본으로 켜져 있어야 합니다.
+        self.assertTrue(config.polling.require_queue_label)
         self.assertGreater(config.claim.lease_ttl_seconds, 0)
         self.assertEqual(config.claim.grace_period_seconds, 0.0)
 
@@ -120,7 +155,7 @@ class ConfigTest(unittest.TestCase):
                 "ATLAS_REPOSITORY": "owner/name",
                 "ATLAS_POLL_INTERVAL_SECONDS": "15",
                 "ATLAS_LEASE_TTL_SECONDS": "120",
-                "ATLAS_REQUIRE_QUEUE_LABEL": "true",
+                "ATLAS_DISABLE_QUEUE_LABEL": "true",
             }
         )
 
@@ -128,7 +163,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.polling.repository, "owner/name")
         self.assertEqual(config.polling.interval_seconds, 15.0)
         self.assertEqual(config.claim.lease_ttl_seconds, 120.0)
-        self.assertTrue(config.polling.require_queue_label)
+        self.assertFalse(config.polling.require_queue_label)
 
     def test_from_env_ignores_invalid_numbers(self):
         config = WorkerConfig.from_env(
@@ -140,6 +175,19 @@ class ConfigTest(unittest.TestCase):
 
     def test_from_env_with_no_variables_matches_defaults(self):
         self.assertEqual(WorkerConfig.from_env({}), WorkerConfig())
+
+    def test_negative_config_values_are_rejected(self):
+        with self.assertRaises(ValueError):
+            PollingConfig(interval_seconds=-1)
+        with self.assertRaises(ValueError):
+            PollingConfig(per_page=0)
+        with self.assertRaises(ValueError):
+            ClaimConfig(lease_ttl_seconds=-1)
+        with self.assertRaises(ValueError):
+            ClaimConfig(grace_period_seconds=-1)
+
+    def test_zero_grace_period_is_allowed(self):
+        self.assertEqual(ClaimConfig(grace_period_seconds=0).grace_period_seconds, 0)
 
     def test_backoff_is_capped(self):
         config = PollingConfig(

@@ -10,7 +10,7 @@
 
 현재 가능한 운영 흐름은 **GitHub Issue 생성 → 사람이 Issue를 Executor에게 전달 → Executor가 branch에서 작업·검증 → PR 생성 → 사람 review/merge**입니다.
 
-사람이 번호를 지정한 GitHub Issue 한 건의 fetch·parse·schema validation core는 구현됐습니다. Atlas worker, webhook/polling, 자동 claim, persistence, self-hosted Claude Code invocation, Run validation automation, GitHub delivery automation은 아직 구현되지 않았습니다.
+GitHub Issue polling, parse·schema validation, Task persistence, atomic claim과 lease는 구현됐습니다. webhook, Run record, self-hosted Claude Code invocation, Run validation automation, GitHub delivery automation은 아직 구현되지 않았습니다.
 
 Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge** 흐름은 `Proven Manually`입니다. Atlas-to-Codex automated invocation은 `Feasibility Unverified`이며 adapter backlog로 이동하기 전에 별도 integration validation이 필요합니다.
 
@@ -28,7 +28,8 @@ Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge*
 - [x] AI Agent guide, Task contract, PR contract, ADR 문서 foundation
 - [x] execution runtime, Agent Registry, usage, polling ingestion, Project lifecycle specification 초안
 - [x] 초기 구현 언어를 Python으로 확정 (ADR-011)
-- [ ] Proposed ADR-004~010 검토; ADR-004~007은 계속 Proposed
+- [x] ADR-008 polling-first, ADR-011 구현 언어, ADR-012 operational store 승인
+- [ ] Proposed ADR-004~007·009~010 검토
 
 ## Milestone M1 — Automated Issue-to-PR Vertical Slice
 
