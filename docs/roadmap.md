@@ -10,7 +10,7 @@
 
 현재 가능한 운영 흐름은 **GitHub Issue 생성 → 사람이 Issue를 Executor에게 전달 → Executor가 branch에서 작업·검증 → PR 생성 → 사람 review/merge**입니다.
 
-사람이 번호를 지정한 GitHub Issue 한 건의 fetch·parse·schema validation core는 구현됐습니다. Atlas worker, webhook/polling, 자동 claim, persistence, self-hosted Claude Code invocation, Run validation automation, GitHub delivery automation은 아직 구현되지 않았습니다.
+GitHub Issue polling, parse·schema validation, Task persistence, atomic claim과 lease는 구현됐습니다. webhook, Run record, self-hosted Claude Code invocation, Run validation automation, GitHub delivery automation은 아직 구현되지 않았습니다.
 
 Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge** 흐름은 `Proven Manually`입니다. Atlas-to-Codex automated invocation은 `Feasibility Unverified`이며 adapter backlog로 이동하기 전에 별도 integration validation이 필요합니다.
 
@@ -28,7 +28,8 @@ Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge*
 - [x] AI Agent guide, Task contract, PR contract, ADR 문서 foundation
 - [x] execution runtime, Agent Registry, usage, polling ingestion, Project lifecycle specification 초안
 - [x] 초기 구현 언어를 Python으로 확정 (ADR-011)
-- [ ] Proposed ADR-004~010 검토; ADR-004~007은 계속 Proposed
+- [x] ADR-008 polling-first, ADR-011 구현 언어, ADR-012 operational store 승인
+- [ ] Proposed ADR-004~007·009~010 검토
 
 ## Milestone M1 — Automated Issue-to-PR Vertical Slice
 
@@ -38,17 +39,17 @@ Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge*
 
 - [x] GitHub Issue Template 생성
 - [x] Task Schema와 Issue Command Contract 작성
-- [ ] ADR-008 polling-first 제안 승인
+- [x] ADR-008 polling-first 승인
 - [x] Issue payload parser와 Task 필수 필드 검증
 - [x] Project allowlist 확인 (actor repository permission 확인은 claim 단계로 남음)
-- [ ] idempotent claim, lease, duplicate event 방지
-- [ ] polling cursor, backoff, pagination, rate-limit handling
+- [x] idempotent claim, lease, duplicate event 방지
+- [x] polling cursor, backoff, pagination handling (rate-limit budget은 미결)
 - [ ] 수동 workflow를 유지하는 safe rollout flag
 
 ### Epic 2. Isolated Worker Runtime
 
 - [ ] provider-neutral Executor Adapter 최소 interface
-- [ ] 최소 Task, Run, claim lease, heartbeat persistence
+- [x] 최소 Task, claim lease persistence (Run과 heartbeat는 후속)
 - [ ] Task별 worktree/clone, branch, process, Run ID, log scope
 - [ ] mock executor invocation
 - [ ] timeout, cancel, retry, process/worktree cleanup
@@ -164,8 +165,9 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 - [x] MVP primary automated Executor를 self-hosted Claude Code worker로 결정
 - [ ] 공개 저장소에 노출하면 안 되는 개인 정보 제거
 - [x] GitHub Markdown canonical / Notion optional mirror 결정
-- [ ] ADR-008 polling-first, ADR-009 tmux PoC, ADR-010 isolation 제안 검토
-- [ ] polling interval, server hosting, stable supervisor, network egress 결정
+- [x] ADR-008 polling-first 승인
+- [ ] ADR-009 tmux PoC, ADR-010 isolation 제안 검토
+- [ ] server hosting, stable supervisor, network egress, rate-limit budget 결정
 - [ ] 첫 Atlas Task Issue 세트 생성
 - [ ] mock executor 문서 Task PR 실험 수행
 - [ ] 별도 후속 PR에서 self-hosted Claude Code worker 문서 Task 실험 수행
@@ -173,9 +175,9 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 ## Recommended Next Implementation Sprint
 
 1. ~~Atlas GitHub Issue를 parse하고 validate합니다.~~ (완료 — `src/atlas/`)
-2. valid Atlas Task Issue의 live E2E를 확인하고 approved 또는 queued Task polling을 구현합니다.
-3. 한 Task를 idempotent하게 claim합니다.
-4. 최소 Task와 Run 상태를 persist합니다.
+2. ~~approved 또는 queued Task polling을 구현합니다.~~ (완료 — `polling.py`)
+3. ~~한 Task를 idempotent하게 claim합니다.~~ (완료 — `store.py`)
+4. ~~valid Atlas Task Issue의 live E2E를 확인합니다.~~ (완료 — Issue #7) Run record와 heartbeat를 추가합니다.
 5. 격리된 worktree와 branch를 생성합니다.
 6. Task별 새 process에서 mock executor를 호출합니다.
 7. 결과를 validate하고 draft PR을 생성합니다.

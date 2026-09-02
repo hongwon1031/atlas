@@ -15,7 +15,7 @@ Sprint 1은 GitHub Issue Form과 comment command 계약을 문서화했지만 �
 
 - 초기 모바일 Task intake channel은 GitHub Issues입니다.
 - 기존 `.github/ISSUE_TEMPLATE/atlas-task.yml`을 canonical 구조화 입력 인터페이스로 사용합니다.
-- 현재는 사람이 Issue를 확인하고 선택한 Executor에게 전달합니다. comment command, label trigger, webhook, polling, 자동 claim은 동작하지 않습니다.
+- polling과 `atlas:queued` label trigger, Task 등록, ingestion claim은 동작합니다. comment command, webhook, Run 실행, PR delivery는 동작하지 않으므로 사람이 Executor에게 전달합니다.
 - 목표 MVP에서는 Atlas worker가 Issue를 검증하고 claim하며, 권한 있는 사용자는 [Issue Command Contract](../specs/issue-command-contract.md)에 정의된 comment와 label로 Task를 제어합니다.
 - 자동화 이후 실행 상태는 Atlas Task state가 canonical이며 GitHub label은 projection으로 취급합니다.
 - 전용 Web UI는 Task → PR 경로가 검증된 뒤 검토합니다.

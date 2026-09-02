@@ -153,11 +153,11 @@ Atlas는 모바일에서 받은 개발 지시를 프로젝트 단위의 실행 �
 
 ## Open Questions
 
-- Proposed polling-first ingestion의 interval, backoff, production scaling policy
+- Accepted polling-first ingestion의 rate-limit budget과 production scaling policy
 - always-available server의 hosting 위치와 stable supervisor로 systemd/Docker 중 무엇을 선택할지
 - self-hosted Claude Code worker의 인증 방식과 availability 확인 정책
 - Codex Cloud secondary fallback을 자동화할지 사람 배정으로만 둘지
 - Atlas의 초기 개발 언어와 Control Plane 배포 위치
 - network egress, secret scanning, branch protection의 구체적인 policy
 
-문서 원본, 초기 intake channel, primary automated Executor 결정은 각각 ADR-001, ADR-002, ADR-003에서 Accepted됐습니다. Polling-first ingestion, tmux PoC supervision, Task execution isolation은 ADR-008~010의 Proposed 방향이며 구현 근거로 승인되지 않았습니다.
+문서 원본, 초기 intake channel, primary automated Executor 결정은 각각 ADR-001, ADR-002, ADR-003에서 Accepted됐습니다. Polling-first ingestion(ADR-008), 구현 언어(ADR-011), operational state store(ADR-012)도 Accepted입니다. tmux PoC supervision과 Task execution isolation은 ADR-009~010의 Proposed 방향이며 구현 근거로 승인되지 않았습니다.

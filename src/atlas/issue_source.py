@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Protocol
@@ -34,6 +35,7 @@ class IssueRecord:
     created_at: str
     updated_at: str
     is_pull_request: bool = False
+    labels: tuple[str, ...] = ()
 
     @property
     def uri(self) -> str:
@@ -52,6 +54,14 @@ class IssueSourceError(Exception):
 
 class IssueSource(Protocol):
     def fetch_issue(self, repository: str, number: int) -> IssueRecord: ...
+
+
+class IssueLister(Protocol):
+    """polling이 사용하는 목록 조회 경계."""
+
+    def list_issues(
+        self, repository: str, since: str | None = None, per_page: int = 50, max_pages: int = 10
+    ) -> list[IssueRecord]: ...
 
 
 def resolve_token(environ: dict[str, str] | None = None) -> str | None:
@@ -75,19 +85,70 @@ class GitHubRestIssueSource:
         self._token = token if token is not None else resolve_token()
         self._api_base = api_base.rstrip("/")
         self._timeout = timeout
+        self._repository_ids: dict[str, str] = {}
 
     def fetch_issue(self, repository: str, number: int) -> IssueRecord:
         if number <= 0:
             raise IssueSourceError("invalid_request", "Issue 번호는 1 이상이어야 합니다.")
 
-        repo = self._get(f"/repos/{repository}")
+        repository_id = self._repository_id(repository)
         issue = self._get(f"/repos/{repository}/issues/{number}")
-        user = issue.get("user") or {}
+        return self._to_record(repository, repository_id, issue, fallback_number=number)
 
+    def list_issues(
+        self, repository: str, since: str | None = None, per_page: int = 50, max_pages: int = 10
+    ) -> list[IssueRecord]:
+        """Issue를 `updated` 오름차순으로 조회합니다.
+
+        `since`는 polling cursor입니다. Pull Request는 결과에서 제외합니다.
+
+        닫힌 Issue도 포함합니다. label 제거나 Issue 종료를 poller가 관찰해 승인을
+        회수할 수 있어야 하기 때문입니다. open만 조회하면 닫힌 Issue가 목록에서
+        사라져 reconciliation이 불가능합니다.
+        """
+
+        repository_id = self._repository_id(repository)
+        records: list[IssueRecord] = []
+        for page in range(1, max(1, max_pages) + 1):
+            query = [
+                "state=all",
+                "sort=updated",
+                "direction=asc",
+                f"per_page={max(1, min(per_page, 100))}",
+                f"page={page}",
+            ]
+            if since:
+                query.append(f"since={urllib.parse.quote(since)}")
+            payload = self._get(f"/repos/{repository}/issues?{'&'.join(query)}")
+            if not isinstance(payload, list):
+                raise IssueSourceError("invalid_response", "Issue 목록 응답 형식이 예상과 다릅니다.")
+
+            for issue in payload:
+                record = self._to_record(repository, repository_id, issue)
+                if not record.is_pull_request:
+                    records.append(record)
+            if len(payload) < per_page:
+                break
+        return records
+
+    def _repository_id(self, repository: str) -> str:
+        if repository not in self._repository_ids:
+            self._repository_ids[repository] = str(self._get(f"/repos/{repository}").get("id", ""))
+        return self._repository_ids[repository]
+
+    @staticmethod
+    def _to_record(
+        repository: str, repository_id: str, issue: dict, fallback_number: int = 0
+    ) -> IssueRecord:
+        user = issue.get("user") or {}
+        labels = tuple(
+            str(label.get("name", "")) if isinstance(label, dict) else str(label)
+            for label in (issue.get("labels") or [])
+        )
         return IssueRecord(
             repository=repository,
-            repository_id=str(repo.get("id", "")),
-            number=int(issue.get("number", number)),
+            repository_id=repository_id,
+            number=int(issue.get("number", fallback_number)),
             issue_id=str(issue.get("id", "")),
             title=issue.get("title") or "",
             body=issue.get("body") or "",
@@ -96,9 +157,10 @@ class GitHubRestIssueSource:
             created_at=issue.get("created_at") or "",
             updated_at=issue.get("updated_at") or "",
             is_pull_request="pull_request" in issue,
+            labels=labels,
         )
 
-    def _get(self, path: str) -> dict:
+    def _get(self, path: str):
         request = urllib.request.Request(
             f"{self._api_base}{path}",
             headers=self._headers(),
@@ -132,9 +194,11 @@ class GitHubRestIssueSource:
         remaining = headers.get("X-RateLimit-Remaining")
         retry_after = _parse_retry_after(headers.get("Retry-After"))
 
-        # 429는 header가 없어도 항상 rate limit입니다. secondary rate limit 응답은
-        # X-RateLimit-Remaining을 포함하지 않습니다.
-        if status == 429 or (status == 403 and remaining == "0"):
+        # 429는 header가 없어도 항상 rate limit입니다. 403은 quota 소진
+        # (remaining == "0")이거나 secondary rate limit(Retry-After 제공)일 때
+        # rate limit으로 분류합니다. secondary rate limit 응답은
+        # X-RateLimit-Remaining을 포함하지 않으므로 remaining만 보면 놓칩니다.
+        if status == 429 or (status == 403 and (remaining == "0" or retry_after is not None)):
             return IssueSourceError(
                 "rate_limited", "GitHub API rate limit에 도달했습니다.", retry_after=retry_after
             )

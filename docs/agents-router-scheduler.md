@@ -149,7 +149,7 @@ Issue 생성, `/atlas` command, label 변경만으로 실행이 자동 시작되
 - [ ] 개인/회사 authentication profile을 분리한 Agent Registry schema 구현
 - [ ] Availability와 rolling/weekly reset 수동 입력 구현
 - [ ] primary-only 규칙 기반 Router 최소 구현
-- [ ] worker claim lease와 heartbeat 정책 구현
+- [x] worker claim lease 구현 (heartbeat 정책은 후속)
 - [ ] 재시도·Fallback 정책 구현
 - [ ] 동일 브랜치 동시 실행 Lock 구현
 - [ ] Reviewer 분리 정책 구현

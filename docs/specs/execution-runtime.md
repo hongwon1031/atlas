@@ -7,7 +7,8 @@
 | 항목 | 상태 | 설명 |
 | --- | --- | --- |
 | 사람이 Executor에 Task 전달 | Proven Manually | 사람이 prompt를 전달하고 Executor가 branch와 PR을 생성 |
-| Atlas worker | Not Implemented | polling, claim, process 관리 없음 |
+| Atlas worker polling·claim·lease | Complete | Issue polling, Task persistence, atomic claim, lease TTL, 승인 회수 구현. live E2E는 [Verification Log](../verification-log.md) 참조 |
+| Run record와 process 관리 | Not Implemented | Run 생성, worktree, executor process 없음 |
 | self-hosted Claude Code invocation | Planned | Target MVP primary automated executor |
 | tmux worker PoC | Planned | process persistence 용도; service manager가 아님 |
 | systemd 또는 Docker supervision | Planned | stable operation에서 별도 결정 |
@@ -78,7 +79,7 @@ status: Running
 - source Issue, approval/queue command, Task revision을 묶은 idempotency key를 유지합니다.
 - 같은 poll result나 command를 반복 처리하면 기존 Task, Run, PR 결과를 반환합니다.
 - PR delivery도 `task_id`, `run_id`, head branch 또는 delivery key로 중복을 방지합니다.
-- lease expiry만으로 즉시 재실행하지 않고 worker heartbeat와 process ownership을 확인합니다.
+- lease expiry만으로 즉시 재실행하지 않고 worker heartbeat와 process ownership을 확인합니다. 현재 구현은 TTL 만료와 설정 가능한 grace period까지이며 heartbeat와 process identity 확인은 미구현입니다. 회수 시 이전 owner와 expiry를 event로 남깁니다.
 
 ## Restart and Recovery
 

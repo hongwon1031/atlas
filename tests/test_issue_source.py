@@ -31,6 +31,19 @@ class ErrorClassificationTest(unittest.TestCase):
         error = self.classify(403, {"X-RateLimit-Remaining": "0"})
         self.assertEqual(error.category, "rate_limited")
 
+    def test_403_with_retry_after_is_secondary_rate_limit(self):
+        """secondary rate limit은 X-RateLimit-Remaining을 포함하지 않습니다."""
+
+        error = self.classify(403, {"Retry-After": "120", "X-RateLimit-Remaining": "10"})
+
+        self.assertEqual(error.category, "rate_limited")
+        self.assertEqual(error.retry_after, 120)
+
+    def test_403_without_retry_after_stays_authentication(self):
+        error = self.classify(403, {"X-RateLimit-Remaining": "10"})
+
+        self.assertEqual(error.category, "authentication")
+
     def test_429_is_rate_limited_even_without_ratelimit_header(self):
         """secondary rate limit 응답은 X-RateLimit-Remaining을 포함하지 않습니다."""
 

@@ -1,8 +1,8 @@
 # Task State Machine v0.1
 
-이 문서는 Atlas Task와 Run의 수명주기를 정의합니다. 상태는 UI 표시가 아니라 권한, 재시도, 감사 로그를 제어하는 계약입니다. persistence와 workflow engine 구현은 아직 선택하지 않습니다.
+이 문서는 Atlas Task와 Run의 수명주기를 정의합니다. 상태는 UI 표시가 아니라 권한, 재시도, 감사 로그를 제어하는 계약입니다. operational state store는 [ADR-012](../adr/0012-operational-state-store.md)에서 SQLite로 확정했고 workflow engine은 [ADR-004](../adr/0004-workflow-engine.md)의 `Proposed` 방향입니다.
 
-현재는 상태 저장과 자동 transition이 구현되지 않았습니다. Current manual workflow에서는 사람이 Issue를 Executor에게 전달하고 Issue/PR 기록으로 논리적 상태를 추적합니다. Target MVP에서는 Atlas worker가 transition, claim lease, event log를 관리합니다.
+현재 구현된 상태는 `Draft`와 `NeedsClarification`뿐입니다. poller가 valid Task를 `Draft`로 저장하고 append-only event log를 남기며, ingestion claim lease를 원자적으로 관리합니다. `Draft` 이후의 자동 transition(`Planned` 이상)은 구현되지 않았고 사람이 Issue/PR 기록으로 추적합니다.
 
 ## States
 
@@ -186,6 +186,6 @@ evidence:
 - PR approval과 merge를 각각 상태로 분리할지
 - timeout과 retry budget의 Task별 기본값
 - Issue label을 상태의 source of truth로 사용할지 projection으로만 사용할지
-- Proposed polling-first trigger의 interval, backoff, production scaling policy
+- polling-first trigger의 rate-limit budget과 production scaling policy
 - claim lease duration, heartbeat, abandoned Run recovery 정책
 - polling interval, source revision과 approval signal idempotency key
