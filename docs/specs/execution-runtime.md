@@ -7,7 +7,7 @@
 | 항목 | 상태 | 설명 |
 | --- | --- | --- |
 | 사람이 Executor에 Task 전달 | Proven Manually | 사람이 prompt를 전달하고 Executor가 branch와 PR을 생성 |
-| Atlas worker polling·claim·lease | In Progress | Issue polling, Task persistence, atomic claim, lease TTL 구현 |
+| Atlas worker polling·claim·lease | Complete | Issue polling, Task persistence, atomic claim, lease TTL, 승인 회수 구현. live E2E는 [Verification Log](../verification-log.md) 참조 |
 | Run record와 process 관리 | Not Implemented | Run 생성, worktree, executor process 없음 |
 | self-hosted Claude Code invocation | Planned | Target MVP primary automated executor |
 | tmux worker PoC | Planned | process persistence 용도; service manager가 아님 |

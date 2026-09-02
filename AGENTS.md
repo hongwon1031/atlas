@@ -131,7 +131,8 @@ application code가 명시적으로 승인된 Task에서만 다음 원칙을 적
 - 사실, Accepted 결정, Proposed 권고, Open Question을 명확히 구분합니다.
 - GitHub Markdown만 canonical policy와 decision으로 사용합니다. Notion 내용을 반영하려면 GitHub PR로 동기화하고 merge해야 합니다.
 - 현재 manual workflow와 Target MVP automation을 한 문단에서 혼용하지 않습니다.
-- 정규 계약은 `docs/specs/`, 결정과 대안은 `docs/adr/`, 조사 결과는 `docs/research/`에 둡니다.
+- 정규 계약은 `docs/specs/`, 결정과 대안은 `docs/adr/`, 조사 결과는 `docs/research/`, 실제 환경 검증 기록은 `docs/verification-log.md`에 둡니다.
+- 외부 시스템으로 end-to-end 검증을 수행하면 확인한 항목과 확인하지 못한 항목을 `docs/verification-log.md`에 남깁니다. PR comment만으로는 canonical 기록이 되지 않습니다.
 - 한 개념의 정규 정의를 한 곳에 두고 다른 문서는 상대 링크로 참조합니다.
 - Markdown heading, table, code fence, 상대 링크를 일관되게 사용합니다.
 - 구조나 파일을 바꾸면 README와 해당 인덱스를 함께 갱신합니다.

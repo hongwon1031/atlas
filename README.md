@@ -145,7 +145,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 - webhook ingestion이 없습니다. polling만 있으며 지연은 interval에 좌우됩니다.
 - Run record를 만들지 않습니다. claim은 Task lease까지이고 `active_run_id`는 계속 null입니다.
 - heartbeat와 worker restart reconciliation이 없습니다. lease는 TTL 만료와 grace period로만 회수됩니다.
-- live E2E는 Issue #7로 확인했습니다: poll 등록 → 중복 미생성 → claim → active lease 차단 → label 제거 후 승인 회수 → claim 거부 → label 재부착 후 복구 → Issue 종료 후 회수.
+- live E2E는 Issue #7로 확인했습니다. 단계별 결과는 [Verification Log](docs/verification-log.md)에 있습니다.
 - operational store는 단일 SQLite 파일이라 여러 host가 공유할 수 없습니다.
 - schema migration runner가 없습니다. `schema_meta.schema_version`만 기록합니다.
 - `atlas:queued` label을 추가한 actor의 repository permission을 Atlas가 직접 재확인하지 않습니다. GitHub의 label 권한 제한에 의존합니다.
@@ -193,6 +193,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 - [기존 시스템 조사 계획](docs/research/existing-systems.md)
 - [로드맵, Epic과 백로그](docs/roadmap.md)
 - [ADR 등록부와 미해결 결정](docs/adr/README.md)
+- [검증 기록](docs/verification-log.md)
 
 ### 실행 계약
 
@@ -240,6 +241,7 @@ atlas/
     ├── mobile-workflow.md            # 모바일 Task와 review 흐름
     ├── security-governance.md        # 격리, 권한, 승인, 위협 모델
     ├── roadmap.md                    # Milestone, Epic, 백로그
+    ├── verification-log.md           # 실제 환경 검증 기록과 미확인 항목
     ├── specs/                        # Task, runtime, registry, ingestion의 정규 계약
     ├── adr/                          # Accepted/Proposed 결정, 대안, 영향, 후속 작업
     └── research/                     # 외부 시스템 조사와 Build/Adopt 근거

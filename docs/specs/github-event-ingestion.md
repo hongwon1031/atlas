@@ -1,6 +1,6 @@
 # GitHub Event Ingestion Specification v0.1
 
-이 문서는 GitHub Issue를 Atlas Task 후보로 발견하고 exactly-one active Run으로 연결하기 위한 Target MVP 계약입니다. [ADR-008](../adr/0008-initial-github-event-ingestion.md)의 polling-first는 `Accepted`이며 poller, persistent idempotency, atomic claim, lease가 구현됐습니다. approval signal은 `atlas:queued` label로 확정됐습니다. webhook과 Run 생성은 아직 구현되지 않았습니다.
+이 문서는 GitHub Issue를 Atlas Task 후보로 발견하고 exactly-one active Run으로 연결하기 위한 Target MVP 계약입니다. [ADR-008](../adr/0008-initial-github-event-ingestion.md)의 polling-first는 `Accepted`이며 poller, persistent idempotency, atomic claim, lease가 구현됐습니다. approval signal은 `atlas:queued` label로 확정됐습니다. live 검증 결과는 [Verification Log](../verification-log.md)에 있습니다. webhook과 Run 생성은 아직 구현되지 않았습니다.
 
 ## Scope
 
