@@ -85,6 +85,7 @@ Project owner가 PR #6 리뷰 과정에서 polling-first 방식의 장단점을 
 - [x] duplicate Task registration acceptance test 작성
 - [x] approval/queue signal을 `atlas:queued` label 필수로 확정
 - [ ] label을 추가한 actor의 repository permission을 Atlas가 직접 재확인
-- [ ] duplicate Run/PR acceptance test 작성 (Run 생성은 아직 미구현)
+- [x] duplicate Run acceptance test 작성 (Run 생성 구현됨)
+- [ ] duplicate PR acceptance test 작성 (PR delivery는 아직 미구현)
 - [ ] rate-limit budget과 production scaling policy 결정
 - [ ] webhook migration trigger와 보안 요구사항 정의

@@ -49,7 +49,8 @@ Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge*
 ### Epic 2. Isolated Worker Runtime
 
 - [ ] provider-neutral Executor Adapter 최소 interface
-- [x] 최소 Task, claim lease persistence (Run과 heartbeat는 후속)
+- [x] 최소 Task, claim lease persistence
+- [x] Run record, heartbeat, restart reconciliation
 - [ ] Task별 worktree/clone, branch, process, Run ID, log scope
 - [ ] mock executor invocation
 - [ ] timeout, cancel, retry, process/worktree cleanup
@@ -177,8 +178,9 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 1. ~~Atlas GitHub Issue를 parse하고 validate합니다.~~ (완료 — `src/atlas/`)
 2. ~~approved 또는 queued Task polling을 구현합니다.~~ (완료 — `polling.py`)
 3. ~~한 Task를 idempotent하게 claim합니다.~~ (완료 — `store.py`)
-4. ~~valid Atlas Task Issue의 live E2E를 확인합니다.~~ (완료 — Issue #7) Run record와 heartbeat를 추가합니다.
-5. 격리된 worktree와 branch를 생성합니다.
+4. ~~valid Atlas Task Issue의 live E2E를 확인합니다.~~ (완료 — Issue #7)
+5. ~~Run record와 heartbeat, restart reconciliation을 추가합니다.~~ (완료)
+6. 격리된 worktree와 branch를 생성합니다.
 6. Task별 새 process에서 mock executor를 호출합니다.
 7. 결과를 validate하고 draft PR을 생성합니다.
 8. self-hosted Claude Code invocation은 별도 후속 PR에서 추가합니다.

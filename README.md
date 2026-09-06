@@ -46,6 +46,16 @@ python -m atlas poll --watch --interval 60   # pass마다 한 줄씩 즉시 출�
 python -m atlas tasks
 python -m atlas claim --worker-id worker-1 --lease-ttl 900
 python -m atlas release <claim-id> --reason done
+
+# Run lifecycle
+python -m atlas run-start ATLAS-0042 --worker-id worker-1
+python -m atlas run-heartbeat <run-id> --worker-id worker-1
+python -m atlas run-finish <run-id> --status Succeeded
+python -m atlas runs --task-id ATLAS-0042
+
+# worker 재시작 후 stale Run 정리
+python -m atlas reconcile --dry-run   # 판정만
+python -m atlas reconcile
 ```
 
 결과는 JSON으로 출력됩니다. exit code는 `0` 성공, `1` validation 실패 또는 claim 대상 없음, `2` source 오류입니다.
@@ -61,6 +71,8 @@ python -m atlas release <claim-id> --reason done
 | `ATLAS_REPOSITORY` | `hongwon1031/atlas` | polling 대상 |
 | `ATLAS_POLL_INTERVAL_SECONDS` | `60` | `--watch` 간격 |
 | `ATLAS_LEASE_TTL_SECONDS` | `900` | claim lease TTL |
+| `ATLAS_HEARTBEAT_INTERVAL_SECONDS` | `30` | Run heartbeat 권장 주기 |
+| `ATLAS_RUN_STALE_AFTER_SECONDS` | `300` | 이 시간 동안 heartbeat가 없으면 stale |
 | `ATLAS_DISABLE_QUEUE_LABEL` | 미설정 | approval gate 해제. 신뢰된 repository에서만 사용 |
 
 token은 저장소에 두지 않고 환경변수로만 주입합니다. database 파일도 commit하지 않습니다. public repository의 Issue는 token 없이도 조회되지만 rate limit이 훨씬 낮습니다.
@@ -74,6 +86,7 @@ token은 저장소에 두지 않고 환경변수로만 주입합니다. database
 | Runtime·isolation specification | In Progress | ADR-009~010은 Proposed이며 구현 전 사람 승인 필요 |
 | Issue intake core | Complete | 단건 fetch·parse·validate와 회귀 테스트 구현; Issue #7로 live 확인 |
 | Polling, persistence, claim, lease | Complete | polling·SQLite store·atomic claim·lease·승인 회수 구현; Issue #7로 live E2E 확인 |
+| Run lifecycle, heartbeat, reconciliation | Complete | Run record·heartbeat·restart recovery 구현; 별도 OS 프로세스 동시성 확인 |
 | self-hosted Claude Code automated path | Planned | primary automated executor로 결정됐지만 invocation 미구현 |
 | Atlas-to-Codex Cloud automation | Feasibility Unverified | adapter로 표시하기 전 integration validation 필요 |
 | Polling, claim, recovery, routing, validation delivery | Not Implemented | 문서 계약만 존재 |
@@ -143,8 +156,8 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 ## Current Limitations
 
 - webhook ingestion이 없습니다. polling만 있으며 지연은 interval에 좌우됩니다.
-- Run record를 만들지 않습니다. claim은 Task lease까지이고 `active_run_id`는 계속 null입니다.
-- heartbeat와 worker restart reconciliation이 없습니다. lease는 TTL 만료와 grace period로만 회수됩니다.
+- Run은 실행 단위 record까지입니다. worktree, branch, executor process, timeout은 아직 없습니다.
+- reconciliation은 heartbeat 경과와 claim/lease 상태로만 판단합니다. executor process가 없어 PID identity 확인을 수행하지 못하며, 판정 event에 `process_identity_checked: false`로 기록합니다.
 - live E2E는 Issue #7로 확인했습니다. 단계별 결과는 [Verification Log](docs/verification-log.md)에 있습니다.
 - operational store는 단일 SQLite 파일이라 여러 host가 공유할 수 없습니다.
 - schema migration runner가 없습니다. `schema_meta.schema_version`만 기록합니다.
@@ -228,8 +241,9 @@ atlas/
 │   ├── issue_source.py               # IssueSource/IssueLister 경계와 GitHub REST adapter
 │   ├── intake.py                     # fetch → parse → validate 조립
 │   ├── polling.py                    # candidate Issue polling과 등록
-│   ├── store.py                      # SQLite operational store, atomic claim, lease
-│   └── cli.py                        # show / poll / claim / release / tasks
+│   ├── store.py                      # SQLite operational store, claim, lease, Run
+│   ├── reconciliation.py             # stale Run 판정과 recovery review 전환
+│   └── cli.py                        # show / poll / claim / runs / reconcile 등
 ├── tests/                            # 단위 테스트 (표준 unittest)
 └── docs/
     ├── vision.md                     # Mission, 핵심 가치, 성공 상태

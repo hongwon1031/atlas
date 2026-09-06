@@ -21,9 +21,17 @@ from pathlib import Path
 from typing import Any
 
 from .idempotency import IdempotencyKey
-from .schema import IntakeResult, Priority, TaskStatus
+from .schema import (
+    ACTIVE_RUN_STATUSES,
+    IntakeResult,
+    Priority,
+    Run,
+    RunFailure,
+    RunStatus,
+    TaskStatus,
+)
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 _PRIORITY_RANK = {
     Priority.LOW: 0,
@@ -94,8 +102,31 @@ CREATE TABLE IF NOT EXISTS events (
     task_id     TEXT,
     fingerprint TEXT,
     claim_id    TEXT,
+    run_id      TEXT,
     detail      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id           TEXT PRIMARY KEY,
+    task_id          TEXT NOT NULL,
+    fingerprint      TEXT NOT NULL,
+    claim_id         TEXT NOT NULL,
+    worker_id        TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    heartbeat_at     TEXT NOT NULL,
+    started_at       TEXT,
+    finished_at      TEXT,
+    failure_category TEXT,
+    failure_message  TEXT,
+    previous_run_id  TEXT
+);
+
+-- Task 하나에 active Run은 최대 하나입니다(execution-runtime.md의 Run Boundary).
+-- claim의 partial unique index와 같은 방식으로 database가 강제합니다.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active
+    ON runs(task_id) WHERE status IN ('Pending', 'Running');
+CREATE INDEX IF NOT EXISTS idx_runs_claim ON runs(claim_id);
 
 CREATE TABLE IF NOT EXISTS poll_cursors (
     repository      TEXT PRIMARY KEY,
@@ -115,6 +146,15 @@ def to_iso(moment: datetime) -> str:
 
 def from_iso(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+class RunError(Exception):
+    """Run lifecycle 위반. category로 분류합니다."""
+
+    def __init__(self, category: str, message: str) -> None:
+        super().__init__(message)
+        self.category = category
+        self.message = message
 
 
 @dataclass(frozen=True)
@@ -191,6 +231,13 @@ class TaskStore:
         ):
             if column not in existing:
                 self._connection.execute(f"ALTER TABLE tasks ADD COLUMN {ddl}")
+
+        # schema v2 database의 events에는 run_id가 없습니다.
+        event_columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(events)")
+        }
+        if "run_id" not in event_columns:
+            self._connection.execute("ALTER TABLE events ADD COLUMN run_id TEXT")
         self._connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -557,7 +604,326 @@ class TaskStore:
             (task_id,),
         ).fetchone()
 
+
+    # -- run lifecycle ---------------------------------------------------
+
+    def start_run(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        previous_run_id: str | None = None,
+        now: datetime | None = None,
+    ) -> Run:
+        """approved이고 claim된 Task에 새 Run을 만듭니다.
+
+        docs/specs/execution-runtime.md의 Run Boundary를 강제합니다.
+
+        - Task가 승인 상태여야 합니다.
+        - active claim이 있어야 하고 lease가 유효해야 합니다.
+        - `worker_id`가 claim의 `lease_owner`와 같아야 합니다.
+        - 같은 Task에 active Run이 있으면 만들지 않습니다.
+
+        조건을 만족하지 못하면 `RunError`를 냅니다.
+        """
+
+        moment = now or utcnow()
+        stamp = to_iso(moment)
+
+        with self._write() as connection:
+            task = connection.execute(
+                "SELECT fingerprint, approved, status FROM tasks "
+                "WHERE task_id = ? AND is_current = 1",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise RunError("task_not_found", f"{task_id}에 해당하는 current Task가 없습니다.")
+            if not task["approved"]:
+                raise RunError(
+                    "task_not_approved",
+                    f"{task_id}는 승인되지 않았습니다. Run을 만들 수 없습니다.",
+                )
+
+            claim = connection.execute(
+                "SELECT claim_id, lease_owner, lease_expires_at FROM claims "
+                "WHERE task_id = ? AND released_at IS NULL",
+                (task_id,),
+            ).fetchone()
+            if claim is None:
+                raise RunError("no_active_claim", f"{task_id}에 active claim이 없습니다.")
+            if from_iso(claim["lease_expires_at"]) <= moment:
+                raise RunError(
+                    "lease_expired",
+                    f"{task_id}의 claim lease가 만료됐습니다. 다시 claim해야 합니다.",
+                )
+            if claim["lease_owner"] != worker_id:
+                # lease owner가 아닌 worker가 Run을 만들면 소유권이 갈라집니다.
+                raise RunError(
+                    "worker_mismatch",
+                    f"{worker_id}는 이 Task의 lease owner가 아닙니다.",
+                )
+
+            active = self._active_run_row(connection, task_id)
+            if active is not None:
+                raise RunError(
+                    "active_run_exists",
+                    f"{task_id}에 이미 active Run {active['run_id']}이 있습니다.",
+                )
+
+            if previous_run_id is not None:
+                previous = connection.execute(
+                    "SELECT status FROM runs WHERE run_id = ?", (previous_run_id,)
+                ).fetchone()
+                if previous is None:
+                    raise RunError(
+                        "previous_run_not_found", f"{previous_run_id}를 찾을 수 없습니다."
+                    )
+                if not RunStatus(previous["status"]).is_terminal:
+                    raise RunError(
+                        "previous_run_active",
+                        f"{previous_run_id}가 아직 종료되지 않았습니다.",
+                    )
+
+            run = Run(
+                run_id=f"run-{uuid.uuid4().hex[:16]}",
+                task_id=task_id,
+                fingerprint=task["fingerprint"],
+                claim_id=claim["claim_id"],
+                worker_id=worker_id,
+                status=RunStatus.PENDING,
+                created_at=stamp,
+                heartbeat_at=stamp,
+                previous_run_id=previous_run_id,
+            )
+            connection.execute(
+                "INSERT INTO runs("
+                " run_id, task_id, fingerprint, claim_id, worker_id, status,"
+                " created_at, heartbeat_at, previous_run_id"
+                ") VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    run.run_id,
+                    run.task_id,
+                    run.fingerprint,
+                    run.claim_id,
+                    run.worker_id,
+                    run.status.value,
+                    run.created_at,
+                    run.heartbeat_at,
+                    run.previous_run_id,
+                ),
+            )
+            self._record(
+                connection,
+                kind="run_started",
+                moment=stamp,
+                task_id=task_id,
+                fingerprint=task["fingerprint"],
+                claim_id=claim["claim_id"],
+                run_id=run.run_id,
+                detail={"worker_id": worker_id, "previous_run_id": previous_run_id},
+            )
+            return run
+
+    def heartbeat(
+        self, run_id: str, worker_id: str, *, now: datetime | None = None
+    ) -> Run:
+        """Run이 살아 있음을 기록합니다.
+
+        첫 heartbeat는 `Pending`을 `Running`으로 올립니다. executor가 실제로
+        시작됐다는 증거이기 때문입니다. terminal Run에는 허용하지 않습니다.
+        """
+
+        moment = now or utcnow()
+        stamp = to_iso(moment)
+
+        with self._write() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunError("run_not_found", f"{run_id}를 찾을 수 없습니다.")
+            status = RunStatus(row["status"])
+            if status.is_terminal:
+                raise RunError(
+                    "run_terminal",
+                    f"{run_id}는 이미 {status.value} 상태입니다. heartbeat할 수 없습니다.",
+                )
+            if row["worker_id"] != worker_id:
+                raise RunError(
+                    "worker_mismatch",
+                    f"{worker_id}는 {run_id}의 owner가 아닙니다.",
+                )
+
+            promoted = status is RunStatus.PENDING
+            new_status = RunStatus.RUNNING
+            connection.execute(
+                "UPDATE runs SET status = ?, heartbeat_at = ?, "
+                "started_at = COALESCE(started_at, ?) WHERE run_id = ?",
+                (new_status.value, stamp, stamp, run_id),
+            )
+            if promoted:
+                self._record(
+                    connection,
+                    kind="run_running",
+                    moment=stamp,
+                    task_id=row["task_id"],
+                    run_id=run_id,
+                    detail={"worker_id": worker_id},
+                )
+            return self._run_from_row(
+                connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            )
+
+    def finish_run(
+        self,
+        run_id: str,
+        status: RunStatus,
+        *,
+        worker_id: str | None = None,
+        failure: RunFailure | None = None,
+        now: datetime | None = None,
+    ) -> Run:
+        """Run을 terminal 상태로 전이합니다.
+
+        `worker_id`를 주면 owner 일치를 확인합니다. reconciliation처럼 worker를
+        대신해 종료할 때는 생략합니다.
+        """
+
+        if not status.is_terminal:
+            raise RunError("not_terminal_status", f"{status.value}는 terminal 상태가 아닙니다.")
+        if status is RunStatus.SUCCEEDED and failure is not None:
+            raise RunError("unexpected_failure", "Succeeded Run에는 failure를 기록하지 않습니다.")
+        if status in (RunStatus.FAILED, RunStatus.ORPHANED) and failure is None:
+            raise RunError("missing_failure", f"{status.value}에는 failure 사유가 필요합니다.")
+
+        moment = now or utcnow()
+        stamp = to_iso(moment)
+
+        with self._write() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunError("run_not_found", f"{run_id}를 찾을 수 없습니다.")
+            current = RunStatus(row["status"])
+            if current.is_terminal:
+                raise RunError(
+                    "run_terminal",
+                    f"{run_id}는 이미 {current.value} 상태입니다.",
+                )
+            if worker_id is not None and row["worker_id"] != worker_id:
+                raise RunError("worker_mismatch", f"{worker_id}는 {run_id}의 owner가 아닙니다.")
+
+            connection.execute(
+                "UPDATE runs SET status = ?, finished_at = ?, "
+                "failure_category = ?, failure_message = ? WHERE run_id = ?",
+                (
+                    status.value,
+                    stamp,
+                    failure.category if failure else None,
+                    failure.message if failure else None,
+                    run_id,
+                ),
+            )
+            self._record(
+                connection,
+                kind="run_finished",
+                moment=stamp,
+                task_id=row["task_id"],
+                fingerprint=row["fingerprint"],
+                claim_id=row["claim_id"],
+                run_id=run_id,
+                detail={
+                    "status": status.value,
+                    "from": current.value,
+                    "failure": failure.to_dict() if failure else None,
+                },
+            )
+            return self._run_from_row(
+                connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            )
+
+    def mark_orphaned(
+        self, run_id: str, failure: RunFailure, evidence: dict[str, Any], now: datetime | None = None
+    ) -> Run:
+        """stale Run을 recovery review 대상으로 전환합니다.
+
+        판단 근거를 event로 남깁니다. 재실행은 하지 않습니다.
+        """
+
+        moment = now or utcnow()
+        with self._write() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is not None and not RunStatus(row["status"]).is_terminal:
+                self._record(
+                    connection,
+                    kind="run_orphaned",
+                    moment=to_iso(moment),
+                    task_id=row["task_id"],
+                    run_id=run_id,
+                    detail=evidence,
+                )
+        return self.finish_run(run_id, RunStatus.ORPHANED, failure=failure, now=moment)
+
+    # -- run reads -------------------------------------------------------
+
+    def run(self, run_id: str) -> Run | None:
+        row = self._connection.execute(
+            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return self._run_from_row(row) if row else None
+
+    def active_run(self, task_id: str) -> Run | None:
+        row = self._active_run_row(self._connection, task_id)
+        return self._run_from_row(row) if row else None
+
+    def runs(self, task_id: str | None = None, limit: int = 100) -> list[Run]:
+        query = "SELECT * FROM runs"
+        params: list[Any] = []
+        if task_id is not None:
+            query += " WHERE task_id = ?"
+            params.append(task_id)
+        query += " ORDER BY created_at DESC, run_id DESC LIMIT ?"
+        params.append(limit)
+        return [self._run_from_row(row) for row in self._connection.execute(query, params)]
+
+    def active_runs(self) -> list[Run]:
+        placeholders = ",".join("?" for _ in ACTIVE_RUN_STATUSES)
+        rows = self._connection.execute(
+            f"SELECT * FROM runs WHERE status IN ({placeholders}) ORDER BY created_at ASC",
+            ACTIVE_RUN_STATUSES,
+        )
+        return [self._run_from_row(row) for row in rows]
+
+    def claim_for(self, claim_id: str) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT * FROM claims WHERE claim_id = ?", (claim_id,)
+        ).fetchone()
+
+    @staticmethod
+    def _active_run_row(connection: sqlite3.Connection, task_id: str) -> sqlite3.Row | None:
+        placeholders = ",".join("?" for _ in ACTIVE_RUN_STATUSES)
+        return connection.execute(
+            f"SELECT * FROM runs WHERE task_id = ? AND status IN ({placeholders})",
+            (task_id, *ACTIVE_RUN_STATUSES),
+        ).fetchone()
+
+    @staticmethod
+    def _run_from_row(row: sqlite3.Row) -> Run:
+        return Run(
+            run_id=row["run_id"],
+            task_id=row["task_id"],
+            fingerprint=row["fingerprint"],
+            claim_id=row["claim_id"],
+            worker_id=row["worker_id"],
+            status=RunStatus(row["status"]),
+            created_at=row["created_at"],
+            heartbeat_at=row["heartbeat_at"],
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
+            failure_category=row["failure_category"],
+            failure_message=row["failure_message"],
+            previous_run_id=row["previous_run_id"],
+        )
+
     # -- reads -----------------------------------------------------------
+
 
     def current_tasks(self) -> list[sqlite3.Row]:
         return self._connection.execute(
@@ -683,17 +1049,20 @@ class TaskStore:
         task_id: str | None = None,
         fingerprint: str | None = None,
         claim_id: str | None = None,
+        run_id: str | None = None,
         detail: dict[str, Any] | None = None,
     ) -> None:
         connection.execute(
-            "INSERT INTO events(occurred_at, kind, task_id, fingerprint, claim_id, detail) "
-            "VALUES (?,?,?,?,?,?)",
+            "INSERT INTO events"
+            "(occurred_at, kind, task_id, fingerprint, claim_id, run_id, detail) "
+            "VALUES (?,?,?,?,?,?,?)",
             (
                 moment,
                 kind,
                 task_id,
                 fingerprint,
                 claim_id,
+                run_id,
                 json.dumps(detail or {}, ensure_ascii=False, default=str),
             ),
         )

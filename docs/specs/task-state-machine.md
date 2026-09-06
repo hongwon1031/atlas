@@ -2,7 +2,9 @@
 
 이 문서는 Atlas Task와 Run의 수명주기를 정의합니다. 상태는 UI 표시가 아니라 권한, 재시도, 감사 로그를 제어하는 계약입니다. operational state store는 [ADR-012](../adr/0012-operational-state-store.md)에서 SQLite로 확정했고 workflow engine은 [ADR-004](../adr/0004-workflow-engine.md)의 `Proposed` 방향입니다.
 
-현재 구현된 상태는 `Draft`와 `NeedsClarification`뿐입니다. poller가 valid Task를 `Draft`로 저장하고 append-only event log를 남기며, ingestion claim lease를 원자적으로 관리합니다. `Draft` 이후의 자동 transition(`Planned` 이상)은 구현되지 않았고 사람이 Issue/PR 기록으로 추적합니다.
+현재 구현된 Task 상태는 `Draft`와 `NeedsClarification`뿐입니다. poller가 valid Task를 `Draft`로 저장하고 append-only event log를 남기며, ingestion claim lease를 원자적으로 관리합니다. `Draft` 이후의 자동 transition(`Planned` 이상)은 구현되지 않았고 사람이 Issue/PR 기록으로 추적합니다.
+
+Run은 Task와 별도의 상태 집합을 가지며 [Execution Runtime](execution-runtime.md)의 Run Lifecycle에 정의돼 있습니다. Run lifecycle과 heartbeat는 구현됐습니다. Task가 `Draft`인 동안에도 Run을 만들 수 있는데, 이는 claim이 ingestion 단계의 lease이고 Run이 그 lease 아래의 실행 시도이기 때문입니다. Run 완료가 Task 상태를 자동으로 옮기지는 않습니다.
 
 ## States
 
@@ -136,7 +138,7 @@ stateDiagram-v2
 - 동일 transition 요청을 다시 받으면 새 Run을 만들지 않고 기존 결과를 반환합니다.
 - retry Run은 이전 Run, 실패 원인, 변경된 plan을 참조합니다.
 - retry는 Acceptance Criteria나 scope를 몰래 변경할 수 없습니다.
-- lease expiry만으로 새 Run을 만들지 않고 heartbeat, worker ownership, process identity를 reconcile합니다.
+- lease expiry만으로 새 Run을 만들지 않고 heartbeat, worker ownership, process identity를 reconcile합니다. 현재 구현은 heartbeat와 worker ownership까지이며 process identity 확인은 executor process가 생긴 뒤에 가능합니다.
 - worker restart는 [Execution Runtime](execution-runtime.md)의 recovery 절차로 stale lease, orphan process, stale worktree를 확인합니다.
 
 ## Current and Target State Ownership

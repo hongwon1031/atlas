@@ -1,6 +1,6 @@
 # Execution Runtime Specification v0.1
 
-이 문서는 Atlas worker가 한 Task를 하나의 Run으로 실행할 때 따라야 할 runtime, isolation, recovery 계약을 정의합니다. [ADR-009](../adr/0009-worker-process-supervision.md)와 [ADR-010](../adr/0010-task-execution-isolation.md)은 아직 `Proposed`이며, worker와 executor invocation은 구현되지 않았습니다.
+이 문서는 Atlas worker가 한 Task를 하나의 Run으로 실행할 때 따라야 할 runtime, isolation, recovery 계약을 정의합니다. Run record, heartbeat, restart reconciliation은 구현됐습니다. [ADR-009](../adr/0009-worker-process-supervision.md)와 [ADR-010](../adr/0010-task-execution-isolation.md)은 아직 `Proposed`이며 worktree, branch, executor process invocation은 구현되지 않았습니다.
 
 ## Current and Target Status
 
@@ -8,7 +8,8 @@
 | --- | --- | --- |
 | 사람이 Executor에 Task 전달 | Proven Manually | 사람이 prompt를 전달하고 Executor가 branch와 PR을 생성 |
 | Atlas worker polling·claim·lease | Complete | Issue polling, Task persistence, atomic claim, lease TTL, 승인 회수 구현. live E2E는 [Verification Log](../verification-log.md) 참조 |
-| Run record와 process 관리 | Not Implemented | Run 생성, worktree, executor process 없음 |
+| Run record와 heartbeat | Complete | Run lifecycle, heartbeat, restart reconciliation 구현. [Verification Log](../verification-log.md) 참조 |
+| worktree, branch, executor process | Not Implemented | Run은 실행 단위 record이며 아직 process를 띄우지 않음 |
 | self-hosted Claude Code invocation | Planned | Target MVP primary automated executor |
 | tmux worker PoC | Planned | process persistence 용도; service manager가 아님 |
 | systemd 또는 Docker supervision | Planned | stable operation에서 별도 결정 |
@@ -25,18 +26,41 @@
 
 모든 Run은 다음 리소스를 독점합니다.
 
-| 리소스 | 요구사항 |
-| --- | --- |
-| `task_id` | 원본 Task의 안정적인 ID |
-| `run_id` | 시도마다 새로 발급되는 unique ID |
-| branch | Run이 단독 수정하는 Task 전용 branch |
-| worktree/clone | 허용된 Project root 아래의 전용 mutable workspace |
-| executor process | Task마다 새로 시작하며 이전 conversation이나 shell state를 상속하지 않음 |
-| log scope | stdout, stderr, event, validation evidence를 Run별로 분리 |
-| timeout | 시작 전에 고정하고 만료 시 cancellation과 cleanup 수행 |
-| cancellation | 요청, 시각, actor, process 종료와 cleanup 결과 기록 |
+| 리소스 | 요구사항 | 구현 상태 |
+| --- | --- | --- |
+| `task_id` | 원본 Task의 안정적인 ID | 구현됨 |
+| `run_id` | 시도마다 새로 발급되는 unique ID | 구현됨 |
+| branch | Run이 단독 수정하는 Task 전용 branch | 미구현 |
+| worktree/clone | 허용된 Project root 아래의 전용 mutable workspace | 미구현 |
+| executor process | Task마다 새로 시작하며 이전 conversation이나 shell state를 상속하지 않음 | 미구현 |
+| log scope | stdout, stderr, event, validation evidence를 Run별로 분리 | event만 구현됨 |
+| timeout | 시작 전에 고정하고 만료 시 cancellation과 cleanup 수행 | 미구현 |
+| cancellation | 요청, 시각, actor, process 종료와 cleanup 결과 기록 | terminal 전이만 구현됨 |
 
 여러 Project가 하나의 executor conversation을 공유하거나, 여러 Task가 mutable worktree를 공유하거나, 여러 Run이 같은 branch를 동시에 수정해서는 안 됩니다.
+
+**한 Task에 active Run은 최대 하나입니다.** `Pending`과 `Running`을 active로 보며, operational store의 partial unique index가 database 수준에서 강제합니다.
+
+## Run Lifecycle
+
+| 상태 | 의미 | 다음 상태 |
+| --- | --- | --- |
+| `Pending` | Run record가 예약됐고 executor는 아직 시작되지 않음 | `Running`, terminal |
+| `Running` | executor가 살아 있고 heartbeat가 갱신되는 중 | terminal |
+| `Succeeded` | 실행이 성공적으로 끝남 | terminal |
+| `Failed` | 실행이 실패했고 분류된 사유가 기록됨 | terminal |
+| `Cancelled` | 사람 요청이나 정책으로 중단됨 | terminal |
+| `Orphaned` | heartbeat가 끊겨 상태를 증명할 수 없음. recovery review 대상 | terminal |
+
+Run 상태는 Task 상태와 다릅니다. Run이 `Succeeded`여도 Task는 사람 승인과 merge 전까지 `Completed`가 아닙니다. `Orphaned`는 "process 상태를 증명할 수 없으면 새 side effect를 허용하지 않고 recovery review로 기록한다"는 아래 Restart and Recovery 요구를 구현한 상태입니다.
+
+전이 규칙은 다음과 같습니다.
+
+- Run 생성은 승인된 Task, active claim, 유효한 lease, lease owner 일치를 모두 요구합니다.
+- 첫 heartbeat가 `Pending`을 `Running`으로 올립니다. executor가 실제로 살아 있다는 증거이기 때문입니다.
+- heartbeat는 Run owner만 보낼 수 있고 terminal Run에는 허용하지 않습니다.
+- terminal 전이는 되돌릴 수 없습니다. 재시도는 새 `run_id`로 만들고 `previous_run_id`로 연결합니다.
+- `Failed`와 `Orphaned`는 분류된 failure 사유를 요구합니다. 분류 어휘는 [Task State Machine](task-state-machine.md)의 Failure Taxonomy를 따릅니다.
 
 ## Conceptual Worker Lifecycle
 
@@ -72,6 +96,8 @@ status: Running
 
 실제 public event와 PR에는 server path, OS account, token, private repository 정보가 노출되지 않도록 path와 identity를 일반화하거나 생략합니다.
 
+현재 구현이 저장하는 필드는 `run_id`, `task_id`, `fingerprint`, `claim_id`, `worker_id`, `status`, `created_at`, `heartbeat_at`, `started_at`, `finished_at`, `failure_category`, `failure_message`, `previous_run_id`입니다. `lease_owner`와 `lease_expires_at`은 `claim_id`로 claim record를 참조해 얻습니다. `process_id`, `branch`, `worktree_path`, `timeout_at`, `cancellation_state`는 worktree와 executor process를 만드는 후속 slice에서 추가합니다.
+
 ## Claim, Lease, and Idempotency
 
 - Task claim은 atomic한 비교·갱신 또는 같은 효과의 primitive를 사용해야 합니다.
@@ -83,7 +109,7 @@ status: Running
 
 ## Restart and Recovery
 
-worker 시작 시 다음 순서로 reconciliation합니다.
+worker 시작 시 또는 `reconcile` command로 다음 순서를 수행합니다.
 
 1. 자신이 소유했거나 만료된 active Run record를 조회합니다.
 2. 기록된 PID의 identity, start time, Run marker를 확인해 PID 재사용을 구분합니다.
@@ -94,6 +120,16 @@ worker 시작 시 다음 순서로 reconciliation합니다.
 7. retry는 새 Run ID를 사용하고 `previous_run_id`와 redacted failure reason을 기록합니다.
 
 복구나 retry 중 Acceptance Criteria, allowed scope, base revision을 조용히 바꾸지 않습니다. 변경이 필요하면 사람 승인 또는 revision workflow로 돌아갑니다.
+
+### 현재 구현 범위
+
+1, 4, 5, 7번은 구현됐습니다. active Run을 조회하고, heartbeat가 stale threshold를 넘으면 `Orphaned`로 기록하며, 판단 근거를 event로 남기고, 재시도는 `previous_run_id`로 연결합니다.
+
+**stale Run을 자동으로 재실행하지 않습니다.** 판정과 기록만 하고 새 Run 생성은 사람이나 상위 정책이 명시적으로 요청해야 합니다.
+
+2, 3, 6번은 executor process와 worktree가 없어 수행할 수 없습니다. 판정 근거 event에 `process_identity_checked: false`를 남겨 이 한계를 감사 기록에 명시합니다. process identity 확인이 없는 동안 판정은 heartbeat 경과와 claim/lease 상태만으로 이루어집니다.
+
+heartbeat interval과 stale threshold는 `RunConfig`로 설정합니다. 아래 Open Questions의 "heartbeat interval, recovery grace period"는 기본값을 두되 운영 측정 후 조정해야 합니다.
 
 ## Cleanup Matrix
 

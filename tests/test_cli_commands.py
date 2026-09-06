@@ -24,7 +24,11 @@ class LegacyInvocationTest(unittest.TestCase):
         )
 
     def test_explicit_subcommands_are_untouched(self):
-        for argv in (["show", "12"], ["poll"], ["claim"], ["tasks"], ["release", "claim-1"]):
+        for argv in (
+            ["show", "12"], ["poll"], ["claim"], ["tasks"], ["release", "claim-1"],
+            ["runs"], ["run-start", "ATLAS-0042"], ["run-heartbeat", "run-1"],
+            ["run-finish", "run-1"], ["reconcile"],
+        ):
             self.assertEqual(_normalize(list(argv)), argv)
 
     def test_flag_only_argv_is_untouched(self):
@@ -59,6 +63,60 @@ class ParserTest(unittest.TestCase):
     def test_command_is_required(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             build_parser().parse_args([])
+
+
+class RunCommandParserTest(unittest.TestCase):
+    def parse(self, argv):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return build_parser().parse_args(argv)
+
+    def test_run_start_accepts_task_and_previous_run(self):
+        args = self.parse(
+            ["run-start", "ATLAS-0042", "--worker-id", "w1", "--previous-run-id", "run-0"]
+        )
+
+        self.assertEqual(args.command, "run-start")
+        self.assertEqual(args.task_id, "ATLAS-0042")
+        self.assertEqual(args.previous_run_id, "run-0")
+
+    def test_run_heartbeat_takes_a_run_id(self):
+        args = self.parse(["run-heartbeat", "run-1"])
+
+        self.assertEqual(args.run_id, "run-1")
+
+    def test_run_finish_requires_a_status(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["run-finish", "run-1"])
+
+    def test_run_finish_rejects_orphaned(self):
+        """Orphaned는 reconciliation이 근거와 함께 기록하는 상태입니다."""
+
+        with self.assertRaises(SystemExit):
+            self.parse(["run-finish", "run-1", "--status", "Orphaned"])
+
+    def test_run_finish_accepts_terminal_statuses(self):
+        for status in ("Succeeded", "Failed", "Cancelled"):
+            args = self.parse(["run-finish", "run-1", "--status", status])
+            self.assertEqual(args.status, status)
+
+    def test_reconcile_accepts_dry_run_and_threshold(self):
+        args = self.parse(["reconcile", "--dry-run", "--stale-after", "120"])
+
+        self.assertTrue(args.dry_run)
+        self.assertEqual(args.stale_after, 120.0)
+
+    def test_reconcile_rejects_non_positive_threshold(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["reconcile", "--stale-after", "0"])
+
+    def test_stale_after_flows_into_config(self):
+        args = self.parse(["reconcile", "--stale-after", "120"])
+
+        self.assertEqual(_config(args).run.stale_after_seconds, 120.0)
+
+    def test_runs_limit_must_be_positive(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["runs", "--limit", "0"])
 
 
 class CommonOptionTest(unittest.TestCase):
@@ -188,6 +246,14 @@ class ConfigTest(unittest.TestCase):
 
     def test_zero_grace_period_is_allowed(self):
         self.assertEqual(ClaimConfig(grace_period_seconds=0).grace_period_seconds, 0)
+
+    def test_run_config_from_env(self):
+        config = WorkerConfig.from_env(
+            {"ATLAS_HEARTBEAT_INTERVAL_SECONDS": "10", "ATLAS_RUN_STALE_AFTER_SECONDS": "60"}
+        )
+
+        self.assertEqual(config.run.heartbeat_interval_seconds, 10.0)
+        self.assertEqual(config.run.stale_after_seconds, 60.0)
 
     def test_backoff_is_capped(self):
         config = PollingConfig(

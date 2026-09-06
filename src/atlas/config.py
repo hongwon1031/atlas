@@ -75,10 +75,34 @@ class ClaimConfig:
 
 
 @dataclass(frozen=True)
+class RunConfig:
+    """Run heartbeat와 staleness 판정.
+
+    docs/specs/execution-runtime.md의 open question("heartbeat interval,
+    recovery grace period")을 코드에 고정하지 않고 설정으로 노출합니다.
+    """
+
+    heartbeat_interval_seconds: float = 30.0
+    # 이 시간 동안 heartbeat가 없으면 stale 후보입니다. interval보다 넉넉해야
+    # 일시적인 지연을 crash로 오판하지 않습니다.
+    stale_after_seconds: float = 300.0
+
+    def __post_init__(self) -> None:
+        _require_positive("heartbeat_interval_seconds", self.heartbeat_interval_seconds)
+        _require_positive("stale_after_seconds", self.stale_after_seconds)
+        if self.stale_after_seconds <= self.heartbeat_interval_seconds:
+            raise ValueError(
+                "stale_after_seconds는 heartbeat_interval_seconds보다 커야 합니다: "
+                f"{self.stale_after_seconds} <= {self.heartbeat_interval_seconds}"
+            )
+
+
+@dataclass(frozen=True)
 class WorkerConfig:
     database_path: str = DEFAULT_DATABASE_PATH
     polling: PollingConfig = field(default_factory=PollingConfig)
     claim: ClaimConfig = field(default_factory=ClaimConfig)
+    run: RunConfig = field(default_factory=RunConfig)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> WorkerConfig:
@@ -98,7 +122,13 @@ class WorkerConfig:
         if ttl := _read_float(env, "ATLAS_LEASE_TTL_SECONDS"):
             claim = replace(claim, lease_ttl_seconds=ttl)
 
-        return replace(config, polling=polling, claim=claim)
+        run = config.run
+        if interval := _read_float(env, "ATLAS_HEARTBEAT_INTERVAL_SECONDS"):
+            run = replace(run, heartbeat_interval_seconds=interval)
+        if stale := _read_float(env, "ATLAS_RUN_STALE_AFTER_SECONDS"):
+            run = replace(run, stale_after_seconds=stale)
+
+        return replace(config, polling=polling, claim=claim, run=run)
 
 
 def _read_float(environ: dict[str, str], name: str) -> float | None:

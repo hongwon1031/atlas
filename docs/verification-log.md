@@ -58,3 +58,48 @@ GitHub Issue 목록 endpoint의 eventual consistency이며, 승인 회수 지연
 - 확인한 항목과 확인하지 못한 항목을 항상 함께 적습니다.
 - 검증 중 발견한 외부 시스템의 동작 특성은 원인 분석과 함께 기록하고, 계약에 영향을 주면 해당 spec도 갱신합니다.
 - server 주소, token, 개인 정보, private repository 세부사항은 기록하지 않습니다.
+
+## 2026-09-06 — Run lifecycle, heartbeat, restart reconciliation
+
+- 대상 구현: `src/atlas/store.py`(runs), `src/atlas/reconciliation.py`, `src/atlas/config.py`
+- 검증 방법: 로컬 SQLite database + 별도 OS process
+- 관련 계약: [Execution Runtime](specs/execution-runtime.md)의 Run Boundary, Run Lifecycle, Restart and Recovery
+
+### schema migration (v2 → v3)
+
+기존 v2 database에서 실제로 migration을 수행했습니다.
+
+- v2 상태를 재현했습니다: `runs` 테이블 삭제, `events.run_id` 컬럼 제거, `schema_version`을 `2`로 되돌림
+- store를 다시 열자 `schema_version=3`, `runs` 테이블 생성, `events.run_id` 추가가 이루어졌습니다
+- 기존 Task 1건과 active claim이 그대로 보존됐습니다
+- migration 직후 Run 생성이 정상 동작했습니다
+
+### restart simulation (worker crash)
+
+heartbeat를 남기고 프로세스가 사라진 상황을 재현했습니다.
+
+- 새 프로세스가 store를 다시 열어 `Running` Run을 발견했습니다
+- stale threshold(300초)를 넘긴 시점에 reconcile하자 `Orphaned`로 전이하고 `failure_category=worker_lost`를 기록했습니다
+- 판단 근거가 event에 남았습니다: `heartbeat_age_seconds`, `stale_after_seconds`, `lease_expired`, `process_identity_checked: false`
+- **자동 재실행은 하지 않았습니다.** active Run이 없어진 상태로 남았고, 이후 명시적 요청으로 만든 retry Run이 `previous_run_id`로 이전 Run을 참조했습니다
+
+### 별도 OS process 동시성
+
+이전 slice에서 "다중 process 경쟁 미검증"으로 남겨둔 항목을 해소했습니다.
+
+- 서로 다른 OS process 6개가 동시에 같은 Task에 `start_run`을 시도했습니다
+- 정확히 1개만 성공했고 나머지 5개는 `active_run_exists`로 거부됐습니다
+- 최종 Run 수는 1건이었습니다
+
+### CLI
+
+`run-start`, `run-heartbeat`, `run-finish`, `runs`, `reconcile`을 실제로 실행해 확인했습니다. 중복 start 거부, 잘못된 worker heartbeat 거부, terminal Run heartbeat 거부, 구조화된 failure 보존, retry 연결이 모두 예상대로 동작했습니다.
+
+검증 중 CLI 출력에서 Run의 `status`가 envelope의 `status`를 덮어쓰는 문제를 발견해 Run payload를 `run` 키 아래로 중첩하도록 고쳤습니다.
+
+### 확인하지 못한 항목
+
+- process identity(PID, start time) 기반 판정. executor process가 없어 수행할 수 없으며 판정 event에 `process_identity_checked: false`로 명시합니다
+- 실제 worker가 장시간 heartbeat를 보내는 상황의 안정성
+- orphan process와 stale worktree 정리. worktree가 아직 없습니다
+- Run 완료를 Task 상태 전이로 연결하는 흐름. Planner와 Validator가 없어 Task는 계속 `Draft`입니다

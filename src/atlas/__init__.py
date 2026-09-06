@@ -5,7 +5,7 @@
 PR delivery는 구현하지 않았습니다.
 """
 
-from .config import ClaimConfig, PollingConfig, WorkerConfig
+from .config import ClaimConfig, PollingConfig, RunConfig, WorkerConfig
 from .idempotency import IdempotencyKey, InProcessIntakeCache
 from .intake import IssueIntake
 from .issue_source import (
@@ -17,15 +17,19 @@ from .issue_source import (
 )
 from .parser import ParsedBody, parse_issue_body
 from .polling import IssuePoller, PollReport, candidate_rejection, is_task_candidate
+from .reconciliation import ReconcileReport, RunReconciler, RunVerdict
 from .schema import (
     IntakeResult,
     Priority,
     RiskLevel,
+    Run,
+    RunFailure,
+    RunStatus,
     Task,
     TaskStatus,
     ValidationIssue,
 )
-from .store import Claim, Registration, TaskStore
+from .store import Claim, Registration, RunError, TaskStore
 from .validation import validate_intake
 
 __all__ = [
@@ -45,8 +49,16 @@ __all__ = [
     "PollReport",
     "PollingConfig",
     "Priority",
+    "ReconcileReport",
     "Registration",
     "RiskLevel",
+    "Run",
+    "RunConfig",
+    "RunError",
+    "RunFailure",
+    "RunReconciler",
+    "RunStatus",
+    "RunVerdict",
     "Task",
     "TaskStatus",
     "TaskStore",
