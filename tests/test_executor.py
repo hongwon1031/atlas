@@ -23,6 +23,8 @@ from atlas.executor import (
     ExecutorError,
     ExecutorFailure,
     ExecutorRequest,
+    ProcessHandle,
+    TerminationOutcome,
 )
 from atlas.gitcmd import GitRunner
 from atlas.intake import build_idempotency_key
@@ -274,6 +276,191 @@ class OutputCaptureTest(AdapterTestCase):
         _, result = self.execute(self.request("success"), name="scoped")
 
         self.assertTrue(Path(result.stdout.path).is_relative_to(self.logs / "scoped"))
+
+
+class LogRedactionTest(AdapterTestCase):
+    """persisted log artifact 자체가 redacted 상태여야 합니다."""
+
+    SECRET = "super-secret-value-abcdef123456"
+    TOKEN = "gh" + "p_" + ("z" * 30)
+
+    def run_with(self, *, stdout_text="", stderr_text="", secrets=(), limit=1_048_576):
+        argv = [sys.executable, "-m", "atlas.mock_executor", "--mode", "fail", "--exit-code", "1"]
+        if stdout_text:
+            argv += ["--stdout-text", stdout_text]
+        if stderr_text:
+            argv += ["--stderr-text", stderr_text]
+        request = ExecutorRequest(
+            run_id="r", task_id="t", cwd=str(self.cwd), argv=tuple(argv),
+            timeout_seconds=30.0, environment=dict(ENV), secret_values=secrets,
+            max_output_bytes=limit,
+        )
+        handle = self.executor.spawn(request, self.logs / "redact")
+        return self.executor.wait(handle, request)
+
+    def test_known_secret_is_not_in_the_stdout_artifact(self):
+        result = self.run_with(stdout_text=f"config={self.SECRET}", secrets=(self.SECRET,))
+
+        raw = Path(result.stdout.path).read_bytes()
+        self.assertNotIn(self.SECRET.encode(), raw)
+        self.assertIn(b"<redacted>", raw)
+
+    def test_known_secret_is_not_in_the_stderr_artifact(self):
+        result = self.run_with(stderr_text=f"failed {self.SECRET}", secrets=(self.SECRET,))
+
+        self.assertNotIn(self.SECRET.encode(), Path(result.stderr.path).read_bytes())
+
+    def test_authorization_header_token_is_not_in_the_artifact(self):
+        result = self.run_with(stdout_text="Authorization: Bearer abcdef1234567890")
+
+        self.assertNotIn(b"abcdef1234567890", Path(result.stdout.path).read_bytes())
+
+    def test_provider_token_shape_is_not_in_the_artifact(self):
+        result = self.run_with(stdout_text=f"fatal: {self.TOKEN} rejected")
+
+        self.assertNotIn(self.TOKEN.encode(), Path(result.stdout.path).read_bytes())
+
+    def test_url_credential_is_not_in_the_artifact(self):
+        result = self.run_with(stdout_text="remote https://user:hunter2pass@github.com/x.git")
+
+        self.assertNotIn(b"hunter2pass", Path(result.stdout.path).read_bytes())
+
+    def test_secret_split_across_chunk_boundaries_is_removed(self):
+        """8192 byte chunk 경계에 secret이 걸쳐도 평문으로 남으면 안 됩니다."""
+
+        script = (
+            "import sys\n"
+            "sys.stdout.write('P' * 8180)\n"
+            "sys.stdout.flush()\n"
+            "sys.stdout.write(sys.argv[1])\n"
+            "sys.stdout.write(chr(10))\n"
+        )
+        request = ExecutorRequest(
+            run_id="r", task_id="t", cwd=str(self.cwd),
+            argv=(sys.executable, "-c", script, self.SECRET),
+            timeout_seconds=60.0, environment=dict(ENV), secret_values=(self.SECRET,),
+        )
+        handle = self.executor.spawn(request, self.logs / "chunk")
+        result = self.executor.wait(handle, request)
+
+        raw = Path(result.stdout.path).read_bytes()
+        self.assertNotIn(self.SECRET.encode(), raw)
+        self.assertIn(b"<redacted>", raw)
+        self.assertEqual(raw.count(b"P"), 8180, "일반 출력은 보존돼야 합니다")
+
+    def test_secret_after_a_very_long_unterminated_line_is_removed(self):
+        """개행 없이 보류 한도를 넘겨도 secret이 남으면 안 됩니다."""
+
+        script = (
+            "import sys\n"
+            "sys.stdout.write('Q' * 70000)\n"
+            "sys.stdout.write(sys.argv[1])\n"
+        )
+        request = ExecutorRequest(
+            run_id="r", task_id="t", cwd=str(self.cwd),
+            argv=(sys.executable, "-c", script, self.SECRET),
+            timeout_seconds=60.0, environment=dict(ENV), secret_values=(self.SECRET,),
+        )
+        handle = self.executor.spawn(request, self.logs / "nonl")
+        result = self.executor.wait(handle, request)
+
+        self.assertNotIn(self.SECRET.encode(), Path(result.stdout.path).read_bytes())
+
+    def test_invalid_utf8_with_secret_like_output_is_safe(self):
+        request = ExecutorRequest(
+            run_id="r", task_id="t", cwd=str(self.cwd),
+            argv=mock_argv("binary"), timeout_seconds=30.0, environment=dict(ENV),
+            secret_values=(self.SECRET,),
+        )
+        handle = self.executor.spawn(request, self.logs / "binary")
+        result = self.executor.wait(handle, request)
+
+        # crash 없이 읽을 수 있어야 합니다.
+        self.assertIn("invalid utf-8", read_log_tail(result.stdout.path))
+
+    def test_truncation_semantics_are_preserved(self):
+        request = ExecutorRequest(
+            run_id="r", task_id="t", cwd=str(self.cwd),
+            argv=mock_argv("output", stdout_bytes=50_000),
+            timeout_seconds=60.0, environment=dict(ENV), max_output_bytes=2048,
+        )
+        handle = self.executor.spawn(request, self.logs / "limit")
+        result = self.executor.wait(handle, request)
+
+        self.assertEqual(result.stdout.bytes_written, 2048)
+        self.assertTrue(result.stdout.truncated)
+        self.assertEqual(Path(result.stdout.path).stat().st_size, 2048)
+
+
+class TerminationOutcomeTest(AdapterTestCase):
+    """종료를 확인하지 못한 상태를 정상 완료로 확정하면 안 됩니다."""
+
+    def unverifiable_handle(self, handle):
+        """identity를 확인할 수 없는 handle을 만듭니다."""
+
+        return ProcessHandle(
+            pid=handle.pid,
+            identity=ProcessIdentity(handle.pid, "unavailable", None, "x"),
+            started_at=handle.started_at,
+            process_group_id=handle.process_group_id,
+        )
+
+    def test_normal_timeout_reports_confirmed_termination(self):
+        _, result = self.execute(self.request("sleep", timeout=2.0, sleep_seconds=60))
+
+        self.assertIs(result.failure, ExecutorFailure.TIMEOUT)
+        self.assertIs(result.termination, TerminationOutcome.CONFIRMED)
+        self.assertFalse(result.process_may_be_alive)
+        self.assertIs(result.status, ExecutionStatus.FINISHED)
+
+    def test_normal_completion_needs_no_termination(self):
+        _, result = self.execute(self.request("success"))
+
+        self.assertIs(result.termination, TerminationOutcome.NOT_REQUIRED)
+        self.assertFalse(result.process_may_be_alive)
+
+    def test_terminate_reports_confirmed_when_process_is_gone(self):
+        request = self.request("sleep", timeout=120.0, sleep_seconds=30)
+        handle = self.executor.spawn(request, self.logs / "confirm")
+        time.sleep(0.5)
+
+        state, outcome, evidence = self.executor.terminate(handle, 2.0)
+
+        self.assertIs(outcome, TerminationOutcome.CONFIRMED)
+        self.assertEqual(evidence["identity_verdict"], "process_absent")
+
+    def test_terminate_reports_unverified_for_unverifiable_identity(self):
+        request = self.request("sleep", timeout=120.0, sleep_seconds=30)
+        handle = self.executor.spawn(request, self.logs / "unverified")
+        time.sleep(0.5)
+        try:
+            state, outcome, evidence = self.executor.terminate(
+                self.unverifiable_handle(handle), 1.0
+            )
+
+            self.assertIs(outcome, TerminationOutcome.UNVERIFIED)
+            self.assertIs(state, CancellationState.UNCONFIRMED)
+            self.assertTrue(process_exists(handle.pid), "종료하면 안 됩니다")
+        finally:
+            self.executor.cancel(handle, 1.0)
+
+    def test_terminate_reports_unverified_for_identity_mismatch(self):
+        request = self.request("sleep", timeout=120.0, sleep_seconds=30)
+        handle = self.executor.spawn(request, self.logs / "mismatch")
+        time.sleep(0.5)
+        tampered = ProcessHandle(
+            pid=handle.pid,
+            identity=ProcessIdentity(handle.pid, handle.identity.method, "0", "x"),
+            started_at=handle.started_at,
+            process_group_id=handle.process_group_id,
+        )
+        try:
+            _, outcome, _ = self.executor.terminate(tampered, 1.0)
+
+            self.assertIs(outcome, TerminationOutcome.UNVERIFIED)
+            self.assertTrue(process_exists(handle.pid), "identity 불일치 process를 죽이면 안 됩니다")
+        finally:
+            self.executor.cancel(handle, 1.0)
 
 
 class TimeoutAndCancelTest(AdapterTestCase):
@@ -869,6 +1056,242 @@ class SchemaMigrationTest(ExecutionServiceTestCase):
         self.assertIsNotNone(migrated.run(self.run.run_id))
         self.assertEqual(migrated.run(self.run.run_id).task_id, "ATLAS-0042")
         self.assertEqual(migrated.executions(self.run.run_id), [])
+
+
+class TerminationUnverifiedServiceTest(ExecutionServiceTestCase):
+    """확인되지 않은 종료는 execution을 active로 남겨 reconciliation이 보게 합니다."""
+
+    class _UnverifiableAdapter:
+        """항상 종료를 확인하지 못하는 adapter."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        @property
+        def name(self):
+            return self._inner.name
+
+        @property
+        def provider(self):
+            return self._inner.provider
+
+        def terminate(self, handle, grace_period_seconds=5.0):
+            return (
+                CancellationState.UNCONFIRMED,
+                TerminationOutcome.UNVERIFIED,
+                {"identity_verdict": "unverifiable", "cancel_error": "identity_unverified"},
+            )
+
+    def unverifiable_service(self, store=None):
+        target = store or self.store
+        return ExecutionService(
+            target,
+            self._UnverifiableAdapter(LocalProcessExecutor()),
+            WorkspaceService(target, self.planner),
+            self.root / "logs",
+            RunConfig(heartbeat_interval_seconds=1.0, stale_after_seconds=60.0),
+        )
+
+    def test_unverified_cancel_does_not_finish_the_execution(self):
+        service = self.unverifiable_service()
+        execution_id, _, handle = service.start(
+            self.run.run_id, WORKER, mock_argv("sleep", sleep_seconds=30),
+            timeout_seconds=120.0, environment=dict(ENV),
+        )
+        time.sleep(0.4)
+        try:
+            outcome = service.cancel(self.run.run_id, "manual", 1.0)
+
+            self.assertFalse(outcome["cancelled"])
+            self.assertEqual(outcome["termination"], "unverified")
+            row = self.store.execution(execution_id)
+            self.assertEqual(row["status"], ExecutionStatus.CANCELLING.value)
+            self.assertEqual(row["cancellation_state"], CancellationState.UNCONFIRMED.value)
+        finally:
+            LocalProcessExecutor().cancel(handle, 1.0)
+
+    def test_unverified_execution_stays_in_reconciliation_scope(self):
+        service = self.unverifiable_service()
+        execution_id, _, handle = service.start(
+            self.run.run_id, WORKER, mock_argv("sleep", sleep_seconds=30),
+            timeout_seconds=120.0, environment=dict(ENV),
+        )
+        time.sleep(0.4)
+        try:
+            service.cancel(self.run.run_id, "manual", 1.0)
+
+            active = [row["execution_id"] for row in self.store.active_executions()]
+            self.assertIn(execution_id, active)
+
+            findings = RunReconciler(self.store, executions=service).reconcile_processes()
+            mine = [f for f in findings if f["execution_id"] == execution_id]
+            self.assertEqual(len(mine), 1)
+            self.assertTrue(process_exists(handle.pid), "살아 있는 process를 죽이면 안 됩니다")
+        finally:
+            LocalProcessExecutor().cancel(handle, 1.0)
+
+    def test_unverified_termination_is_recorded(self):
+        service = self.unverifiable_service()
+        _, _, handle = service.start(
+            self.run.run_id, WORKER, mock_argv("sleep", sleep_seconds=30),
+            timeout_seconds=120.0, environment=dict(ENV),
+        )
+        time.sleep(0.4)
+        try:
+            service.cancel(self.run.run_id, "manual", 1.0)
+
+            kinds = [row["kind"] for row in self.store.events()]
+            self.assertIn("execution_termination_unverified", kinds)
+        finally:
+            LocalProcessExecutor().cancel(handle, 1.0)
+
+    def test_confirmed_cancel_still_finishes_normally(self):
+        execution_id, _, _ = self.service.start(
+            self.run.run_id, WORKER, mock_argv("sleep", sleep_seconds=30),
+            timeout_seconds=120.0, environment=dict(ENV),
+        )
+        time.sleep(0.4)
+
+        outcome = self.service.cancel(self.run.run_id, "manual", 2.0)
+
+        self.assertTrue(outcome["cancelled"])
+        self.assertEqual(
+            self.store.execution(execution_id)["status"], ExecutionStatus.FINISHED.value
+        )
+
+    def test_confirmed_timeout_still_finishes_normally(self):
+        outcome = self.execute(mode="sleep", timeout=2.0, sleep_seconds=60)
+
+        self.assertIs(outcome.result.termination, TerminationOutcome.CONFIRMED)
+        self.assertEqual(
+            self.store.execution(outcome.execution_id)["status"], ExecutionStatus.FINISHED.value
+        )
+
+
+class ReserveSpawnRaceTest(ExecutionServiceTestCase):
+    """gate → reserve → spawn 사이에 근거가 사라지면 process를 만들지 않습니다."""
+
+    class _CountingAdapter:
+        """spawn 호출 횟수를 세는 adapter."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self.spawn_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        @property
+        def name(self):
+            return self._inner.name
+
+        @property
+        def provider(self):
+            return self._inner.provider
+
+        def spawn(self, request, log_dir):
+            self.spawn_calls += 1
+            return self._inner.spawn(request, log_dir)
+
+    class _RevokingService(ExecutionService):
+        """첫 gate 통과 뒤 예약 직전에 근거를 없앱니다."""
+
+        def __init__(self, *args, sabotage=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._sabotage = sabotage
+            self._fired = False
+
+        def safety_gate(self, run_id, worker_id, now=None):
+            gate = super().safety_gate(run_id, worker_id, now)
+            if not self._fired and self._sabotage is not None:
+                self._fired = True
+                self._sabotage()
+            return gate
+
+    def build(self, sabotage):
+        adapter = self._CountingAdapter(LocalProcessExecutor())
+        service = self._RevokingService(
+            self.store, adapter, WorkspaceService(self.store, self.planner),
+            self.root / "logs",
+            RunConfig(heartbeat_interval_seconds=1.0, stale_after_seconds=60.0),
+            sabotage=sabotage,
+        )
+        return service, adapter
+
+    def assert_no_spawn(self, sabotage):
+        service, adapter = self.build(sabotage)
+        with self.assertRaises((SafetyGateFailed, ExecutionConflict)):
+            service.start(
+                self.run.run_id, WORKER, mock_argv("sleep", sleep_seconds=30),
+                timeout_seconds=60.0, environment=dict(ENV),
+            )
+        self.assertEqual(adapter.spawn_calls, 0, "process를 만들면 안 됩니다")
+        return service
+
+    def test_approval_revoked_after_first_gate_prevents_spawn(self):
+        self.assert_no_spawn(lambda: self.store.revoke_approval("ATLAS-0042", "revoked"))
+
+    def test_claim_released_after_first_gate_prevents_spawn(self):
+        claim = self.store.active_claim("ATLAS-0042")
+        self.assert_no_spawn(lambda: self.store.release(claim["claim_id"], "released"))
+
+    def test_lease_expiry_after_first_gate_prevents_spawn(self):
+        claim = self.store.active_claim("ATLAS-0042")
+
+        def expire():
+            self.store._connection.execute(
+                "UPDATE claims SET lease_expires_at = ? WHERE claim_id = ?",
+                ("2020-01-01T00:00:00Z", claim["claim_id"]),
+            )
+            self.store._connection.commit()
+
+        self.assert_no_spawn(expire)
+
+    def test_failed_final_gate_leaves_no_active_reservation(self):
+        self.assert_no_spawn(lambda: self.store.revoke_approval("ATLAS-0042", "revoked"))
+
+        self.assertIsNone(self.store.active_execution(self.run.run_id))
+
+    def test_failed_reservation_is_recorded(self):
+        """어느 단계에서 막혔든 근거가 남아야 합니다."""
+
+        self.assert_no_spawn(lambda: self.store.revoke_approval("ATLAS-0042", "revoked"))
+
+        rows = [r for r in self.store.events() if r["kind"] == "execution_safety_gate_failed"]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("stage", rows[0]["detail"])
+        self.assertIn("task_approved", rows[0]["detail"])
+
+    def test_reservation_guard_blocks_even_without_a_first_gate(self):
+        """예약 transaction 자체가 근거를 확인합니다."""
+
+        self.store.revoke_approval("ATLAS-0042", "revoked")
+
+        with self.assertRaises(ExecutionConflict) as caught:
+            self.store.reserve_execution(
+                self.run.run_id, task_id=self.run.task_id, executor_name="mock_local",
+                executor_provider="local", worker_id=WORKER, cwd=self.run.worktree_path,
+                command=["x"], timeout_seconds=10.0,
+            )
+
+        self.assertEqual(caught.exception.category, "reservation_guard_failed")
+
+    def test_duplicate_start_invariant_still_holds(self):
+        self.service.start(
+            self.run.run_id, WORKER, mock_argv("sleep", sleep_seconds=30),
+            timeout_seconds=120.0, environment=dict(ENV),
+        )
+
+        with self.assertRaises(ExecutionConflict):
+            self.service.start(
+                self.run.run_id, WORKER, mock_argv(), timeout_seconds=10.0,
+                environment=dict(ENV),
+            )
+
+        self.assertEqual(len(self.store.executions(self.run.run_id)), 1)
 
 
 class ConfigTest(unittest.TestCase):

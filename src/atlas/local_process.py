@@ -14,14 +14,16 @@ docs/security-governance.md 제약을 지킵니다.
 
 from __future__ import annotations
 
+import codecs
 import os
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .executor import (
     CancellationState,
@@ -32,8 +34,10 @@ from .executor import (
     ExecutorResult,
     OutputCapture,
     ProcessHandle,
+    TerminationOutcome,
 )
 from .process_identity import IdentityVerdict, ProcessIdentity, capture, verify
+from .redaction import redact
 
 # 상속을 허용하는 OS 기본 환경변수. 이 목록 밖의 값은 child에 전달하지 않습니다.
 # Python 인터프리터와 DLL/라이브러리 탐색에 필요한 최소 집합입니다.
@@ -56,6 +60,11 @@ WINDOWS_ENV_ALLOWLIST = (
 
 _TASKKILL_TIMEOUT_SECONDS = 15.0
 _POLL_INTERVAL_SECONDS = 0.05
+
+# redaction pattern은 줄 단위입니다. secret에는 개행이 없으므로 완성된 줄만
+# 처리하면 chunk 경계에 걸친 token도 안전하게 지울 수 있습니다. 개행 없이
+# 계속 쏟아내는 process를 대비해 보류할 수 있는 최대 길이를 둡니다.
+MAX_PENDING_CHARS = 65_536
 
 
 def _utcnow_iso() -> str:
@@ -93,36 +102,101 @@ def base_environment(environ: dict[str, str] | None = None) -> dict[str, str]:
 class _Capture:
     path: Path
     limit: int
+    secrets: tuple[str, ...] = ()
     written: int = 0
     truncated: bool = False
 
 
-def _pump(stream, capture: _Capture) -> None:
-    """pipe를 파일로 흘립니다.
+class _RedactingSink:
+    """executor 출력을 redaction하면서 파일로 흘립니다.
 
-    한도를 넘으면 더 쓰지 않지만 읽기는 계속합니다. 읽기를 멈추면 pipe가 차서
-    child가 블록되기 때문입니다. 메모리에 전체를 쌓지 않습니다.
+    log artifact 자체가 redacted 상태여야 합니다. event만 지우면 secret이 디스크에
+    평문으로 남습니다.
+
+    설계상 유의점입니다.
+
+    - **streaming**: 전체 출력을 메모리에 모으지 않습니다. 완성된 줄만 처리하고
+      나머지는 보류합니다.
+    - **chunk 경계**: secret이 여러 chunk에 나뉘어 도착해도 줄이 완성될 때까지
+      기다렸다가 redaction하므로 잘린 채로 기록되지 않습니다.
+    - **invalid UTF-8**: incremental decoder를 `errors="replace"`로 씁니다.
+      multi-byte 문자가 chunk 경계에 걸려도 깨지지 않고, 잘못된 byte는 대체
+      문자가 됩니다.
+    - **binary 출력**: log는 텍스트로 취급합니다. binary 출력은 대체 문자로
+      바뀌므로 log artifact는 byte 단위로 원본과 같지 않습니다. secret이 평문으로
+      남지 않게 하는 것이 우선입니다.
+    - **크기 제한**: redaction을 마친 byte 기준으로 셉니다.
     """
 
+    def __init__(self, capture: _Capture) -> None:
+        self._capture = capture
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._pending = ""
+        self._sink = open(capture.path, "wb")
+
+    def feed(self, chunk: bytes) -> None:
+        self._pending += self._decoder.decode(chunk)
+        if "\n" in self._pending:
+            head, _, self._pending = self._pending.rpartition("\n")
+            self._write(head + "\n")
+        elif len(self._pending) >= MAX_PENDING_CHARS:
+            # 개행 없이 계속 출력하는 process입니다. 무한정 보류할 수 없으므로
+            # 지금까지 받은 만큼 redaction해서 내보냅니다.
+            self._write(self._pending)
+            self._pending = ""
+
+    def close(self) -> None:
+        try:
+            self._pending += self._decoder.decode(b"", final=True)
+            if self._pending:
+                self._write(self._pending)
+                self._pending = ""
+        finally:
+            try:
+                self._sink.close()
+            except (OSError, ValueError):
+                pass
+
+    def _write(self, text: str) -> None:
+        if not text:
+            return
+        data = redact(text, self._capture.secrets).encode("utf-8", errors="replace")
+        capture = self._capture
+        if capture.written >= capture.limit:
+            capture.truncated = True
+            return
+        room = capture.limit - capture.written
+        self._sink.write(data[:room])
+        capture.written += min(len(data), room)
+        if len(data) > room:
+            capture.truncated = True
+        self._sink.flush()
+
+
+def _pump(stream, capture: _Capture) -> None:
+    """pipe를 redaction하며 파일로 흘립니다.
+
+    한도를 넘어도 읽기는 계속합니다. 읽기를 멈추면 pipe가 차서 child가 블록되기
+    때문입니다. 메모리에 전체 출력을 쌓지 않습니다.
+    """
+
+    sink = None
     try:
-        with open(capture.path, "wb") as sink:
-            while True:
-                chunk = stream.read(8192)
-                if not chunk:
-                    break
-                if capture.written < capture.limit:
-                    room = capture.limit - capture.written
-                    sink.write(chunk[:room])
-                    capture.written += min(len(chunk), room)
-                    if len(chunk) > room:
-                        capture.truncated = True
-                else:
-                    capture.truncated = True
-                sink.flush()
+        sink = _RedactingSink(capture)
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                break
+            sink.feed(chunk)
     except (OSError, ValueError):
         # stream이 닫혔거나 디스크 오류입니다. 수집만 중단합니다.
         pass
     finally:
+        if sink is not None:
+            try:
+                sink.close()
+            except (OSError, ValueError):
+                pass
         try:
             stream.close()
         except (OSError, ValueError):
@@ -156,8 +230,12 @@ class LocalProcessExecutor:
             raise ExecutorError("empty_argv", "실행할 command가 없습니다.")
 
         log_dir.mkdir(parents=True, exist_ok=True)
-        stdout_capture = _Capture(log_dir / "stdout.log", request.max_output_bytes)
-        stderr_capture = _Capture(log_dir / "stderr.log", request.max_output_bytes)
+        stdout_capture = _Capture(
+            log_dir / "stdout.log", request.max_output_bytes, request.secret_values
+        )
+        stderr_capture = _Capture(
+            log_dir / "stderr.log", request.max_output_bytes, request.secret_values
+        )
 
         environment = base_environment()
         environment.update(request.environment)
@@ -213,16 +291,19 @@ class LocalProcessExecutor:
             raise ExecutorError("process_not_tracked", f"이 adapter가 시작한 process가 아닙니다: {handle.pid}")
 
         timed_out = False
+        cancel_state = CancellationState.NONE
+        cancel_error: str | None = None
         try:
             process.wait(timeout=request.timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
             try:
-                self.cancel(handle, request.grace_period_seconds)
-            except ExecutorError:
-                # identity를 확인하지 못하면 종료하지 않습니다. 남은 process는
-                # reconciliation이 판단합니다.
-                pass
+                cancel_state = self.cancel(handle, request.grace_period_seconds)
+            except ExecutorError as error:
+                # identity를 확인하지 못하면 종료하지 않습니다. 이 경우 process가
+                # 아직 살아 있을 수 있으므로 정상 종료로 확정하면 안 됩니다.
+                cancel_error = error.category
+                cancel_state = CancellationState.UNCONFIRMED
             try:
                 process.wait(timeout=request.grace_period_seconds + 5.0)
             except subprocess.TimeoutExpired:
@@ -233,18 +314,34 @@ class LocalProcessExecutor:
         exit_code = process.returncode
 
         if timed_out:
+            # 요청만으로 끝났다고 보지 않고 실제로 사라졌는지 확인합니다.
+            verdict = verify(handle.identity)
+            confirmed = verdict is IdentityVerdict.PROCESS_ABSENT
+            evidence = {
+                "identity_verdict": verdict.value,
+                "cancel_error": cancel_error,
+                "pid": handle.pid,
+            }
             return ExecutorResult(
                 run_id=request.run_id,
                 executor_name=self._name,
-                status=ExecutionStatus.FINISHED,
+                status=ExecutionStatus.FINISHED if confirmed else ExecutionStatus.CANCELLING,
                 exit_code=exit_code,
                 started_at=handle.started_at,
-                finished_at=finished_at,
+                finished_at=finished_at if confirmed else None,
                 stdout=stdout,
                 stderr=stderr,
                 failure=ExecutorFailure.TIMEOUT,
-                detail=f"{request.timeout_seconds}초 안에 끝나지 않아 종료했습니다.",
-                cancellation_state=CancellationState.FORCED,
+                detail=f"{request.timeout_seconds}초 안에 끝나지 않아 종료했습니다."
+                if confirmed
+                else f"{request.timeout_seconds}초 timeout 후 종료를 확인하지 못했습니다.",
+                cancellation_state=cancel_state
+                if confirmed
+                else CancellationState.UNCONFIRMED,
+                termination=TerminationOutcome.CONFIRMED
+                if confirmed
+                else TerminationOutcome.UNVERIFIED,
+                termination_evidence=evidence,
             )
 
         failure = None if exit_code == 0 else ExecutorFailure.NONZERO_EXIT
@@ -259,6 +356,33 @@ class LocalProcessExecutor:
             stderr=stderr,
             failure=failure,
             detail="" if failure is None else f"exit code {exit_code}",
+        )
+
+    def terminate(
+        self, handle: ProcessHandle, grace_period_seconds: float = 5.0
+    ) -> tuple[CancellationState, TerminationOutcome, dict[str, Any]]:
+        """종료를 시도하고 **확인 결과까지** 돌려줍니다.
+
+        `cancel()`은 계약 호환을 위해 상태만 돌려주지만, 호출자가 종료 확인 여부를
+        알아야 할 때는 이 함수를 씁니다.
+        """
+
+        try:
+            state = self.cancel(handle, grace_period_seconds)
+        except ExecutorError as error:
+            return (
+                CancellationState.UNCONFIRMED,
+                TerminationOutcome.UNVERIFIED,
+                {"identity_verdict": verify(handle.identity).value, "cancel_error": error.category},
+            )
+
+        verdict = verify(handle.identity)
+        if verdict is IdentityVerdict.PROCESS_ABSENT:
+            return state, TerminationOutcome.CONFIRMED, {"identity_verdict": verdict.value}
+        return (
+            CancellationState.UNCONFIRMED,
+            TerminationOutcome.UNVERIFIED,
+            {"identity_verdict": verdict.value, "cancel_error": None},
         )
 
     def cancel(self, handle: ProcessHandle, grace_period_seconds: float = 5.0) -> CancellationState:

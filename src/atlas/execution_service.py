@@ -30,6 +30,7 @@ from .executor import (
     ExecutorFailure,
     ExecutorRequest,
     ExecutorResult,
+    TerminationOutcome,
 )
 from .process_identity import IdentityVerdict, ProcessIdentity, verify
 from .redaction import redact_argv, redact_line
@@ -208,16 +209,54 @@ class ExecutionService:
             grace_period_seconds=grace_period_seconds,
         )
 
-        execution_id = self._store.reserve_execution(
-            run_id,
-            task_id=run.task_id,
-            executor_name=self._adapter.name,
-            executor_provider=self._adapter.provider,
-            worker_id=worker_id,
-            cwd=request.cwd,
-            command=redact_argv(request.argv, request.secret_values),
-            timeout_seconds=timeout_seconds,
-        )
+        try:
+            execution_id = self._store.reserve_execution(
+                run_id,
+                task_id=run.task_id,
+                executor_name=self._adapter.name,
+                executor_provider=self._adapter.provider,
+                worker_id=worker_id,
+                cwd=request.cwd,
+                command=redact_argv(request.argv, request.secret_values),
+                timeout_seconds=timeout_seconds,
+            )
+        except ExecutionConflict as conflict:
+            if conflict.category == "reservation_guard_failed":
+                # 예약 transaction이 rollback되므로 그 안에서는 event를 남길 수
+                # 없습니다. 밖에서 근거를 기록합니다.
+                self._store.record_execution_event(
+                    None,
+                    run_id,
+                    "execution_safety_gate_failed",
+                    {
+                        "stage": "reservation",
+                        "failed_checks": (conflict.execution or {}).get("failed_checks", []),
+                    },
+                )
+            raise
+
+        # 예약과 spawn 사이에도 승인 회수나 claim 해제가 일어날 수 있습니다.
+        # spawn 직전에 마지막으로 한 번 더 확인하고, 실패하면 process를 만들지
+        # 않고 예약을 명시적으로 정리합니다.
+        final_gate = self.safety_gate(run_id, worker_id)
+        if not final_gate.passed:
+            self._store.finish_execution(
+                execution_id,
+                status=ExecutionStatus.FAILED,
+                failure_category=ExecutorFailure.SAFETY_GATE.value,
+                error={
+                    "category": "final_safety_gate_failed",
+                    "failed_checks": list(final_gate.failed_checks),
+                },
+            )
+            self._store.record_execution_event(
+                execution_id, run_id, "execution_safety_gate_failed",
+                {"stage": "final", **final_gate.evidence()},
+            )
+            raise SafetyGateFailed(
+                f"spawn 직전 확인에 실패했습니다: {', '.join(final_gate.failed_checks)}",
+                final_gate,
+            )
 
         try:
             handle = self._adapter.spawn(request, self.log_dir(run_id, execution_id))
@@ -266,6 +305,28 @@ class ExecutionService:
                 "execution_heartbeat_failed",
                 {"failures": failures[:5], "count": len(failures)},
             )
+
+        if result.process_may_be_alive:
+            # 종료를 확인하지 못했습니다. Finished로 확정하면 살아 있는 process가
+            # reconciliation 대상에서 빠집니다. Cancelling을 유지해 active로 남기고
+            # 근거를 남깁니다.
+            self._store.set_cancellation_state(
+                execution_id,
+                CancellationState.UNCONFIRMED.value,
+                reason="termination_unverified",
+                status=ExecutionStatus.CANCELLING,
+            )
+            self._store.record_execution_event(
+                execution_id,
+                request.run_id,
+                "execution_termination_unverified",
+                {
+                    "failure": result.failure.value if result.failure else None,
+                    "termination": result.termination.value,
+                    **result.termination_evidence,
+                },
+            )
+            return result
 
         self._store.finish_execution(
             execution_id,
@@ -379,7 +440,32 @@ class ExecutionService:
             started_at=row["process_started_at"] or "",
             process_group_id=identity.pid,
         )
-        state = self._adapter.cancel(handle, grace_period_seconds)
+        terminate = getattr(self._adapter, "terminate", None)
+        if terminate is None:
+            state = self._adapter.cancel(handle, grace_period_seconds)
+            outcome, evidence = TerminationOutcome.CONFIRMED, {}
+        else:
+            state, outcome, evidence = terminate(handle, grace_period_seconds)
+
+        if outcome.process_may_be_alive:
+            # 종료를 확인하지 못했습니다. terminal로 확정하지 않습니다.
+            self._store.set_cancellation_state(
+                execution_id,
+                CancellationState.UNCONFIRMED.value,
+                reason=reason,
+                status=ExecutionStatus.CANCELLING,
+            )
+            self._store.record_execution_event(
+                execution_id, run_id, "execution_termination_unverified",
+                {"reason": redact_line(reason), "termination": outcome.value, **evidence},
+            )
+            return {
+                "run_id": run_id,
+                "cancelled": False,
+                "detail": "종료를 확인하지 못했습니다. reconciliation 대상으로 남깁니다.",
+                "termination": outcome.value,
+            }
+
         self._store.finish_execution(
             execution_id,
             status=ExecutionStatus.FINISHED,

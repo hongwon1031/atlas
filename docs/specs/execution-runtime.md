@@ -297,6 +297,16 @@ process spawn을 database transaction 안에서 잡지 않습니다.
 
 실패는 근거와 함께 event로 남깁니다.
 
+#### gate를 두 번 확인하는 이유
+
+첫 gate와 실제 spawn 사이에도 승인 회수나 claim 해제가 일어날 수 있습니다. 그래서 세 겹으로 확인합니다.
+
+1. **첫 gate** — 예약 전에 확인합니다.
+2. **예약 transaction 안의 guard** — 예약과 같은 transaction에서 run active, workspace ready, 승인, claim owner, lease를 다시 확인합니다. 예약 자체가 근거 없이 만들어지지 않습니다.
+3. **final gate** — 예약 뒤 spawn 직전에 마지막으로 확인합니다. 실패하면 process를 만들지 않고 예약을 `Failed`로 정리해 ghost reservation을 남기지 않습니다.
+
+**subprocess spawn은 database transaction 밖에서 수행합니다.** transaction이 process 수명만큼 열려 있으면 다른 worker가 막힙니다.
+
 ### Runtime 격리
 
 - 작업 디렉터리는 반드시 해당 Run의 검증된 worktree입니다. repository root나 main worktree에서 실행하지 않으며 cwd fallback을 두지 않습니다.
@@ -305,13 +315,22 @@ process spawn을 database transaction 안에서 잡지 않습니다.
 
 ### 출력 수집과 redaction
 
+**persisted log artifact 자체가 redacted 상태여야 합니다.** event만 지우면 secret이 디스크에 평문으로 남습니다.
+
 - stdout과 stderr를 분리해 Run별 log artifact로 씁니다.
-- 각각 크기 상한이 있습니다. 상한을 넘으면 기록을 멈추되 pipe는 계속 비웁니다. 읽기를 멈추면 child가 블록되기 때문입니다.
-- 메모리에 전체 출력을 쌓지 않습니다.
+- 파일에 쓰기 **전에** redaction을 적용합니다. 저장된 파일에 raw secret이 남지 않습니다.
+- 각각 크기 상한이 있습니다. 상한은 redaction을 마친 byte 기준입니다. 상한을 넘으면 기록을 멈추되 pipe는 계속 비웁니다. 읽기를 멈추면 child가 블록되기 때문입니다.
+- 메모리에 전체 출력을 쌓지 않습니다. 완성된 줄만 처리하고 나머지는 보류합니다.
+- **chunk 경계**: secret이 여러 chunk에 나뉘어 도착해도 줄이 완성될 때까지 기다렸다가 redaction하므로 잘린 채 기록되지 않습니다. 개행 없이 계속 출력하는 process를 대비해 보류 한도를 두고, 넘으면 지금까지 받은 만큼 redaction해 내보냅니다.
 - log 경로는 worktree 밖의 log root 아래이며 경계를 벗어나면 거부합니다.
-- 유효하지 않은 UTF-8을 안전하게 다룹니다.
 - event에는 raw 출력을 저장하지 않고 크기와 분류만 남깁니다.
 - redaction 대상은 token 형태, URL에 박힌 credential, `Authorization`/`Bearer` 헤더, 주입한 known secret 값입니다.
+
+#### binary 출력 정책
+
+log는 **텍스트로 취급합니다.** incremental UTF-8 decoder를 `errors="replace"`로 사용하므로 유효하지 않은 byte는 대체 문자가 되고, multi-byte 문자가 chunk 경계에 걸려도 깨지지 않습니다.
+
+그 결과 **log artifact는 원본과 byte 단위로 같지 않습니다.** binary를 그대로 남기려면 redaction을 적용할 수 없고, 그러면 secret이 평문으로 저장됩니다. 둘 중 secret을 막는 쪽을 택했습니다. byte-faithful artifact가 필요해지면 별도 결정이 필요합니다.
 
 ### Timeout과 cancellation
 
@@ -325,6 +344,20 @@ cancellation trigger는 다음과 같습니다.
 - Run cancellation 전이
 
 이미 종료된 process에 대한 취소는 idempotent합니다.
+
+#### 종료 확인과 termination outcome
+
+**"종료를 요청했다"와 "종료를 확인했다"는 다릅니다.** identity를 확인할 수 없거나 다른 process일 수 있으면 종료를 수행하지 않으므로, 요청만으로 완료 처리하면 살아 있는 process를 놓칩니다.
+
+| outcome | 의미 | execution 상태 |
+| --- | --- | --- |
+| `not_required` | process가 스스로 끝남 | `Finished` |
+| `confirmed` | 종료 요청 후 사라진 것을 확인 | `Finished` |
+| `unverified` | 종료를 시도했지만 사라졌다고 증명하지 못함 | **`Cancelling` 유지** |
+
+`unverified`인 execution은 terminal로 확정하지 않고 `Cancelling`으로 남깁니다. `Cancelling`은 active 상태이므로 reconciliation이 반드시 다시 검사합니다. cancellation state는 `unconfirmed`가 되고 `execution_termination_unverified` event에 판정 근거를 남깁니다.
+
+process가 살아 있을 가능성이 있는 execution은 어떤 경우에도 reconciliation 대상에서 빠지지 않습니다.
 
 ### Process identity
 

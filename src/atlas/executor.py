@@ -64,6 +64,28 @@ class CancellationState(str, Enum):
     TERMINATING = "terminating"
     FORCED = "forced"
     COMPLETED = "completed"
+    # 종료를 시도했지만 process가 정말 끝났는지 증명하지 못했습니다.
+    # identity를 확인할 수 없거나 다른 process일 수 있는 경우입니다.
+    UNCONFIRMED = "unconfirmed"
+
+
+class TerminationOutcome(str, Enum):
+    """종료 시도의 결과.
+
+    "종료를 요청했다"와 "종료를 확인했다"는 다릅니다. 확인하지 못한 상태를
+    정상 종료로 확정하면 살아 있는 process를 놓칩니다.
+    """
+
+    # 종료가 필요하지 않았습니다. process가 스스로 끝났습니다.
+    NOT_REQUIRED = "not_required"
+    # 종료를 요청했고 process가 사라진 것을 확인했습니다.
+    CONFIRMED = "confirmed"
+    # 종료를 시도했지만 사라졌다고 증명하지 못했습니다. reconciliation 대상입니다.
+    UNVERIFIED = "unverified"
+
+    @property
+    def process_may_be_alive(self) -> bool:
+        return self is TerminationOutcome.UNVERIFIED
 
 
 class ExecutorFailure(str, Enum):
@@ -192,10 +214,18 @@ class ExecutorResult:
     failure: ExecutorFailure | None = None
     detail: str = ""
     cancellation_state: CancellationState = CancellationState.NONE
+    termination: TerminationOutcome = TerminationOutcome.NOT_REQUIRED
+    termination_evidence: dict[str, Any] = field(default_factory=dict)
 
     @property
     def succeeded(self) -> bool:
         return self.status is ExecutionStatus.FINISHED and self.exit_code == 0
+
+    @property
+    def process_may_be_alive(self) -> bool:
+        """process가 아직 살아 있을 수 있으면 terminal로 확정하면 안 됩니다."""
+
+        return self.termination.process_may_be_alive
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -210,7 +240,10 @@ class ExecutorResult:
             "failure": self.failure.value if self.failure else None,
             "detail": self.detail,
             "cancellation_state": self.cancellation_state.value,
+            "termination": self.termination.value,
+            "termination_evidence": self.termination_evidence,
             "succeeded": self.succeeded,
+            "process_may_be_alive": self.process_may_be_alive,
         }
 
 

@@ -178,6 +178,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 
 - webhook ingestion이 없습니다. polling만 있으며 지연은 interval에 좌우됩니다.
 - executor는 mock만 있습니다. 실제 Claude Code나 Codex를 호출하지 않으며 provider credential도 주입하지 않습니다.
+- executor log는 redaction을 거쳐 저장되므로 원본과 byte 단위로 같지 않습니다. binary 출력은 UTF-8 대체 문자가 됩니다.
 - push, PR 생성, validation pipeline이 없습니다. executor가 worktree를 수정해도 그 결과를 전달하지 않습니다.
 - process identity 확인 방법이 플랫폼마다 다릅니다. 얻지 못하면 `unverifiable`로 남기고 그 process는 종료하지 않습니다.
 - Windows에서는 parent가 먼저 종료하면 child를 tree로 추적할 수 없습니다. graceful 단계에서 parent를 즉시 죽이지 않는 방식으로 완화했지만 Job Object만큼 견고하지는 않습니다.

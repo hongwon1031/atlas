@@ -1261,7 +1261,8 @@ class TaskStore:
         `command`는 이미 redaction된 값이어야 합니다.
         """
 
-        moment = to_iso(now or utcnow())
+        moment = now or utcnow()
+        stamp = to_iso(moment)
         execution_id = f"exec-{uuid.uuid4().hex[:16]}"
         with self._write() as connection:
             existing = connection.execute(
@@ -1274,6 +1275,16 @@ class TaskStore:
                     "execution_already_active",
                     f"{run_id}에 이미 active execution {existing['execution_id']}이 있습니다.",
                     self._execution_from_row(existing),
+                )
+
+            # 실행 근거를 예약과 같은 transaction에서 확인합니다. gate와 예약
+            # 사이에 승인이 회수되거나 claim이 풀리는 창을 좁힙니다.
+            failed = self._reservation_guards(connection, run_id, worker_id, moment)
+            if failed:
+                raise ExecutionConflict(
+                    "reservation_guard_failed",
+                    f"예약 시점 확인에 실패했습니다: {', '.join(failed)}",
+                    {"failed_checks": failed},
                 )
             connection.execute(
                 "INSERT INTO executions("
@@ -1292,20 +1303,56 @@ class TaskStore:
                     cwd,
                     json.dumps(command, ensure_ascii=False),
                     timeout_seconds,
-                    moment,
-                    moment,
+                    stamp,
+                    stamp,
                 ),
             )
             self._record(
                 connection,
                 kind="execution_reserved",
-                moment=moment,
+                moment=stamp,
                 task_id=task_id,
                 run_id=run_id,
                 execution_id=execution_id,
                 detail={"executor": executor_name, "timeout_seconds": timeout_seconds},
             )
         return execution_id
+
+    @staticmethod
+    def _reservation_guards(
+        connection: sqlite3.Connection, run_id: str, worker_id: str, moment: datetime
+    ) -> list[str]:
+        """예약 transaction 안에서 실행 근거를 확인하고 실패 항목을 돌려줍니다."""
+
+        failed: list[str] = []
+        run = connection.execute(
+            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if run is None:
+            return ["run_exists"]
+        if RunStatus(run["status"]).is_terminal:
+            failed.append("run_active")
+        if run["workspace_status"] != WorkspaceStatus.READY.value:
+            failed.append("workspace_ready")
+
+        task = connection.execute(
+            "SELECT approved, is_current FROM tasks WHERE fingerprint = ?",
+            (run["fingerprint"],),
+        ).fetchone()
+        if task is None or not task["approved"] or not task["is_current"]:
+            failed.append("task_approved")
+
+        claim = connection.execute(
+            "SELECT * FROM claims WHERE claim_id = ?", (run["claim_id"],)
+        ).fetchone()
+        if claim is None or claim["released_at"] is not None:
+            failed.append("claim_active")
+        else:
+            if claim["lease_owner"] != worker_id:
+                failed.append("claim_owner_matches")
+            if from_iso(claim["lease_expires_at"]) <= moment:
+                failed.append("lease_valid")
+        return failed
 
     def attach_process(
         self,

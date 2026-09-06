@@ -210,3 +210,76 @@ PR #9 리뷰에서 지적된 두 건을 수정하고 다시 검증했습니다.
 - 별도 OS process 사이의 동시 `executor-start` 경쟁. thread 6개 경쟁만 검증했습니다.
 - 장시간 실행 executor의 안정성과 log 누적량.
 - Job Object를 쓰지 않아 Windows에서 CTRL_BREAK를 무시하는 child가 있을 때의 동작.
+
+### 2026-09-06 추가 — log redaction, 종료 확인, gate 경쟁
+
+merge-blocking review 세 건을 고치고 다시 검증했습니다.
+
+#### log artifact redaction
+
+이전에는 event만 redaction했고 **파일에는 raw 출력을 그대로 썼습니다.** secret이 디스크에 평문으로 남는 문제라서, 파일에 쓰기 전에 redaction하도록 바꿨습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 주입한 known secret | stdout·stderr 파일 어디에도 남지 않음 |
+| `Authorization: Bearer <token>` | 헤더가 줄 끝까지 제거됨 |
+| GitHub token 형태, URL credential | 제거됨 |
+| chunk 경계에 걸친 secret | 줄 단위로 모아 처리하므로 잘린 채 기록되지 않음 |
+| 개행 없이 65536자 초과 | 보류 한도에서 redaction 후 기록, secret 남지 않음 |
+| 유효하지 않은 UTF-8 | 예외 없이 대체 문자로 처리 |
+| 크기 상한 | redaction을 마친 byte 기준으로 잘리고 `truncated` 표시 |
+| pipe drain | 상한 도달 후에도 계속 비워 child가 블록되지 않음 |
+| event·DB 전체 | secret 평문 없음 |
+
+log는 텍스트로 취급하므로 **artifact는 원본과 byte 단위로 같지 않습니다.** binary를 그대로 남기려면 redaction을 적용할 수 없어, secret을 막는 쪽을 택했습니다.
+
+#### 종료 확인과 termination outcome
+
+이전에는 종료를 **요청**하기만 하면 `Finished`로 확정했습니다. identity를 확인할 수 없으면 실제로 종료하지 않으므로, 살아 있는 process가 terminal 처리되어 reconciliation에서 빠질 수 있었습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 정상 종료 | `not_required` → `Finished` |
+| 종료 확인됨 | `confirmed` → `Finished` |
+| 종료 미확인 | `unverified` → `Cancelling` 유지, terminal 아님 |
+| timeout 후 process 잔존 | `Finished`가 아니라 `Cancelling`으로 남음 |
+| cancel 미확인 | `cancelled=False` 반환, 근거 event 기록 |
+| reconciliation 범위 | `Cancelling`은 active라 다시 검사됨 |
+| 근거 | `execution_termination_unverified` event에 판정 evidence 기록 |
+
+#### safety gate → reserve → spawn 경쟁
+
+gate 통과와 spawn 사이에 승인 회수나 claim 해제가 들어오면 근거 없는 process가 뜰 수 있었습니다. 세 겹으로 막았습니다.
+
+| 층 | 시점 | 확인 |
+| --- | --- | --- |
+| 첫 gate | 예약 전 | 8개 항목 |
+| 예약 guard | 예약과 같은 transaction | run active, workspace ready, 승인, claim owner, lease |
+| final gate | spawn 직전 | 8개 항목 |
+
+| 확인 | 결과 |
+| --- | --- |
+| gate 직후 승인 회수 | spawn되지 않음 |
+| gate 직후 claim 해제 | spawn되지 않음 |
+| gate 직후 lease 만료 | spawn되지 않음 |
+| 차단 후 상태 | active execution 0개. ghost reservation 없음 |
+| 차단 근거 | `execution_safety_gate_failed` event에 단계와 실패 항목 기록 |
+| transaction 경계 | subprocess spawn은 transaction 밖에서만 수행 |
+
+예약 transaction은 rollback되므로 그 안에서 event를 남길 수 없습니다. 그래서 guard 실패 근거는 transaction 밖에서 기록합니다.
+
+#### 회귀 테스트가 실제로 잡는지 확인
+
+세 수정을 각각 되돌리고 다시 돌렸습니다. **11건이 실패**했고 복원하니 전부 통과했습니다. 테스트가 통과하기만 하는 것이 아니라 해당 결함을 실제로 잡습니다.
+
+#### 재실행한 검증
+
+- 전체 테스트 466건 통과
+- `compileall` (src, tests) 통과
+- Windows smoke 15단계 전부 통과 (timeout, cancel, child process tree, restart 재식별, `process_missing`, PID identity mismatch 포함)
+- 이번 수정분 end-to-end smoke 통과
+- secret scan, `git diff --check` 통과
+
+#### 확인하지 못한 항목
+
+앞 절의 항목이 그대로 남습니다. POSIX process group 종료 실측과 Windows Job Object 미사용 한계는 이번 범위에서 해소하지 않았습니다.
