@@ -923,7 +923,7 @@ class SchemaMigrationTest(GitBackedTestCase):
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
         restored = migrated.run(run.run_id)
-        self.assertEqual(version, "4")
+        self.assertEqual(version, "5")
         self.assertEqual(restored.workspace_status, WorkspaceStatus.NONE)
         self.assertIsNone(restored.branch)
         # Run 자체는 보존됩니다.

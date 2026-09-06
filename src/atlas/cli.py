@@ -15,6 +15,9 @@
     python -m atlas workspace-create --run-id <run-id>
     python -m atlas workspace-show --run-id <run-id>
     python -m atlas workspace-cleanup --run-id <run-id>
+    python -m atlas executor-start --run-id <run-id> --mock-mode success
+    python -m atlas executor-show --run-id <run-id>
+    python -m atlas executor-cancel --run-id <run-id>
 
 Exit code: 0 성공, 1 대상 없음 또는 lifecycle 위반, 2 source 오류.
 """
@@ -26,6 +29,7 @@ import json
 import re
 import socket
 import sys
+from pathlib import Path
 from dataclasses import replace
 from typing import Any
 
@@ -33,6 +37,9 @@ from .config import WorkerConfig
 from .intake import DEFAULT_REPOSITORY, IssueIntake
 from .issue_source import GitHubRestIssueSource, IssueSourceError
 from .polling import IssuePoller
+from .execution_service import DEFAULT_MAX_OUTPUT_BYTES, ExecutionService
+from .executor import ExecutorError
+from .local_process import LocalProcessExecutor
 from .reconciliation import RunReconciler
 from .schema import RunFailure, RunStatus
 from .store import RunError, TaskStore
@@ -54,7 +61,13 @@ COMMANDS = (
     "workspace-create",
     "workspace-show",
     "workspace-cleanup",
+    "executor-start",
+    "executor-show",
+    "executor-cancel",
 )
+
+# mock executor 실행 모드. 개발과 테스트 전용이며 public UX가 아닙니다.
+MOCK_MODES = ("success", "fail", "sleep", "child", "output", "binary")
 
 # finish에서 사람이 지정할 수 있는 terminal 상태. Orphaned는 reconciliation이
 # 판단 근거와 함께 기록하는 상태이므로 CLI로 직접 지정하지 않습니다.
@@ -194,6 +207,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--delete-branch", action="store_true", help="branch까지 삭제(기본은 보존)"
     )
 
+    executor_common = argparse.ArgumentParser(add_help=False)
+    executor_common.add_argument("--run-id", required=True)
+    executor_common.add_argument("--repository-root", default=None)
+    executor_common.add_argument("--workspaces-root", default=None)
+    executor_common.add_argument("--logs-root", default=None)
+
+    start = subparsers.add_parser(
+        "executor-start",
+        parents=[common, executor_common],
+        help="Run의 worktree에서 executor process를 실행합니다",
+    )
+    start.add_argument("--worker-id", default=None)
+    start.add_argument("--timeout", type=_positive_float, default=None, help="초")
+    start.add_argument(
+        "--mock-mode",
+        choices=MOCK_MODES,
+        default="success",
+        help="개발·테스트용 mock executor 모드. 실제 provider adapter가 아닙니다",
+    )
+    start.add_argument("--mock-write-file", default=None, help="worktree 안에 만들 파일")
+    start.add_argument("--mock-sleep-seconds", type=float, default=1.0)
+    start.add_argument("--mock-exit-code", type=int, default=0)
+
+    subparsers.add_parser(
+        "executor-show",
+        parents=[common, executor_common],
+        help="Run의 execution 기록과 process 상태를 봅니다",
+    )
+    cancel_exec = subparsers.add_parser(
+        "executor-cancel",
+        parents=[common, executor_common],
+        help="실행 중인 executor process를 취소합니다",
+    )
+    cancel_exec.add_argument("--reason", default="manual_cancel")
+    cancel_exec.add_argument("--grace", type=_positive_float, default=None, help="초")
+
     return parser
 
 
@@ -245,7 +294,14 @@ def _config(args: argparse.Namespace) -> WorkerConfig:
         workspace = replace(workspace, repository_root=repository_root)
     if workspaces_root := _option(args, "workspaces_root"):
         workspace = replace(workspace, workspaces_root=workspaces_root)
-    return replace(config, polling=polling, claim=claim, run=run, workspace=workspace)
+    if logs_root := _option(args, "logs_root"):
+        workspace = replace(workspace, logs_root=logs_root)
+    executor = config.executor
+    if timeout := _option(args, "timeout"):
+        executor = replace(executor, timeout_seconds=timeout)
+    return replace(
+        config, polling=polling, claim=claim, run=run, workspace=workspace, executor=executor
+    )
 
 
 def _default_worker_id() -> str:
@@ -283,6 +339,12 @@ def main(argv: list[str] | None = None) -> int:
             return _run_workspace_show(args, config)
         if args.command == "workspace-cleanup":
             return _run_workspace_cleanup(args, config)
+        if args.command == "executor-start":
+            return _run_executor_start(args, config)
+        if args.command == "executor-show":
+            return _run_executor_show(args, config)
+        if args.command == "executor-cancel":
+            return _run_executor_cancel(args, config)
     except IssueSourceError as error:
         _emit(
             {"status": "SourceError", "category": error.category, "message": error.message},
@@ -300,6 +362,17 @@ def main(argv: list[str] | None = None) -> int:
             {"status": "WorkspaceError", "category": error.category, "message": error.message},
             _option(args, "indent", 2),
         )
+        return 1
+    except ExecutorError as error:
+        payload = {
+            "status": "ExecutorError",
+            "category": error.category,
+            "message": error.message,
+        }
+        gate = getattr(error, "gate", None)
+        if gate is not None:
+            payload["gate"] = gate.evidence()
+        _emit(payload, _option(args, "indent", 2))
         return 1
     return 2
 
@@ -494,9 +567,11 @@ def _run_workspace_cleanup(args: argparse.Namespace, config: WorkerConfig) -> in
 def _run_reconcile(args: argparse.Namespace, config: WorkerConfig) -> int:
     with TaskStore(config.database_path) as store:
         workspaces = None
+        executions = None
         if config.workspace.repository_root:
             workspaces = _workspace_service(store, config)
-        reconciler = RunReconciler(store, config.run, workspaces)
+            executions = _execution_service(store, config)
+        reconciler = RunReconciler(store, config.run, workspaces, executions)
         if args.dry_run:
             verdicts = [reconciler.evaluate(run) for run in store.active_runs()]
             payload = {
@@ -508,6 +583,69 @@ def _run_reconcile(args: argparse.Namespace, config: WorkerConfig) -> int:
             payload = {"status": "Reconciled", **reconciler.reconcile().to_dict()}
     _emit(payload, _option(args, "indent", 2))
     return 0
+
+
+def _execution_service(store: TaskStore, config: WorkerConfig) -> ExecutionService:
+    logs_root = config.workspace.resolved_logs_root()
+    if not logs_root:
+        raise ExecutorError(
+            "logs_root_missing",
+            "log root를 결정할 수 없습니다. --repository-root 또는 --logs-root를 지정하세요.",
+        )
+    return ExecutionService(
+        store,
+        LocalProcessExecutor(),
+        _workspace_service(store, config),
+        logs_root,
+        config.run,
+    )
+
+
+def _mock_argv(args: argparse.Namespace) -> tuple[str, ...]:
+    """mock executor를 별도 process로 띄우는 argv를 만듭니다."""
+
+    argv = [sys.executable, "-m", "atlas.mock_executor", "--mode", args.mock_mode]
+    if args.mock_write_file:
+        argv += ["--write-file", args.mock_write_file]
+    if args.mock_mode in ("sleep", "child"):
+        argv += ["--sleep-seconds", str(args.mock_sleep_seconds)]
+    if args.mock_exit_code:
+        argv += ["--exit-code", str(args.mock_exit_code)]
+    return tuple(argv)
+
+
+def _run_executor_start(args: argparse.Namespace, config: WorkerConfig) -> int:
+    worker_id = args.worker_id or _default_worker_id()
+    with TaskStore(config.database_path) as store:
+        service = _execution_service(store, config)
+        outcome = service.run(
+            args.run_id,
+            worker_id,
+            _mock_argv(args),
+            timeout_seconds=config.executor.timeout_seconds,
+            environment={"PYTHONPATH": str(Path(__file__).resolve().parent.parent)},
+            grace_period_seconds=config.executor.grace_period_seconds,
+            max_output_bytes=config.executor.max_output_bytes,
+        )
+        if outcome.result is not None:
+            service.apply_to_run(args.run_id, outcome.result)
+    _emit({"status": "ExecutorFinished", **outcome.to_dict()}, _option(args, "indent", 2))
+    return 0 if outcome.result and outcome.result.succeeded else 1
+
+
+def _run_executor_show(args: argparse.Namespace, config: WorkerConfig) -> int:
+    with TaskStore(config.database_path) as store:
+        report = _execution_service(store, config).show(args.run_id)
+    _emit({"status": "Executions", **report}, _option(args, "indent", 2))
+    return 0
+
+
+def _run_executor_cancel(args: argparse.Namespace, config: WorkerConfig) -> int:
+    grace = args.grace or config.executor.grace_period_seconds
+    with TaskStore(config.database_path) as store:
+        outcome = _execution_service(store, config).cancel(args.run_id, args.reason, grace)
+    _emit({"status": "ExecutorCancel", **outcome}, _option(args, "indent", 2))
+    return 0 if outcome.get("cancelled") else 1
 
 
 if __name__ == "__main__":

@@ -48,14 +48,14 @@ Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge*
 
 ### Epic 2. Isolated Worker Runtime
 
-- [ ] provider-neutral Executor Adapter 최소 interface
+- [x] provider-neutral Executor Adapter 최소 interface
 - [x] 최소 Task, claim lease persistence
 - [x] Run record, heartbeat, restart reconciliation
 - [x] Task별 worktree, branch, Run ID, log scope (process는 후속)
-- [ ] mock executor invocation
-- [ ] timeout, cancel, retry, process/worktree cleanup
-- [ ] 승인 회수·claim 해제 시 실행 중인 executor cancellation (executor slice 필수)
-- [ ] worker restart, stale lease, orphan resource recovery
+- [x] mock executor invocation
+- [x] timeout, cancel, process/worktree cleanup (retry 정책은 후속)
+- [x] 승인 회수·claim 해제 시 실행 중인 executor cancellation
+- [x] worker restart, stale lease, orphan resource recovery 판정 (자동 복구는 하지 않음)
 - [ ] Proposed tmux PoC로 process persistence 검증
 
 ### Epic 3. Validation and Delivery
@@ -183,7 +183,8 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 4. ~~valid Atlas Task Issue의 live E2E를 확인합니다.~~ (완료 — Issue #7)
 5. ~~Run record와 heartbeat, restart reconciliation을 추가합니다.~~ (완료)
 6. ~~격리된 worktree와 branch를 생성합니다.~~ (완료)
-7. mock executor를 새 process로 호출합니다.
+7. ~~mock executor를 새 process로 호출합니다.~~ (완료)
+8. 실제 provider adapter를 하나 연결하고 validation·draft PR을 구현합니다.
 6. Task별 새 process에서 mock executor를 호출합니다.
 7. 결과를 validate하고 draft PR을 생성합니다.
 8. self-hosted Claude Code invocation은 별도 후속 PR에서 추가합니다.

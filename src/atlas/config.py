@@ -15,6 +15,7 @@ DEFAULT_REPOSITORY = "hongwon1031/atlas"
 DEFAULT_DATABASE_PATH = "atlas.db"
 # repository 안에 두되 git이 추적하지 않도록 operator가 ignore해야 하는 경로입니다.
 DEFAULT_WORKSPACES_DIRNAME = ".atlas/worktrees"
+DEFAULT_LOGS_DIRNAME = ".atlas/logs"
 
 # docs/specs/issue-command-contract.md의 queue 의도 label.
 QUEUE_LABEL = "atlas:queued"
@@ -115,6 +116,9 @@ class WorkspaceConfig:
     # worktree를 만들 worker root. 기본값은 repository_root 아래의 전용 디렉터리로,
     # 이 경로 밖으로 나가는 worktree는 거부합니다.
     workspaces_root: str | None = None
+    # Run별 executor log를 두는 root. worktree 안에 두면 작업 트리를 오염시키므로
+    # 분리합니다.
+    logs_root: str | None = None
     git_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
@@ -127,6 +131,31 @@ class WorkspaceConfig:
             return str(Path(self.repository_root) / DEFAULT_WORKSPACES_DIRNAME)
         return None
 
+    def resolved_logs_root(self) -> str | None:
+        if self.logs_root:
+            return self.logs_root
+        if self.repository_root:
+            return str(Path(self.repository_root) / DEFAULT_LOGS_DIRNAME)
+        return None
+
+
+@dataclass(frozen=True)
+class ExecutorConfig:
+    """executor process 실행 정책.
+
+    provider별 옵션은 여기 두지 않습니다. adapter 내부에 격리합니다.
+    """
+
+    timeout_seconds: float = 900.0
+    grace_period_seconds: float = 5.0
+    # stdout/stderr 각각의 최대 저장 크기. 넘으면 잘라내고 truncated로 표시합니다.
+    max_output_bytes: int = 1_048_576
+
+    def __post_init__(self) -> None:
+        _require_positive("timeout_seconds", self.timeout_seconds)
+        _require_positive("grace_period_seconds", self.grace_period_seconds)
+        _require_positive("max_output_bytes", self.max_output_bytes)
+
 
 @dataclass(frozen=True)
 class WorkerConfig:
@@ -135,6 +164,7 @@ class WorkerConfig:
     claim: ClaimConfig = field(default_factory=ClaimConfig)
     run: RunConfig = field(default_factory=RunConfig)
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
+    executor: ExecutorConfig = field(default_factory=ExecutorConfig)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> WorkerConfig:
@@ -167,8 +197,25 @@ class WorkerConfig:
             workspace = replace(workspace, workspaces_root=ws_root)
         if timeout := _read_float(env, "ATLAS_GIT_TIMEOUT_SECONDS"):
             workspace = replace(workspace, git_timeout_seconds=timeout)
+        if logs_root := env.get("ATLAS_LOGS_ROOT", "").strip():
+            workspace = replace(workspace, logs_root=logs_root)
 
-        return replace(config, polling=polling, claim=claim, run=run, workspace=workspace)
+        executor = config.executor
+        if timeout := _read_float(env, "ATLAS_EXECUTOR_TIMEOUT_SECONDS"):
+            executor = replace(executor, timeout_seconds=timeout)
+        if grace := _read_float(env, "ATLAS_EXECUTOR_GRACE_SECONDS"):
+            executor = replace(executor, grace_period_seconds=grace)
+        if limit := _read_float(env, "ATLAS_EXECUTOR_MAX_OUTPUT_BYTES"):
+            executor = replace(executor, max_output_bytes=int(limit))
+
+        return replace(
+            config,
+            polling=polling,
+            claim=claim,
+            run=run,
+            workspace=workspace,
+            executor=executor,
+        )
 
 
 def _read_float(environ: dict[str, str], name: str) -> float | None:

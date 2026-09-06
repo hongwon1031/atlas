@@ -1,6 +1,6 @@
 # Execution Runtime Specification v0.1
 
-이 문서는 Atlas worker가 한 Task를 하나의 Run으로 실행할 때 따라야 할 runtime, isolation, recovery 계약을 정의합니다. Run record, heartbeat, restart reconciliation, branch/worktree isolation은 구현됐습니다. [ADR-010](../adr/0010-task-execution-isolation.md)의 filesystem/branch 격리는 `Accepted`이고 executor process 격리는 `Proposed`입니다. [ADR-009](../adr/0009-worker-process-supervision.md)는 `Proposed`이며 executor process invocation은 구현되지 않았습니다.
+이 문서는 Atlas worker가 한 Task를 하나의 Run으로 실행할 때 따라야 할 runtime, isolation, recovery 계약을 정의합니다. Run record, heartbeat, restart reconciliation, branch/worktree isolation, executor process runtime이 구현됐습니다. [ADR-010](../adr/0010-task-execution-isolation.md)의 filesystem/branch 격리와 process 격리는 `Accepted`이고 provider별 정책과 credential injection은 `Proposed`입니다. [ADR-009](../adr/0009-worker-process-supervision.md)는 `Proposed`이며 실제 Claude Code나 Codex adapter는 구현되지 않았습니다.
 
 ## Current and Target Status
 
@@ -10,7 +10,8 @@
 | Atlas worker polling·claim·lease | Complete | Issue polling, Task persistence, atomic claim, lease TTL, 승인 회수 구현. live E2E는 [Verification Log](../verification-log.md) 참조 |
 | Run record와 heartbeat | Complete | Run lifecycle, heartbeat, restart reconciliation 구현. [Verification Log](../verification-log.md) 참조 |
 | branch와 worktree 격리 | Complete | Run별 전용 branch/worktree, 경계 검증, cleanup, reconciliation 구현 |
-| executor process | Not Implemented | worktree는 준비되지만 아직 아무 process도 실행하지 않음 |
+| executor process runtime | Complete | provider-neutral adapter, mock executor, timeout, cancellation, process identity, reconciliation 구현 |
+| 실제 provider adapter | Not Implemented | Claude Code와 Codex 호출은 아직 없음. mock executor만 사용 |
 | self-hosted Claude Code invocation | Planned | Target MVP primary automated executor |
 | tmux worker PoC | Planned | process persistence 용도; service manager가 아님 |
 | systemd 또는 Docker supervision | Planned | stable operation에서 별도 결정 |
@@ -33,10 +34,10 @@
 | `run_id` | 시도마다 새로 발급되는 unique ID | 구현됨 |
 | branch | Run이 단독 수정하는 Task 전용 branch | 구현됨 |
 | worktree/clone | 허용된 Project root 아래의 전용 mutable workspace | worktree 구현됨, clone 미채택 |
-| executor process | Task마다 새로 시작하며 이전 conversation이나 shell state를 상속하지 않음 | 미구현 |
-| log scope | stdout, stderr, event, validation evidence를 Run별로 분리 | event만 구현됨 |
-| timeout | 시작 전에 고정하고 만료 시 cancellation과 cleanup 수행 | 미구현 |
-| cancellation | 요청, 시각, actor, process 종료와 cleanup 결과 기록 | terminal 전이만 구현됨 |
+| executor process | Task마다 새로 시작하며 이전 conversation이나 shell state를 상속하지 않음 | 구현됨 |
+| log scope | stdout, stderr, event, validation evidence를 Run별로 분리 | stdout/stderr/event 구현됨, validation evidence 미구현 |
+| timeout | 시작 전에 고정하고 만료 시 cancellation과 cleanup 수행 | 구현됨 |
+| cancellation | 요청, 시각, actor, process 종료와 cleanup 결과 기록 | 구현됨 |
 
 여러 Project가 하나의 executor conversation을 공유하거나, 여러 Task가 mutable worktree를 공유하거나, 여러 Run이 같은 branch를 동시에 수정해서는 안 됩니다.
 
@@ -124,9 +125,24 @@ worker 시작 시 또는 `reconcile` command로 다음 순서를 수행합니다
 
 ### 현재 구현 범위
 
-1, 4, 5, 7번은 구현됐습니다. active Run을 조회하고, heartbeat가 stale threshold를 넘으면 `Orphaned`로 기록하며, 판단 근거를 event로 남기고, 재시도는 `previous_run_id`로 연결합니다.
+1~7번이 모두 구현됐습니다.
 
-6번의 stale worktree 탐지도 구현됐습니다. 기록된 worktree 경로의 존재 여부, git worktree 등록 여부, 기대한 branch와의 일치, worker root 안에 있는지를 확인합니다. **불일치를 발견해도 임의로 복구하거나 삭제하지 않고** `workspace_recovery_required` event로 근거만 남깁니다. orphan process 탐지는 executor process가 없어 해당하지 않습니다.
+- active Run을 조회하고 heartbeat가 stale threshold를 넘으면 `Orphaned`로 기록합니다.
+- 기록된 PID의 identity를 확인해 PID 재사용을 구분합니다.
+- stale worktree를 탐지합니다. 경로 존재, git worktree 등록, 기대 branch 일치, worker root 경계를 봅니다.
+- 재시도는 새 Run ID와 `previous_run_id`로 연결합니다.
+
+process 판정은 다음과 같습니다.
+
+| 상황 | 판정 | 자동 종료 |
+| --- | --- | --- |
+| `Running` + identity 일치 | healthy | — |
+| `Running` + process 없음 | recovery-required (`process_missing`) | 해당 없음 |
+| `Running` + PID는 있지만 identity 불일치 | recovery-required (`pid_identity_mismatch`) | **금지** |
+| `Starting` + attach 전 중단 | recovery-required (`process_never_attached`) | 해당 없음 |
+| terminal Run인데 process 생존 | 높은 심각도 (`execution_surviving_terminal_run`) | **ownership 확인 전 금지** |
+
+**불일치를 발견해도 임의로 복구하거나 삭제하거나 재실행하지 않습니다.** 근거를 event로 남기고 사람이 판단합니다.
 
 **stale Run을 자동으로 재실행하지 않습니다.** 판정과 기록만 하고 새 Run 생성은 사람이나 상위 정책이 명시적으로 요청해야 합니다.
 
@@ -232,6 +248,131 @@ Atlas가 만들었다고 **증명할 수 있는** 리소스만 정리합니다. 
 
 둘 중 하나라도 어긋나면 삭제하지 않고 거부합니다. 사용자가 만든 branch는 어떤 경우에도 삭제하지 않습니다.
 
+## Executor Runtime
+
+Run의 worktree 안에서 별도 OS process를 실행하는 계약입니다. [ADR-010](../adr/0010-task-execution-isolation.md)의 process isolation 범위가 Accepted입니다.
+
+### Provider-neutral contract
+
+provider별 옵션(model, prompt 형식, credential 주입 방식)을 계약에 넣지 않습니다. adapter 내부에 격리합니다. 계약이 다루는 것은 다음뿐입니다.
+
+- executor 이름과 provider identity
+- 실행할 argv와 작업 디렉터리
+- 환경 allowlist
+- timeout과 grace period
+- cancellation
+- exit code, 시작·종료 시각
+- stdout/stderr metadata
+- 실패 분류
+
+같은 계약으로 mock executor와 실제 provider adapter를 교체할 수 있어야 합니다.
+
+### 단계별 lifecycle
+
+process spawn을 database transaction 안에서 잡지 않습니다.
+
+| 단계 | 의미 |
+| --- | --- |
+| `Starting` | 실행 의도를 기록함. process는 아직 없음 |
+| `Running` | spawn 성공, pid와 identity를 붙임 |
+| `Cancelling` | 취소를 요청하고 종료를 기다리는 중 |
+| `Finished` | 종료 코드와 출력 metadata를 기록함 |
+| `Failed` | spawn이나 attach 도중 실패. 남은 process가 있을 수 있음 |
+
+`Starting` 기록이 spawn보다 먼저 남으므로 중간에 죽어도 "process를 만들려다 만 Run"을 식별할 수 있습니다. 한 Run에 active execution은 최대 하나이며 operational store의 partial unique index가 강제합니다.
+
+### 실행 직전 safety gate
+
+승인 회수나 claim 해제는 Run 시작 이후에도 일어납니다. 그 상태로 executor를 띄우면 승인 없는 side effect가 됩니다. 따라서 spawn 직전에 다음을 **모두** 다시 확인하고, 하나라도 실패하면 process를 만들지 않습니다.
+
+| 확인 | 의미 |
+| --- | --- |
+| `run_active` | Run이 terminal이 아님 |
+| `workspace_ready` | workspace가 `ready` |
+| `workspace_valid` | 기록된 worktree가 실제로 유효함 |
+| `task_approved` | 승인이 아직 유효함 |
+| `claim_active` | claim이 해제되지 않음 |
+| `claim_owner_matches` | claim owner가 현재 worker와 같음 |
+| `lease_valid` | lease가 만료되지 않음 |
+
+실패는 근거와 함께 event로 남깁니다.
+
+### Runtime 격리
+
+- 작업 디렉터리는 반드시 해당 Run의 검증된 worktree입니다. repository root나 main worktree에서 실행하지 않으며 cwd fallback을 두지 않습니다.
+- `shell`을 사용하지 않고 argv list로만 실행합니다.
+- 환경을 통째로 상속하지 않고 allowlist로 구성합니다. POSIX는 `PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, `TMPDIR`이고 Windows는 `PATH`, `SYSTEMROOT`, `TEMP` 등 인터프리터 구동에 필요한 최소 집합입니다.
+
+### 출력 수집과 redaction
+
+- stdout과 stderr를 분리해 Run별 log artifact로 씁니다.
+- 각각 크기 상한이 있습니다. 상한을 넘으면 기록을 멈추되 pipe는 계속 비웁니다. 읽기를 멈추면 child가 블록되기 때문입니다.
+- 메모리에 전체 출력을 쌓지 않습니다.
+- log 경로는 worktree 밖의 log root 아래이며 경계를 벗어나면 거부합니다.
+- 유효하지 않은 UTF-8을 안전하게 다룹니다.
+- event에는 raw 출력을 저장하지 않고 크기와 분류만 남깁니다.
+- redaction 대상은 token 형태, URL에 박힌 credential, `Authorization`/`Bearer` 헤더, 주입한 known secret 값입니다.
+
+### Timeout과 cancellation
+
+timeout이 만료하거나 취소를 요청하면 graceful 종료를 시도하고 grace period 뒤 강제 종료합니다. 종료는 process 하나가 아니라 **Run 단위 process tree**로 수행합니다.
+
+cancellation trigger는 다음과 같습니다.
+
+- 사용자의 명시적 취소
+- 승인 회수
+- claim 해제나 상실
+- Run cancellation 전이
+
+이미 종료된 process에 대한 취소는 idempotent합니다.
+
+### Process identity
+
+PID만으로는 PID 재사용을 구분할 수 없습니다. PID와 process 시작 시각을 함께 저장하고 확인합니다. 판정은 네 가지입니다.
+
+| 판정 | 의미 | 종료 허용 |
+| --- | --- | --- |
+| `match` | 같은 process가 살아 있음 | 예 |
+| `mismatch` | PID는 살아 있지만 다른 process | **아니오** |
+| `process_absent` | process가 없음 | 해당 없음 |
+| `unverifiable` | 시작 시각을 얻지 못해 증명 불가 | **아니오** |
+
+`unverifiable`을 `match`로 취급하지 않습니다. 증명하지 못한 process는 종료하지 않습니다.
+
+### Run status 연결
+
+execution 결과를 Run status로 옮깁니다. Run status와 Task status를 동일시하지 않습니다.
+
+| execution 결과 | Run status | failure category |
+| --- | --- | --- |
+| exit 0 | `Succeeded` | — |
+| non-zero exit | `Failed` | `transient_executor` |
+| timeout | `Failed` | `timeout` |
+| cancel | `Cancelled` | `cancelled_by_human` |
+| spawn 실패 | `Failed` | `transient_executor` |
+| safety gate 실패 | Run 상태 변경 없음 | `policy_violation` |
+
+Run이 `Succeeded`여도 Task는 사람 승인과 merge 전까지 `Completed`가 아닙니다.
+
+### 플랫폼별 차이
+
+process tree 종료 방식이 다릅니다.
+
+| 플랫폼 | graceful | 강제 |
+| --- | --- | --- |
+| POSIX | 새 session의 process group에 `SIGTERM` | 같은 group에 `SIGKILL` |
+| Windows | 새 process group에 `CTRL_BREAK_EVENT` | `taskkill /F /T` |
+
+process 시작 시각을 얻는 방법도 다릅니다. Linux는 `/proc/<pid>/stat`, Windows는 `GetProcessTimes`, 그 밖의 POSIX는 `ps -o lstart=`입니다. 어느 것도 쓸 수 없으면 `unverifiable`로 모델링하고 종료 근거로 쓰지 않습니다.
+
+**Windows 한계**: parent가 먼저 종료하면 child를 tree로 추적할 수 없습니다. 그래서 graceful 단계에서 parent를 즉시 종료하지 않고 group 신호를 보내며, 강제 단계는 parent가 살아 있는 동안 수행합니다. Job Object를 쓰면 더 견고하지만 이번 범위에서는 채택하지 않았습니다.
+
+### Log retention (MVP 정책)
+
+- log는 Run별 디렉터리에 남기고 자동 삭제하지 않습니다.
+- Run workspace를 정리해도 log는 지우지 않습니다. 실패 진단 근거이기 때문입니다.
+- retention 기간과 자동 정리는 아직 결정하지 않았습니다. Open Questions에 있습니다.
+
 ## Cleanup Matrix
 
 | 종료 유형 | process | worktree/clone | branch | logs/artifacts |
@@ -267,5 +408,7 @@ Run 상태별 branch 보존 여부입니다. 작업 내용이 남아 있을 수 
 - worktree와 clone의 Project별 선택 기준
 - default timeout과 cancel escalation 순서
 - stable supervisor로 systemd와 Docker 중 무엇을 선택할지
-- log와 failed workspace retention 기간
+- log와 failed workspace retention 기간, 자동 정리 시점
+- 동시에 실행할 수 있는 Run 수와 자원 한도
+- Windows에서 Job Object를 도입해 process tree 종료를 더 견고하게 만들지
 - 승인 회수와 delivery 사이의 재확인 시점(주기적 reconciliation만으로 충분한지, side effect 직전 재확인이 필요한지)

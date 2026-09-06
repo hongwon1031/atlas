@@ -5,7 +5,14 @@
 PR delivery는 구현하지 않았습니다.
 """
 
-from .config import ClaimConfig, PollingConfig, RunConfig, WorkerConfig, WorkspaceConfig
+from .config import (
+    ClaimConfig,
+    ExecutorConfig,
+    PollingConfig,
+    RunConfig,
+    WorkerConfig,
+    WorkspaceConfig,
+)
 from .idempotency import IdempotencyKey, InProcessIntakeCache
 from .intake import IssueIntake
 from .issue_source import (
@@ -16,7 +23,20 @@ from .issue_source import (
     IssueSourceError,
 )
 from .parser import ParsedBody, parse_issue_body
+from .execution_service import ExecutionService, SafetyGateResult
+from .executor import (
+    CancellationState,
+    ExecutionStatus,
+    ExecutorAdapter,
+    ExecutorError,
+    ExecutorFailure,
+    ExecutorRequest,
+    ExecutorResult,
+    ProcessHandle,
+)
 from .gitcmd import GitError, GitRunner
+from .local_process import LocalProcessExecutor
+from .process_identity import IdentityVerdict, ProcessIdentity
 from .polling import IssuePoller, PollReport, candidate_rejection, is_task_candidate
 from .reconciliation import ReconcileReport, RunReconciler, RunVerdict
 from .schema import (
@@ -72,7 +92,21 @@ __all__ = [
     "Task",
     "TaskStatus",
     "TaskStore",
+    "CancellationState",
     "CleanupResult",
+    "ExecutionService",
+    "ExecutionStatus",
+    "ExecutorAdapter",
+    "ExecutorConfig",
+    "ExecutorError",
+    "ExecutorFailure",
+    "ExecutorRequest",
+    "ExecutorResult",
+    "IdentityVerdict",
+    "LocalProcessExecutor",
+    "ProcessHandle",
+    "ProcessIdentity",
+    "SafetyGateResult",
     "GitError",
     "GitRunner",
     "ValidationIssue",

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .idempotency import IdempotencyKey
+from .executor import ExecutionStatus
 from .schema import (
     ACTIVE_RUN_STATUSES,
     IntakeResult,
@@ -32,7 +33,7 @@ from .schema import (
     WorkspaceStatus,
 )
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 _PRIORITY_RANK = {
     Priority.LOW: 0,
@@ -104,6 +105,7 @@ CREATE TABLE IF NOT EXISTS events (
     fingerprint TEXT,
     claim_id    TEXT,
     run_id      TEXT,
+    execution_id TEXT,
     detail      TEXT NOT NULL
 );
 
@@ -140,6 +142,42 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active
     ON runs(task_id) WHERE status IN ('Pending', 'Running');
 CREATE INDEX IF NOT EXISTS idx_runs_claim ON runs(claim_id);
 
+CREATE TABLE IF NOT EXISTS executions (
+    execution_id         TEXT PRIMARY KEY,
+    run_id               TEXT NOT NULL,
+    task_id              TEXT NOT NULL,
+    executor_name        TEXT NOT NULL,
+    executor_provider    TEXT NOT NULL,
+    status               TEXT NOT NULL,
+    worker_id            TEXT NOT NULL,
+    cwd                  TEXT NOT NULL,
+    command              TEXT NOT NULL,
+    timeout_seconds      REAL NOT NULL,
+    cancellation_state   TEXT NOT NULL DEFAULT 'none',
+    -- process identity. PID만으로는 PID 재사용을 구분할 수 없습니다.
+    process_id           INTEGER,
+    process_identity     TEXT,
+    process_started_at   TEXT,
+    process_finished_at  TEXT,
+    process_exit_code    INTEGER,
+    stdout_path          TEXT,
+    stdout_bytes         INTEGER,
+    stdout_truncated     INTEGER,
+    stderr_path          TEXT,
+    stderr_bytes         INTEGER,
+    stderr_truncated     INTEGER,
+    failure_category     TEXT,
+    executor_error       TEXT,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL
+);
+
+-- Run 하나에 active execution은 최대 하나입니다. DB reservation과 spawn 사이의
+-- race를 database가 최종적으로 막습니다.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_active
+    ON executions(run_id) WHERE status IN ('Starting', 'Running', 'Cancelling');
+CREATE INDEX IF NOT EXISTS idx_executions_run ON executions(run_id);
+
 CREATE TABLE IF NOT EXISTS poll_cursors (
     repository      TEXT PRIMARY KEY,
     last_updated_at TEXT,
@@ -167,6 +205,18 @@ class RunError(Exception):
         super().__init__(message)
         self.category = category
         self.message = message
+
+
+class ExecutionError(RunError):
+    """execution lifecycle 위반."""
+
+
+class ExecutionConflict(ExecutionError):
+    """이미 active execution이 있거나 기대한 단계가 아닙니다."""
+
+    def __init__(self, category: str, message: str, execution: dict | None = None) -> None:
+        super().__init__(category, message)
+        self.execution = execution
 
 
 class WorkspaceConflict(RunError):
@@ -254,6 +304,13 @@ class TaskStore:
         ):
             if column not in existing:
                 self._connection.execute(f"ALTER TABLE tasks ADD COLUMN {ddl}")
+
+        # schema v4 database의 events에는 execution_id가 없습니다.
+        event_columns2 = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(events)")
+        }
+        if "execution_id" not in event_columns2:
+            self._connection.execute("ALTER TABLE events ADD COLUMN execution_id TEXT")
 
         # schema v3 database의 runs에는 workspace 컬럼이 없습니다.
         run_columns = {
@@ -1176,7 +1233,308 @@ class TaskStore:
         ).fetchone()
         return self._run_from_row(row) if row else None
 
+
+    # -- execution lifecycle ---------------------------------------------
+
+    def reserve_execution(
+        self,
+        run_id: str,
+        *,
+        task_id: str,
+        executor_name: str,
+        executor_provider: str,
+        worker_id: str,
+        cwd: str,
+        command: list[str],
+        timeout_seconds: float,
+        now: datetime | None = None,
+    ) -> str:
+        """process를 띄우기 전에 실행 의도를 먼저 기록합니다.
+
+        spawn을 DB transaction 안에서 잡지 않으려고 단계를 나눕니다. `Starting`
+        기록이 먼저 남으므로 spawn 직전이나 직후에 죽어도 reconciliation이
+        "process를 만들려다 만 Run"을 식별할 수 있습니다.
+
+        active execution이 이미 있으면 `ExecutionConflict`를 냅니다. partial
+        unique index가 동시 예약을 database 수준에서 막습니다.
+
+        `command`는 이미 redaction된 값이어야 합니다.
+        """
+
+        moment = to_iso(now or utcnow())
+        execution_id = f"exec-{uuid.uuid4().hex[:16]}"
+        with self._write() as connection:
+            existing = connection.execute(
+                "SELECT * FROM executions WHERE run_id = ? AND status IN "
+                "('Starting','Running','Cancelling')",
+                (run_id,),
+            ).fetchone()
+            if existing is not None:
+                raise ExecutionConflict(
+                    "execution_already_active",
+                    f"{run_id}에 이미 active execution {existing['execution_id']}이 있습니다.",
+                    self._execution_from_row(existing),
+                )
+            connection.execute(
+                "INSERT INTO executions("
+                " execution_id, run_id, task_id, executor_name, executor_provider,"
+                " status, worker_id, cwd, command, timeout_seconds,"
+                " created_at, updated_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    execution_id,
+                    run_id,
+                    task_id,
+                    executor_name,
+                    executor_provider,
+                    ExecutionStatus.STARTING.value,
+                    worker_id,
+                    cwd,
+                    json.dumps(command, ensure_ascii=False),
+                    timeout_seconds,
+                    moment,
+                    moment,
+                ),
+            )
+            self._record(
+                connection,
+                kind="execution_reserved",
+                moment=moment,
+                task_id=task_id,
+                run_id=run_id,
+                execution_id=execution_id,
+                detail={"executor": executor_name, "timeout_seconds": timeout_seconds},
+            )
+        return execution_id
+
+    def attach_process(
+        self,
+        execution_id: str,
+        *,
+        pid: int,
+        identity: dict[str, Any],
+        started_at: str,
+        now: datetime | None = None,
+    ) -> sqlite3.Row:
+        """spawn된 process의 pid와 identity를 붙이고 `Running`으로 확정합니다."""
+
+        moment = to_iso(now or utcnow())
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT * FROM executions WHERE execution_id = ?", (execution_id,)
+            ).fetchone()
+            if row is None:
+                raise ExecutionError("execution_not_found", f"{execution_id}를 찾을 수 없습니다.")
+            if row["status"] != ExecutionStatus.STARTING.value:
+                raise ExecutionConflict(
+                    "execution_not_starting",
+                    f"{execution_id}가 Starting 상태가 아닙니다.",
+                    self._execution_from_row(row),
+                )
+            connection.execute(
+                "UPDATE executions SET status = ?, process_id = ?, process_identity = ?, "
+                "process_started_at = ?, updated_at = ? WHERE execution_id = ?",
+                (
+                    ExecutionStatus.RUNNING.value,
+                    pid,
+                    json.dumps(identity, ensure_ascii=False),
+                    started_at,
+                    moment,
+                    execution_id,
+                ),
+            )
+            self._record(
+                connection,
+                kind="execution_running",
+                moment=moment,
+                task_id=row["task_id"],
+                run_id=row["run_id"],
+                execution_id=execution_id,
+                detail={"pid": pid, "identity_method": identity.get("method")},
+            )
+            return connection.execute(
+                "SELECT * FROM executions WHERE execution_id = ?", (execution_id,)
+            ).fetchone()
+
+    def finish_execution(
+        self,
+        execution_id: str,
+        *,
+        status: ExecutionStatus,
+        exit_code: int | None = None,
+        finished_at: str | None = None,
+        stdout: dict[str, Any] | None = None,
+        stderr: dict[str, Any] | None = None,
+        failure_category: str | None = None,
+        error: dict[str, Any] | None = None,
+        cancellation_state: str | None = None,
+        now: datetime | None = None,
+    ) -> sqlite3.Row:
+        """execution을 terminal 상태로 기록합니다. `error`는 redaction된 값이어야 합니다."""
+
+        moment = to_iso(now or utcnow())
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT * FROM executions WHERE execution_id = ?", (execution_id,)
+            ).fetchone()
+            if row is None:
+                raise ExecutionError("execution_not_found", f"{execution_id}를 찾을 수 없습니다.")
+            connection.execute(
+                "UPDATE executions SET status = ?, process_exit_code = ?, "
+                "process_finished_at = ?, stdout_path = ?, stdout_bytes = ?, "
+                "stdout_truncated = ?, stderr_path = ?, stderr_bytes = ?, "
+                "stderr_truncated = ?, failure_category = ?, executor_error = ?, "
+                "cancellation_state = COALESCE(?, cancellation_state), updated_at = ? "
+                "WHERE execution_id = ?",
+                (
+                    status.value,
+                    exit_code,
+                    finished_at or moment,
+                    (stdout or {}).get("path"),
+                    (stdout or {}).get("bytes_written"),
+                    1 if (stdout or {}).get("truncated") else 0,
+                    (stderr or {}).get("path"),
+                    (stderr or {}).get("bytes_written"),
+                    1 if (stderr or {}).get("truncated") else 0,
+                    failure_category,
+                    json.dumps(error, ensure_ascii=False, default=str) if error else None,
+                    cancellation_state,
+                    moment,
+                    execution_id,
+                ),
+            )
+            self._record(
+                connection,
+                kind="execution_finished",
+                moment=moment,
+                task_id=row["task_id"],
+                run_id=row["run_id"],
+                execution_id=execution_id,
+                detail={
+                    "status": status.value,
+                    "exit_code": exit_code,
+                    "failure_category": failure_category,
+                    "stdout_bytes": (stdout or {}).get("bytes_written"),
+                    "stderr_bytes": (stderr or {}).get("bytes_written"),
+                },
+            )
+            return connection.execute(
+                "SELECT * FROM executions WHERE execution_id = ?", (execution_id,)
+            ).fetchone()
+
+    def set_cancellation_state(
+        self,
+        execution_id: str,
+        state: str,
+        *,
+        reason: str = "",
+        status: ExecutionStatus | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        moment = to_iso(now or utcnow())
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT task_id, run_id FROM executions WHERE execution_id = ?", (execution_id,)
+            ).fetchone()
+            if row is None:
+                return
+            if status is None:
+                connection.execute(
+                    "UPDATE executions SET cancellation_state = ?, updated_at = ? "
+                    "WHERE execution_id = ?",
+                    (state, moment, execution_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE executions SET cancellation_state = ?, status = ?, updated_at = ? "
+                    "WHERE execution_id = ?",
+                    (state, status.value, moment, execution_id),
+                )
+            self._record(
+                connection,
+                kind="execution_cancellation",
+                moment=moment,
+                task_id=row["task_id"],
+                run_id=row["run_id"],
+                execution_id=execution_id,
+                detail={"cancellation_state": state, "reason": reason},
+            )
+
+    def record_execution_event(
+        self,
+        execution_id: str | None,
+        run_id: str | None,
+        kind: str,
+        detail: dict[str, Any],
+        now: datetime | None = None,
+    ) -> None:
+        moment = to_iso(now or utcnow())
+        with self._write() as connection:
+            task_id = None
+            if run_id:
+                row = connection.execute(
+                    "SELECT task_id FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                task_id = row["task_id"] if row else None
+            self._record(
+                connection,
+                kind=kind,
+                moment=moment,
+                task_id=task_id,
+                run_id=run_id,
+                execution_id=execution_id,
+                detail=detail,
+            )
+
+    # -- execution reads -------------------------------------------------
+
+    def execution(self, execution_id: str) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT * FROM executions WHERE execution_id = ?", (execution_id,)
+        ).fetchone()
+
+    def active_execution(self, run_id: str) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT * FROM executions WHERE run_id = ? AND status IN "
+            "('Starting','Running','Cancelling')",
+            (run_id,),
+        ).fetchone()
+
+    def executions(self, run_id: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+        query = "SELECT * FROM executions"
+        params: list[Any] = []
+        if run_id is not None:
+            query += " WHERE run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        return list(self._connection.execute(query, params))
+
+    def active_executions(self) -> list[sqlite3.Row]:
+        return list(
+            self._connection.execute(
+                "SELECT * FROM executions WHERE status IN "
+                "('Starting','Running','Cancelling') ORDER BY created_at ASC"
+            )
+        )
+
+    def executions_for_terminal_runs(self) -> list[sqlite3.Row]:
+        """Run은 끝났는데 execution이 아직 active인 경우를 찾습니다."""
+
+        return list(
+            self._connection.execute(
+                "SELECT e.* FROM executions e JOIN runs r ON r.run_id = e.run_id "
+                "WHERE e.status IN ('Starting','Running','Cancelling') "
+                "AND r.status NOT IN ('Pending','Running') ORDER BY e.created_at ASC"
+            )
+        )
+
+    @staticmethod
+    def _execution_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {key: row[key] for key in row.keys()}
+
     # -- run reads -------------------------------------------------------
+
 
 
     def run(self, run_id: str) -> Run | None:
@@ -1374,12 +1732,13 @@ class TaskStore:
         fingerprint: str | None = None,
         claim_id: str | None = None,
         run_id: str | None = None,
+        execution_id: str | None = None,
         detail: dict[str, Any] | None = None,
     ) -> None:
         connection.execute(
             "INSERT INTO events"
-            "(occurred_at, kind, task_id, fingerprint, claim_id, run_id, detail) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "(occurred_at, kind, task_id, fingerprint, claim_id, run_id, execution_id, detail) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (
                 moment,
                 kind,
@@ -1387,6 +1746,7 @@ class TaskStore:
                 fingerprint,
                 claim_id,
                 run_id,
+                execution_id,
                 json.dumps(detail or {}, ensure_ascii=False, default=str),
             ),
         )
