@@ -21,7 +21,7 @@
 
 ## Current Manual Workflow
 
-현재 repository에는 Issue polling, Task persistence, atomic claim, Run lifecycle, workspace 격리, executor process runtime을 수행하는 worker가 있습니다. candidate Issue를 polling해 Task로 저장하고, lease 기반으로 claim하고, 전용 branch·worktree를 만들고, 그 안에서 별도 OS process를 실행하며, heartbeat와 restart reconciliation으로 stale Run·workspace·process 불일치를 판정합니다. 실행하는 executor는 아직 mock뿐입니다. webhook, 실제 Claude Code·Codex invocation, Run validation automation, PR delivery는 없습니다.
+현재 repository에는 Issue polling, Task persistence, atomic claim, Run lifecycle, workspace 격리, executor process runtime을 수행하는 worker가 있습니다. candidate Issue를 polling해 Task로 저장하고, lease 기반으로 claim하고, 전용 branch·worktree를 만들고, 그 안에서 별도 OS process를 실행하며, heartbeat와 restart reconciliation으로 stale Run·workspace·process 불일치를 판정합니다. executor는 mock과 **실제 Claude Code CLI** 두 가지가 있습니다. webhook, Codex invocation, Run validation automation, git commit·push, PR delivery는 없습니다.
 
 ```mermaid
 flowchart LR
@@ -83,7 +83,7 @@ Target MVP에서는 primary self-hosted Claude Code Executor를 선택합니다.
 
 ### 6. Execution Runner
 
-운영자가 관리하는 always-available server에서 worker가 저장소를 준비합니다. server를 사용하면 개인 PC는 꺼져 있어도 됩니다. [ADR-010](adr/0010-task-execution-isolation.md)의 Task별 branch, worktree, Run ID, executor process 격리는 `Accepted`이고 구현됐습니다. provider별 정책과 credential injection은 계속 `Proposed`입니다. [ADR-009](adr/0009-worker-process-supervision.md)의 tmux PoC와 stable supervisor 전환은 `Proposed`이며 executor process는 구현되지 않았습니다.
+운영자가 관리하는 always-available server에서 worker가 저장소를 준비합니다. server를 사용하면 개인 PC는 꺼져 있어도 됩니다. [ADR-010](adr/0010-task-execution-isolation.md)의 Task별 branch, worktree, Run ID, executor process 격리는 `Accepted`이고 구현됐습니다. provider별 정책과 credential injection은 계속 `Proposed`입니다. [ADR-009](adr/0009-worker-process-supervision.md)의 tmux PoC와 stable supervisor 전환은 계속 `Proposed`입니다.
 
 worker는 한 Task를 claim한 뒤 새 executor process를 시작하고 stdout, stderr, metadata, heartbeat, validation evidence를 Run별로 수집합니다. timeout, cancellation, retry, cleanup, restart reconciliation은 [Execution Runtime](specs/execution-runtime.md)을 따릅니다. persistent Claude conversation, shell, tmux pane을 여러 Task나 Project가 공유하지 않습니다.
 
@@ -216,6 +216,9 @@ stateDiagram-v2
 
 - always-available server에서 실행합니다.
 - Atlas worker가 검증·claim한 Task를 Claude Code Adapter에 전달합니다.
+- Adapter는 `claude --print --output-format json`으로 비대화형 실행합니다. prompt는 argv가 아니라 stdin으로 전달합니다.
+- 도구를 `Read,Edit,Write,Glob,Grep`으로 제한해 shell 실행 수단을 주지 않습니다. 권한은 `acceptEdits`까지만 엽니다.
+- process 수명주기는 `LocalProcessExecutor`를 재사용합니다. Claude 전용 process manager를 만들지 않습니다.
 - Task별 branch, worktree/clone, 새 process, Run log, timeout, command policy, redaction이 필요합니다.
 - polling-first는 Accepted이고 구현됐습니다. tmux PoC와 isolation은 Proposed ADR이며 server hosting 위치와 stable supervisor는 미결정입니다.
 
@@ -232,7 +235,7 @@ stateDiagram-v2
 
 ## Recommended MVP
 
-[ADR-003](adr/0003-initial-execution-environment.md)에 따라 primary automated path는 **GitHub Issue → Atlas worker → self-hosted Claude Code worker → validation → PR → human review/merge**입니다. Codex Cloud는 manual/secondary로 유지합니다. 현재 이 경로 중 polling, parse·validation, Task persistence, atomic claim, Run lifecycle과 heartbeat, 격리된 branch·worktree 준비, provider-neutral executor process runtime까지 구현됐습니다. 실제 provider adapter와 validation, PR delivery는 구현되지 않았습니다.
+[ADR-003](adr/0003-initial-execution-environment.md)에 따라 primary automated path는 **GitHub Issue → Atlas worker → self-hosted Claude Code worker → validation → PR → human review/merge**입니다. Codex Cloud는 manual/secondary로 유지합니다. 현재 이 경로 중 polling, parse·validation, Task persistence, atomic claim, Run lifecycle과 heartbeat, 격리된 branch·worktree 준비, provider-neutral executor process runtime까지 구현됐습니다. 실제 Claude Code adapter까지 구현됐습니다. validation, git commit, push, PR delivery는 구현되지 않았습니다.
 
 ## Recommended Next Sprint Scope
 
@@ -241,11 +244,12 @@ stateDiagram-v2
 3. ~~격리된 worktree와 branch를 준비합니다.~~ (완료 — `workspace.py`, `workspace_service.py`)
 4. ~~mock executor를 새 process로 호출하고 Run에 연결합니다.~~ (완료 — `executor.py`, `local_process.py`, `execution_service.py`)
 5. ~~승인 회수·claim 해제 시 실행 중인 executor cancellation을 구현합니다.~~ (완료 — safety gate와 `cancel_for_lost_authorization`)
-6. 실제 provider adapter를 하나 연결합니다 (Claude Code 또는 Codex).
+6. ~~실제 provider adapter를 하나 연결합니다.~~ (완료 — `claude_code.py`, `claude_prompt.py`, `implementation.py`, `worktree_changes.py`)
+7. implementation validation pipeline을 추가합니다 (tests·lint·typecheck·allowed-path 판정).
 7. validation pipeline과 draft PR delivery를 구현합니다.
 5. repository allowlist 아래 격리 worktree와 branch를 만듭니다.
 6. provider-neutral contract를 따르는 mock executor를 새 process로 호출합니다.
 7. scope·forbidden path·secret validation을 수행하고 draft PR을 생성합니다.
-8. self-hosted Claude Code invocation은 별도 후속 PR에서 추가합니다.
+8. ~~self-hosted Claude Code invocation은 별도 후속 PR에서 추가합니다.~~ (완료 — 로컬 CLI invocation)
 
-다음 Sprint는 위 mock vertical slice에 한정하며 Claude Code invocation, multi-agent routing, automated Codex adapter, Web UI, vector memory, production deployment를 포함하지 않습니다.
+다음 Sprint는 implementation validation pipeline에 한정하며 multi-agent routing, automated Codex adapter, Web UI, vector memory, production deployment를 포함하지 않습니다.

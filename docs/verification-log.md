@@ -309,3 +309,187 @@ overlap을 보존하고, 자를 지점이 완결된 secret 한가운데면 구�
 #### 회귀 테스트 확인
 
 경계 보존을 되돌리고 다시 돌렸습니다. **3건이 실패**했고 복원하니 전부 통과했습니다.
+
+## 2026-09-06 — 실제 Claude Code executor adapter
+
+Windows 11, Python 3.12.x, git 설치 환경에서 **실제 Claude Code CLI**로 확인했습니다.
+
+### Claude Code CLI 사전 조사
+
+구현 전에 `claude --help`와 임시 git repository 실행으로 실측했습니다. 추측한 항목은 없습니다.
+
+| 항목 | 확인한 동작 |
+| --- | --- |
+| version | `2.1.252 (Claude Code)`. `claude --version`이 약 320ms에 끝남 |
+| 실행 파일 | Windows npm 설치는 `claude.CMD` wrapper로 resolve됨 |
+| 비대화형 | `-p`/`--print`가 응답 후 종료. TTY를 요구하지 않음 |
+| prompt 전달 | argv positional과 **stdin** 모두 가능. stdin으로 넘겨도 정상 동작 |
+| 구조화 출력 | `--output-format json`이 단일 JSON 객체를 stdout에 출력 |
+| exit code | 성공 0. 모델 오류 등 실패는 1 |
+| **오류 신호** | 모델 오류에서도 `subtype`은 `success`였고 **`is_error: true`가 실제 신호**였음. `api_error_status: 404`, `terminal_reason: api_error`도 함께 옴 |
+| stdout/stderr | 정상 실행에서 stderr는 비어 있음. 오류는 stderr에 한 줄 + stdout에 JSON |
+| working directory | `cwd`에서 동작하고 파일을 그 안에 만듦 |
+| **cwd 경계** | cwd 밖 파일 읽기를 CLI가 스스로 거부하고 `permission_denials`에 기록함 |
+| 세션 재사용 | `--resume`/`--continue`가 있으나 `--no-session-persistence`로 비활성 가능 |
+| 권한 옵션 | `--permission-mode {acceptEdits,auto,bypassPermissions,manual,dontAsk,plan}` |
+| 도구 제한 | `--tools "Read,Edit,Write,Glob,Grep"`로 제한하면 Bash가 사라져 shell 명령을 실행할 수단이 없음 |
+| model 옵션 | 필수가 아님. 지정하지 않으면 기본 모델 사용 |
+| 잔여물 | `--no-session-persistence` 사용 시 worktree에 남는 파일 없음 |
+
+### 인증에 필요한 최소 환경
+
+기존 Windows allowlist만으로 인증이 됐습니다. 별도 credential 주입이나 auth 파일 복사가 필요하지 않았습니다.
+
+| 환경 | 결과 |
+| --- | --- |
+| 기존 allowlist(`PATH`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `SYSTEMROOT` 등)만 | 성공 |
+| allowlist + `HOME` | 성공 |
+| 전체 상속(기준선) | 성공 |
+
+Atlas는 credential 값을 읽지도 저장하지도 않습니다. 현재 로그인된 CLI 세션을 그대로 씁니다. API key를 argv에 넣지 않습니다.
+
+### 실제 Claude Code end-to-end smoke
+
+임시 git repository에 Run과 worktree를 만들고 실제 CLI로 한 번 실행했습니다.
+
+Task objective는 "`docs/smoke.md` 파일을 새로 만들고 정확히 한 줄 `atlas claude smoke`만 써라"였습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| executable resolution | `claude.CMD` 확인 |
+| version probe | `2.1.252 (Claude Code)` |
+| process 종료 | exit 0 |
+| CLI 오류 | `is_error=false` |
+| 파일 생성 | `docs/smoke.md` 생성됨 |
+| 내용 | 정확히 `atlas claude smoke` 한 줄 |
+| 변경 감지 | `changed_files=('docs/smoke.md',)` |
+| 구현 판정 | `changes_applied` |
+| main repository README | 변경 없음 |
+| main repository HEAD | 변경 없음 |
+| main repository dirty | 아님 |
+| main에 결과 파일 | 없음 |
+| branch | 예상 atlas branch 유지 |
+| commit | 하지 않음. HEAD 그대로 |
+| Run 상태 | `Succeeded`가 아니라 `Running`(validation 대기) |
+| stdout/stderr log | 저장됨 |
+| credential 흔적 | log·event·DB 전체에 없음 |
+| scope 위반 | 없음 |
+
+### 가짜 실행 파일 통합 테스트
+
+network와 account에 의존하지 않는 경로입니다. `tests/fake_claude.py`가 실제 CLI 계약(stdin prompt, JSON 출력, `--version`)만 흉내 냅니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| prompt가 stdin으로 전달 | 확인. argv에는 없음 |
+| argv에 사용자 텍스트 없음 | 확인 |
+| cwd = Run worktree | 확인 |
+| 파일 수정 | 확인 |
+| nonzero exit | `claude_cli_failed` |
+| timeout | `claude_timeout`, Run `Failed(timeout)` |
+| stdout/stderr 수집 | 확인 |
+| 변경 없음 | `claude_no_changes`. 성공으로 처리하지 않음 |
+| allowed scope 밖 변경 | `out_of_scope_path_changed` 탐지. 되돌리지 않음 |
+| forbidden path 변경 | `forbidden_path_changed` 탐지 |
+| 예상치 못한 commit | `unexpected_commit` 탐지 |
+| duplicate start | `execution_already_active`로 거부 |
+| main worktree 오염 | 없음 |
+| 다른 Run worktree 오염 | 없음 |
+| secret 저장 | log·event·DB 어디에도 raw 값 없음 |
+
+### 검증 중 발견해 고친 것
+
+**Windows에서 prompt 인코딩이 깨졌습니다.** 테스트용 가짜 CLI가 `sys.stdin.read()`로 읽으면 Windows 기본 인코딩(cp949)으로 디코딩해 UTF-8 한국어 prompt가 손상됐습니다. 실제 CLI는 UTF-8을 읽으므로 가짜도 UTF-8로 고정했습니다. Atlas 쪽은 처음부터 `text.encode("utf-8")`로 쓰고 있어 제품 코드 변경은 없었습니다.
+
+### 확인하지 못한 항목
+
+- POSIX에서의 Claude Code 실행. 이 검증은 Windows에서 수행했습니다. `.CMD` wrapper resolution은 Windows 고유 동작입니다.
+- 장시간 실행 Task에서의 안정성, 비용, usage 한도 도달 시 동작.
+- `claude_auth_unavailable` 실제 발생 경로. 로그인 상태에서만 검증해 인증 실패는 가짜 출력으로만 확인했습니다.
+- 여러 Run을 동시에 실제 CLI로 실행했을 때의 상호 간섭.
+- Claude가 `--tools` 제한을 우회해 commit하는 경로. 도구 목록에 shell이 없어 수단이 없다고 판단했으나, 파일 도구로 `.git` 내부를 조작하는 경우는 탐지만 하고 차단하지는 않습니다.
+- validation pipeline이 없어 "구현이 올바른가"는 확인하지 않았습니다. `changes_applied`는 "바뀌었다"는 뜻일 뿐입니다.
+
+### 2026-09-06 추가 — 설정 하드닝, 파싱 경로 분리, AwaitingValidation
+
+merge-blocking review 세 건을 고치고 다시 검증했습니다.
+
+#### 설정으로 안전 경계를 우회할 수 있던 문제
+
+`ATLAS_CLAUDE_PERMISSION_MODE`와 `ATLAS_CLAUDE_TOOLS` 값을 그대로 받고 있었습니다. `bypassPermissions`나 `Bash`를 넣으면 이 adapter의 핵심 경계가 무력화됩니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| `bypassPermissions`, `auto`, `dontAsk` | 거부 |
+| 이름에 `dangerous`가 들어가는 mode | 거부 |
+| 알 수 없는 mode(`plan`, `manual`, 빈 값) | 거부 |
+| safe mode(`acceptEdits`) | 허용 |
+| `Bash` 등 명령 실행 도구 12종 | 각각 거부 |
+| allowlist 밖 도구 이름 | 거부(fail closed) |
+| safe subset(`Read,Grep`) | 허용 |
+| 기본 설정 | 기존 값 그대로 유지 |
+| 검증 우회로 만든 설정 | preflight에서 거부 |
+| event의 유효 정책 | 정규화 값만. 실행 파일 경로 없음 |
+
+#### redaction이 JSON을 깨뜨리던 문제
+
+persisted log는 redaction을 거치는데, adapter가 **그 redacted log를 다시 읽어 파싱**하고 있었습니다. `Authorization` 헤더 pattern은 줄 끝까지 지우므로 한 줄 JSON이 잘립니다. 실제로 확인했습니다.
+
+```
+{"is_error": false, "result": "Changed Authorization: Bearer abc123def456 safely", "subtype": "success"}
+→ {"is_error": false, "result": "Changed Authorization: <redacted>
+→ json.JSONDecodeError: Unterminated string starting at: line 1 column 31
+```
+
+파싱 대상과 저장 대상을 분리했습니다. 원문은 상한 있는 임시 메모리 버퍼로만 흐르고, 저장본은 그대로 redaction을 거칩니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| redaction 후 JSON이 깨지는 사실 | 재현됨(회귀 테스트로 고정) |
+| result에 `Authorization: Bearer …` | 파싱 성공. 저장본에 token 없음 |
+| result에 GitHub token | 파싱 성공. 저장본·요약에 없음 |
+| result에 URL credential | 파싱 성공. 저장본에 없음 |
+| 주입한 known secret | log·event·DB 전체에 없음 |
+| malformed JSON | `claude_output_unparseable` |
+| 상한 초과 JSON | `claude_output_too_large`(fail closed) |
+| 임시 버퍼 | 한 번 읽으면 비워짐. `to_dict`에 내용 없음 |
+| 파싱 상한 | `max_output_bytes`와 별개로 설정 |
+
+core는 provider-neutral하게 유지했습니다. `StructuredCapture`는 "구조화된 출력을 잠깐 원문 그대로 보고 싶다"는 요구만 표현하고 Claude를 모릅니다.
+
+#### 정상 결과가 Orphaned가 되던 문제
+
+`changes_applied` 뒤 Run을 `Running`으로 남겼는데 executor heartbeat는 끝납니다. staleness reconciliation이 정상 구현 결과를 `Orphaned`로 만들 수 있었습니다. 문서로 덮을 문제가 아니라 상태 의미론 문제여서 `RunStatus.AWAITING_VALIDATION`을 추가했습니다.
+
+`is_active`(Run 슬롯 점유)와 `expects_heartbeat`(살아 있어야 하는가)를 분리했습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| `changes_applied` | `AwaitingValidation`으로 전이 |
+| terminal | 아님 |
+| active Run 슬롯 | 차지함. 같은 Task로 새 Run 시작 거부 |
+| heartbeat 기대 | 아님 |
+| stale threshold 초과 후 reconcile | `Orphaned`가 되지 않음 |
+| `orphan_if_stale` 직접 호출 | 회수 거부 |
+| active execution | 없음 |
+| workspace | 유지. branch도 그대로 |
+| 재전이 | idempotent |
+| 이후 terminal 전이 | 가능(다음 slice가 이어받음) |
+| 실패 경로 | 새 상태를 쓰지 않고 `Failed` |
+
+schema v5 → v6에서 active Run partial unique index를 다시 만듭니다. 기존 index는 `AwaitingValidation`을 몰라 슬롯을 지키지 못합니다.
+
+#### 회귀 테스트가 실제로 잡는지 확인
+
+세 수정을 각각 되돌리고 다시 돌렸습니다. **34건이 실패**했고 복원하니 전부 통과했습니다.
+
+#### 재실행한 검증
+
+- 전체 테스트 통과
+- `compileall` (src, tests) 통과
+- **real Claude Code smoke 재실행 통과** — `docs/smoke.md` 정확 생성, main 무오염, commit 없음, branch 유지, Run이 `AwaitingValidation`, active execution 없음, workspace 유지, credential 흔적 없음
+- secret scan, `git diff --check` 통과
+
+#### 확인하지 못한 항목
+
+POSIX 실측은 여전히 하지 않았습니다. 앞 절의 미확인 항목이 그대로 남습니다.

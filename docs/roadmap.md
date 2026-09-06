@@ -10,7 +10,7 @@
 
 현재 가능한 운영 흐름은 **GitHub Issue 생성 → 사람이 Issue를 Executor에게 전달 → Executor가 branch에서 작업·검증 → PR 생성 → 사람 review/merge**입니다.
 
-GitHub Issue polling, parse·schema validation, Task persistence, atomic claim과 lease는 구현됐습니다. webhook, Run record, self-hosted Claude Code invocation, Run validation automation, GitHub delivery automation은 아직 구현되지 않았습니다.
+GitHub Issue polling, parse·schema validation, Task persistence, atomic claim과 lease, Run lifecycle, Run별 branch·worktree 격리, executor process runtime, **실제 Claude Code invocation**까지 구현됐습니다. webhook, Run validation automation, git commit·push, GitHub delivery automation은 아직 구현되지 않았습니다.
 
 Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge** 흐름은 `Proven Manually`입니다. Atlas-to-Codex automated invocation은 `Feasibility Unverified`이며 adapter backlog로 이동하기 전에 별도 integration validation이 필요합니다.
 
@@ -70,8 +70,8 @@ Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge*
 ### Epic 4. Self-hosted Claude Code Integration
 
 - [ ] always-available server hosting과 dedicated service identity 결정
-- [ ] Claude Code Adapter와 invocation contract
-- [ ] per-Task Claude Code process, redacted stdout/stderr 수집
+- [x] Claude Code Adapter와 invocation contract
+- [x] per-Task Claude Code process, redacted stdout/stderr 수집
 - [ ] usage-exhausted, authentication, timeout failure mapping
 - [ ] mock executor vertical slice와 같은 isolation·validation·delivery contract 검증
 - [ ] Codex Cloud는 manual/secondary로 유지하고 자동 fallback은 제외
@@ -173,7 +173,7 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 - [ ] server hosting, stable supervisor, network egress, rate-limit budget 결정
 - [ ] 첫 Atlas Task Issue 세트 생성
 - [ ] mock executor 문서 Task PR 실험 수행
-- [ ] 별도 후속 PR에서 self-hosted Claude Code worker 문서 Task 실험 수행
+- [x] self-hosted Claude Code worker로 격리된 worktree 안 코드 수정 실험 수행
 
 ## Recommended Next Implementation Sprint
 
@@ -187,7 +187,7 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 8. 실제 provider adapter를 하나 연결하고 validation·draft PR을 구현합니다.
 6. Task별 새 process에서 mock executor를 호출합니다.
 7. 결과를 validate하고 draft PR을 생성합니다.
-8. self-hosted Claude Code invocation은 별도 후속 PR에서 추가합니다.
+8. ~~self-hosted Claude Code invocation은 별도 후속 PR에서 추가합니다.~~ (완료)
 
 이 Sprint는 한 Task와 한 PR을 순차 처리합니다. Agent Registry, usage-aware routing, dedicated mobile UI, automated Codex adapter는 후속 milestone입니다.
 

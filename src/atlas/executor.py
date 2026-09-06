@@ -121,6 +121,73 @@ class ExecutorError(Exception):
         self.message = message
 
 
+# structured output을 파싱하기 위한 임시 버퍼의 기본 상한입니다.
+# persisted log의 `max_output_bytes`와 별개입니다. 저장 한도와 파싱 한도는
+# 목적이 다릅니다.
+DEFAULT_STRUCTURED_CAPTURE_BYTES = 262_144
+
+
+@dataclass(eq=False)
+class StructuredCapture:
+    """provider의 structured output을 파싱하기 위한 **임시** 메모리 버퍼.
+
+    persisted log artifact는 redaction을 거쳐 저장됩니다. 그런데 redaction은
+    텍스트 치환이라 JSON 문법이 그대로 남는다는 보장이 없습니다. 예를 들어
+    `Authorization` 헤더 pattern은 줄 끝까지 지우므로, 한 줄 JSON의 문자열
+    값 안에 그 문구가 들어 있으면 닫는 따옴표와 뒤따르는 field까지 함께
+    사라집니다.
+
+    그래서 파싱 대상과 저장 대상을 분리합니다.
+
+    - 저장: 반드시 redaction을 거친 artifact
+    - 파싱: 이 버퍼. **디스크나 DB에 쓰지 않고** 읽는 즉시 버립니다.
+
+    provider-neutral합니다. 어떤 adapter든 "구조화된 출력을 잠깐 원문 그대로
+    보고 싶다"는 요구는 같습니다.
+    """
+
+    limit: int = DEFAULT_STRUCTURED_CAPTURE_BYTES
+    _chunks: list[bytes] = field(default_factory=list, repr=False)
+    _size: int = 0
+    overflowed: bool = False
+
+    def feed(self, chunk: bytes) -> None:
+        """상한을 넘으면 더 쌓지 않고 넘쳤다는 사실만 남깁니다.
+
+        넘친 뒤 앞부분만 파싱하면 잘린 JSON을 해석하게 됩니다. 그래서 실패로
+        다루도록 표시만 하고 내용을 버립니다(fail closed).
+        """
+
+        if self.overflowed:
+            return
+        self._size += len(chunk)
+        if self._size > self.limit:
+            self.overflowed = True
+            self._chunks.clear()
+            return
+        self._chunks.append(chunk)
+
+    def take(self) -> str:
+        """모아 둔 내용을 돌려주고 **즉시 비웁니다.**
+
+        오래 들고 있으면 raw secret이 메모리에 남습니다. 한 번만 읽습니다.
+        """
+
+        if self.overflowed:
+            self._chunks.clear()
+            self._size = 0
+            return ""
+        raw = b"".join(self._chunks)
+        self._chunks.clear()
+        self._size = 0
+        return raw.decode("utf-8", errors="replace")
+
+    def to_dict(self) -> dict[str, Any]:
+        """내용은 절대 담지 않습니다. 한도와 넘침 여부만 남깁니다."""
+
+        return {"limit": self.limit, "overflowed": self.overflowed}
+
+
 @dataclass(frozen=True)
 class ExecutorRequest:
     """한 번의 executor 실행 요청.
@@ -142,6 +209,13 @@ class ExecutorRequest:
     secret_values: tuple[str, ...] = ()
     max_output_bytes: int = 1_048_576
     grace_period_seconds: float = 5.0
+    # stdout 원문을 잠깐 담아 둘 임시 버퍼. `None`이면 수집하지 않습니다.
+    # 여기 담긴 내용은 디스크나 DB에 저장되지 않습니다.
+    structured_capture: StructuredCapture | None = None
+    # process stdin으로 흘려보낼 텍스트. argv에 넣으면 길이 제한과 shell
+    # metacharacter 해석에 노출되므로, 임의 길이의 사용자 유래 텍스트는
+    # 반드시 이 경로로 전달합니다. 비어 있으면 stdin은 닫힌 채 시작합니다.
+    stdin_data: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         from .redaction import redact_argv
@@ -154,6 +228,11 @@ class ExecutorRequest:
             "timeout_seconds": self.timeout_seconds,
             "environment_keys": sorted(self.environment),
             "max_output_bytes": self.max_output_bytes,
+            # 내용은 남기지 않습니다. prompt에는 Issue 본문이 들어갑니다.
+            "stdin_bytes": len(self.stdin_data.encode("utf-8")),
+            "structured_capture": (
+                self.structured_capture.to_dict() if self.structured_capture else None
+            ),
         }
 
 

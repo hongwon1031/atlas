@@ -8,6 +8,7 @@ from pathlib import Path
 
 from atlas.intake import IssueIntake, build_idempotency_key
 from atlas.parser import parse_issue_body
+from atlas.store import SCHEMA_VERSION
 from atlas.store import TaskStore, utcnow
 from atlas.validation import validate_intake
 from tests.fixtures import VALID_BODY, FakeIssueSource, body_replacing, make_issue
@@ -305,7 +306,7 @@ class SchemaMigrationTest(StoreTestCase):
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()
 
-        self.assertEqual(row["value"], "5")
+        self.assertEqual(row["value"], SCHEMA_VERSION)
 
     def test_v1_rows_without_approval_are_not_claimable(self):
         """승인 근거 없이 저장된 기존 Task는 migration 후 claim 대상이 아닙니다."""

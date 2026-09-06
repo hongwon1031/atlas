@@ -38,10 +38,21 @@ Project owner가 executor runtime 구현을 지시하면서 process 격리 범�
 - process identity는 PID와 process 시작 시각을 함께 저장하고 확인합니다. **identity가 일치하지 않거나 확인할 수 없으면 절대 종료하지 않습니다.**
 - stdout과 stderr는 크기 제한이 있는 Run별 log artifact로 수집합니다. raw 출력 전체를 event에 저장하지 않고 redaction을 적용합니다.
 
+### Accepted (2026-09-06, Claude Code 실행 정책)
+
+Project owner가 실제 Claude Code adapter 구현을 지시하면서 Claude Code에 한해 실행 정책을 승인했습니다.
+
+- Claude Code는 비대화형(`--print`)으로만 실행하고 TTY에 의존하지 않습니다.
+- prompt는 argv가 아니라 stdin으로 전달합니다. 사용자 유래 텍스트를 argv에 넣지 않습니다.
+- 도구를 파일 편집 집합으로 제한하고 shell 실행 도구를 주지 않습니다. 권한 우회 옵션을 쓰지 않습니다.
+- 세션을 디스크에 남기지 않습니다. Run 하나가 곧 대화 하나입니다.
+- provider 세부사항은 adapter 경계 안에만 둡니다. core contract는 provider-neutral로 유지합니다.
+- process 수명주기는 기존 executor runtime을 재사용합니다. provider별 process manager를 만들지 않습니다.
+
 ### 계속 Proposed
 
-- provider별 executor 정책(Claude Code, Codex의 호출 형식과 옵션).
-- credential injection과 회수 절차.
+- Codex의 호출 형식과 옵션.
+- credential injection과 회수 절차. 현재는 로그인된 CLI 세션을 쓰며 Atlas가 credential을 다루지 않습니다.
 - clone per Task를 선택할 기준.
 - cloud나 원격 host에서의 실행 정책.
 

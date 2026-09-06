@@ -16,6 +16,7 @@
     python -m atlas workspace-show --run-id <run-id>
     python -m atlas workspace-cleanup --run-id <run-id>
     python -m atlas executor-start --run-id <run-id> --mock-mode success
+    python -m atlas executor-start --run-id <run-id> --executor claude
     python -m atlas executor-show --run-id <run-id>
     python -m atlas executor-cancel --run-id <run-id>
 
@@ -33,7 +34,7 @@ from pathlib import Path
 from dataclasses import replace
 from typing import Any
 
-from .config import WorkerConfig
+from .config import EXECUTOR_KINDS, WorkerConfig
 from .intake import DEFAULT_REPOSITORY, IssueIntake
 from .issue_source import GitHubRestIssueSource, IssueSourceError
 from .polling import IssuePoller
@@ -220,6 +221,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     start.add_argument("--worker-id", default=None)
     start.add_argument("--timeout", type=_positive_float, default=None, help="초")
+    start.add_argument(
+        "--executor",
+        choices=sorted(EXECUTOR_KINDS),
+        default=None,
+        help="사용할 executor adapter. 지정하지 않으면 ATLAS_EXECUTOR를 따릅니다",
+    )
+    start.add_argument(
+        "--debug-prompt-file",
+        default=None,
+        help="개발 전용. Task contract 대신 이 파일의 prompt를 씁니다",
+    )
     start.add_argument(
         "--mock-mode",
         choices=MOCK_MODES,
@@ -594,11 +606,24 @@ def _execution_service(store: TaskStore, config: WorkerConfig) -> ExecutionServi
         )
     return ExecutionService(
         store,
-        LocalProcessExecutor(),
+        _adapter(config),
         _workspace_service(store, config),
         logs_root,
         config.run,
     )
+
+
+def _adapter(config: WorkerConfig):
+    """설정에 따라 executor adapter를 고릅니다.
+
+    provider 세부사항은 adapter 안에 있습니다. 여기서는 이름만 봅니다.
+    """
+
+    if config.executor.kind == "claude":
+        from .claude_code import ClaudeCodeConfig, ClaudeCodeExecutor
+
+        return ClaudeCodeExecutor(ClaudeCodeConfig.from_env())
+    return LocalProcessExecutor()
 
 
 def _mock_argv(args: argparse.Namespace) -> tuple[str, ...]:
@@ -615,6 +640,47 @@ def _mock_argv(args: argparse.Namespace) -> tuple[str, ...]:
 
 
 def _run_executor_start(args: argparse.Namespace, config: WorkerConfig) -> int:
+    if _option(args, "executor", None):
+        config = replace(config, executor=replace(config.executor, kind=args.executor))
+    if config.executor.kind == "claude":
+        return _run_claude_start(args, config)
+    return _run_mock_start(args, config)
+
+
+def _run_claude_start(args: argparse.Namespace, config: WorkerConfig) -> int:
+    """실제 Claude Code CLI로 Task를 구현합니다.
+
+    prompt는 저장된 Task contract에서 만듭니다. CLI 사용자가 자유 prompt로
+    Task 경계를 우회할 수 없습니다. `--debug-prompt-file`은 개발 전용입니다.
+    """
+
+    from .claude_code import ClaudeCodeConfig, ClaudeCodeExecutor
+    from .implementation import ImplementationRunner
+
+    worker_id = args.worker_id or _default_worker_id()
+    adapter = ClaudeCodeExecutor(ClaudeCodeConfig.from_env())
+    override = None
+    if debug_file := _option(args, "debug_prompt_file", None):
+        override = Path(debug_file).read_text(encoding="utf-8")
+
+    with TaskStore(config.database_path) as store:
+        service = _execution_service(store, config)
+        runner = ImplementationRunner(
+            store, service, adapter, config.workspace.git_timeout_seconds
+        )
+        report = runner.run(
+            args.run_id,
+            worker_id,
+            prompt_override=override,
+            timeout_seconds=config.executor.timeout_seconds,
+            grace_period_seconds=config.executor.grace_period_seconds,
+            max_output_bytes=config.executor.max_output_bytes,
+        )
+    _emit({"status": "ImplementationFinished", **report.to_dict()}, _option(args, "indent", 2))
+    return 0 if report.implemented else 1
+
+
+def _run_mock_start(args: argparse.Namespace, config: WorkerConfig) -> int:
     worker_id = args.worker_id or _default_worker_id()
     with TaskStore(config.database_path) as store:
         service = _execution_service(store, config)

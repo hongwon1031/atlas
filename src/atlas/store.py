@@ -33,7 +33,7 @@ from .schema import (
     WorkspaceStatus,
 )
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 _PRIORITY_RANK = {
     Priority.LOW: 0,
@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS runs (
 -- Task 하나에 active Run은 최대 하나입니다(execution-runtime.md의 Run Boundary).
 -- claim의 partial unique index와 같은 방식으로 database가 강제합니다.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active
-    ON runs(task_id) WHERE status IN ('Pending', 'Running');
+    ON runs(task_id) WHERE status IN ('Pending', 'Running', 'AwaitingValidation');
 CREATE INDEX IF NOT EXISTS idx_runs_claim ON runs(claim_id);
 
 CREATE TABLE IF NOT EXISTS executions (
@@ -335,6 +335,19 @@ class TaskStore:
         }
         if "run_id" not in event_columns:
             self._connection.execute("ALTER TABLE events ADD COLUMN run_id TEXT")
+        # schema v5의 active Run 인덱스는 AwaitingValidation을 모릅니다. 그대로
+        # 두면 구현을 마친 Run이 슬롯을 지키지 못해 같은 Task로 새 Run이
+        # 시작될 수 있습니다. 정의가 다르면 다시 만듭니다.
+        index_sql = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_runs_active'"
+        ).fetchone()
+        if index_sql and "AwaitingValidation" not in (index_sql["sql"] or ""):
+            self._connection.execute("DROP INDEX idx_runs_active")
+            self._connection.execute(
+                "CREATE UNIQUE INDEX idx_runs_active ON runs(task_id) "
+                "WHERE status IN ('Pending', 'Running', 'AwaitingValidation')"
+            )
+
         self._connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -877,6 +890,61 @@ class TaskStore:
                 connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             )
 
+    def await_validation(
+        self,
+        run_id: str,
+        *,
+        worker_id: str | None = None,
+        evidence: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> Run:
+        """구현을 마친 Run을 `AwaitingValidation`으로 전이합니다.
+
+        terminal이 아닙니다. executor process는 끝났지만 결과를 아무도
+        검증하지 않았습니다. heartbeat 대상에서 빠지므로 staleness 판정이
+        정상 결과를 `Orphaned`로 만들지 않습니다.
+
+        claim과 workspace는 유지합니다. 다음 validation slice가 같은 worktree
+        에서 이어서 작업합니다.
+        """
+
+        moment = now or utcnow()
+        stamp = to_iso(moment)
+
+        with self._write() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunError("run_not_found", f"{run_id}를 찾을 수 없습니다.")
+            current = RunStatus(row["status"])
+            if current is RunStatus.AWAITING_VALIDATION:
+                # 같은 결과를 다시 보고해도 안전합니다.
+                return self._run_from_row(row)
+            if current.is_terminal:
+                raise RunError(
+                    "run_terminal",
+                    f"{run_id}는 이미 {current.value} 상태입니다.",
+                )
+            if worker_id is not None and row["worker_id"] != worker_id:
+                raise RunError("worker_mismatch", f"{worker_id}는 {run_id}의 owner가 아닙니다.")
+
+            connection.execute(
+                "UPDATE runs SET status = ?, heartbeat_at = ? WHERE run_id = ?",
+                (RunStatus.AWAITING_VALIDATION.value, stamp, run_id),
+            )
+            self._record(
+                connection,
+                kind="run_awaiting_validation",
+                moment=stamp,
+                task_id=row["task_id"],
+                fingerprint=row["fingerprint"],
+                claim_id=row["claim_id"],
+                run_id=run_id,
+                detail=evidence or {},
+            )
+            return self._run_from_row(
+                connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            )
+
     def finish_run(
         self,
         run_id: str,
@@ -979,6 +1047,11 @@ class TaskStore:
             current = RunStatus(row["status"])
             if current.is_terminal:
                 # 다른 경로가 먼저 종료시켰습니다.
+                return None
+            if not current.expects_heartbeat:
+                # heartbeat를 기대하지 않는 상태입니다. 예를 들어
+                # AwaitingValidation은 executor가 이미 정상 종료했으므로
+                # heartbeat가 멈춘 것이 정상입니다. stale이 아닙니다.
                 return None
             if row["heartbeat_at"] != observed_heartbeat_at:
                 # 판정 이후 heartbeat가 갱신됐습니다. 살아 있는 Run입니다.

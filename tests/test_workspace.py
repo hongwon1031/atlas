@@ -16,6 +16,7 @@ from atlas.intake import build_idempotency_key
 from atlas.parser import parse_issue_body
 from atlas.reconciliation import RunReconciler
 from atlas.schema import RunFailure, RunStatus, WorkspaceStatus
+from atlas.store import SCHEMA_VERSION
 from atlas.store import RunError, TaskStore, WorkspaceConflict
 from atlas.validation import validate_intake
 from atlas.workspace import (
@@ -923,7 +924,7 @@ class SchemaMigrationTest(GitBackedTestCase):
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
         restored = migrated.run(run.run_id)
-        self.assertEqual(version, "5")
+        self.assertEqual(version, SCHEMA_VERSION)
         self.assertEqual(restored.workspace_status, WorkspaceStatus.NONE)
         self.assertIsNone(restored.branch)
         # Run 자체는 보존됩니다.

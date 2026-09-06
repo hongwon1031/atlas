@@ -22,9 +22,9 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 - Target MVP에서는 Atlas worker가 Issue를 검증·claim하고 always-available server의 self-hosted Claude Code worker가 primary automated executor로 실행됩니다.
 - Codex Cloud는 manual/secondary executor입니다. 다른 Adapter를 배제하지 않지만 primary automated path로 간주하지 않습니다.
 - Atlas Control Plane의 초기 구현 언어는 [ADR-011](docs/adr/0011-initial-implementation-language.md)에 따라 Python 3.11 이상입니다.
-- `src/atlas/`의 현재 구현은 Issue polling, Task 저장(SQLite), atomic claim과 lease, Run lifecycle과 heartbeat, restart reconciliation, Run별 branch·worktree 격리, mock executor process runtime까지입니다. 실제 Claude Code·Codex 호출, validation, PR delivery는 없습니다.
+- `src/atlas/`의 현재 구현은 Issue polling, Task 저장(SQLite), atomic claim과 lease, Run lifecycle과 heartbeat, restart reconciliation, Run별 branch·worktree 격리, executor process runtime, **실제 Claude Code CLI invocation**까지입니다. Codex 호출, validation pipeline, git commit·push, PR delivery는 없습니다.
 - polling-first ingestion은 [ADR-008](docs/adr/0008-initial-github-event-ingestion.md) Accepted이고 operational store는 [ADR-012](docs/adr/0012-operational-state-store.md) Accepted입니다. [ADR-010](docs/adr/0010-task-execution-isolation.md)은 branch/worktree 격리와 process 격리가 Accepted이고 provider별 정책과 credential injection은 계속 Proposed입니다. tmux PoC supervision(ADR-009)도 `Proposed`이며 승인된 구현 근거로 취급하지 않습니다.
-- webhook, comment/label command automation, 실제 Claude Code·Codex invocation, credential injection은 아직 구현되지 않았습니다. 현재 존재한다고 주장하거나 문서 Task에서 구현하지 않습니다.
+- webhook, comment/label command automation, Codex invocation, credential injection은 아직 구현되지 않았습니다. 현재 존재한다고 주장하거나 문서 Task에서 구현하지 않습니다. Claude Code는 로그인된 CLI 세션을 그대로 쓰며 Atlas가 credential을 다루지 않습니다.
 
 ## 우선순위와 기본 행동
 
@@ -67,8 +67,8 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 - Task가 문서·거버넌스 전용이면 application code, dependency, CI, infrastructure를 추가하지 않습니다.
 - Issue가 존재한다는 사실만으로 Task 후보가 되지 않습니다. `atlas:queued` label이 approval signal이며, GitHub가 label 추가를 triage 이상 권한자로 제한하는 것이 현재의 authorization gate입니다.
 - Target MVP의 worker가 구현되기 전에는 `/atlas` command나 `atlas:*` label이 작업을 자동 시작한다고 가정하지 않습니다.
-- `python -m atlas <issue-number>`는 단건 validation 결과만 출력하며 저장하지 않습니다. `poll`은 valid Task를 저장하고, `claim`은 lease를 잡고, `run-start`는 Run record를, `workspace-create`는 격리된 branch/worktree를 만듭니다. `executor-start`는 process를 실행하지만 현재는 mock executor뿐이며 실제 provider를 호출하지 않습니다.
-- usage detection, routing, automated validation, mobile notification이 구현됐다고 가정하지 않습니다. reconciliation은 heartbeat와 claim 상태만 보며 process identity를 확인하지 않습니다.
+- `python -m atlas <issue-number>`는 단건 validation 결과만 출력하며 저장하지 않습니다. `poll`은 valid Task를 저장하고, `claim`은 lease를 잡고, `run-start`는 Run record를, `workspace-create`는 격리된 branch/worktree를 만듭니다. `executor-start --executor claude`는 실제 Claude Code CLI로 worktree 안의 코드를 수정하고, `--mock-mode`는 개발·테스트용 mock executor를 씁니다.
+- usage detection, routing, automated validation, mobile notification이 구현됐다고 가정하지 않습니다. executor가 코드를 수정해도 그 결과가 올바른지는 아무도 검증하지 않았습니다.
 
 ## 브랜치와 커밋 규칙
 

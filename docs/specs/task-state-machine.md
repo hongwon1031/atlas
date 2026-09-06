@@ -131,6 +131,21 @@ stateDiagram-v2
 | `project_boundary` | 즉시 중단; 사람 검토 필수 |
 | `timeout` | side effect 정리 후 retryability 평가 |
 
+provider adapter는 자기 어휘를 위 category로 옮깁니다. provider category를 이 표에 직접 추가하지 않습니다. Claude Code adapter의 매핑은 [Execution Runtime](execution-runtime.md)의 Failure taxonomy 표에 있습니다.
+
+### 구현 결과와 Run status
+
+executor process가 성공했다고 Run이 곧바로 `Succeeded`가 되지는 않습니다. 구현이 적용된 Run은 `AwaitingValidation`으로 전이합니다.
+
+`AwaitingValidation`은 terminal이 아니고, Task의 active Run 슬롯을 차지하며, **heartbeat 대상이 아닙니다.** executor process가 이미 끝났으므로 heartbeat가 멈춘 것이 정상이고, 그것을 이유로 staleness reconciliation이 회수하면 정상 결과를 잃습니다. claim과 workspace는 유지되어 다음 validation slice가 같은 worktree에서 이어받습니다.
+
+```
+Running → AwaitingValidation   (구현 적용됨)
+Running → Failed               (변경 없음 / 범위 위반 / executor 실패)
+```
+
+자세한 판정은 [Execution Runtime](execution-runtime.md)의 "구현 결과 판정"을 따릅니다.
+
 ## Retry and Idempotency
 
 - 동일 실패에 대한 자동 retry는 기본 1회이며 Task별 policy가 더 엄격하면 그 값을 따릅니다.

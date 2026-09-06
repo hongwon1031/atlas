@@ -23,6 +23,7 @@ from typing import Any
 from .config import RunConfig
 from .executor import (
     FAILURE_TO_RUN_CATEGORY,
+    StructuredCapture,
     CancellationState,
     ExecutionStatus,
     ExecutorAdapter,
@@ -178,6 +179,8 @@ class ExecutionService:
         secret_values: tuple[str, ...] = (),
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         grace_period_seconds: float = DEFAULT_GRACE_PERIOD_SECONDS,
+        stdin_data: str = "",
+        structured_capture: StructuredCapture | None = None,
     ) -> tuple[str, ExecutorRequest, Any]:
         """safety gate를 통과하면 process를 띄우고 `Running`으로 확정합니다.
 
@@ -207,6 +210,8 @@ class ExecutionService:
             secret_values=tuple(secret_values),
             max_output_bytes=max_output_bytes,
             grace_period_seconds=grace_period_seconds,
+            stdin_data=stdin_data,
+            structured_capture=structured_capture,
         )
 
         try:

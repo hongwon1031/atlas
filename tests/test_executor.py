@@ -49,6 +49,7 @@ from atlas.redaction import (
     safe_split_index,
 )
 from atlas.schema import RunStatus
+from atlas.store import SCHEMA_VERSION
 from atlas.store import ExecutionConflict, RunError, TaskStore
 from atlas.validation import validate_intake
 from atlas.workspace import WorkspacePlanner
@@ -1201,7 +1202,7 @@ class SchemaMigrationTest(ExecutionServiceTestCase):
         version = migrated._connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()["value"]
-        self.assertEqual(version, "5")
+        self.assertEqual(version, SCHEMA_VERSION)
         # Run과 workspace는 보존됩니다.
         self.assertIsNotNone(migrated.run(self.run.run_id))
         self.assertEqual(migrated.run(self.run.run_id).task_id, "ATLAS-0042")
