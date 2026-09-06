@@ -2,9 +2,9 @@
 
 Atlas는 사람이 휴대전화에서 업무를 지시하면 여러 AI 개발 에이전트가 올바른 프로젝트 컨텍스트를 불러오고, 격리된 환경에서 작업하고, 검증 가능한 결과와 Pull Request를 생성하도록 조율하는 AI Workforce Operating System입니다.
 
-> **현재 작업 단계:** In Progress — architecture와 operations contract를 문서화했고 Issue intake, polling, persistence, atomic claim까지 구현했습니다. executor 실행 경로는 아직 구현하지 않았습니다.
+> **현재 작업 단계:** In Progress — Issue intake, polling, persistence, atomic claim, Run lifecycle, Run별 worktree 격리, executor process runtime을 구현했고 이제 **실제 Claude Code CLI가 격리된 worktree 안에서 코드를 수정**합니다. validation과 PR delivery는 아직 없습니다.
 >
-> 이 저장소는 제품 정의, 실행 계약, 기여 거버넌스와 함께 GitHub Issue를 polling해 Task 후보로 parse·검증하고 SQLite에 저장한 뒤 lease 기반으로 claim하는 worker 코드를 포함합니다. worktree 생성, Claude Code invocation, Run 실행, validation, PR delivery automation, webhook은 아직 구현하지 않았습니다.
+> 이 저장소는 제품 정의, 실행 계약, 기여 거버넌스와 함께 GitHub Issue를 polling해 Task로 검증·저장하고, lease로 claim한 뒤, Run별 격리된 branch·worktree에서 Claude Code를 실행해 코드를 수정하는 worker 코드를 포함합니다. validation pipeline, git commit, push, PR delivery automation, webhook은 아직 구현하지 않았습니다.
 
 ## 핵심 MVP
 
@@ -59,8 +59,9 @@ python -m atlas workspace-create --run-id <run-id>
 python -m atlas workspace-show --run-id <run-id>
 python -m atlas workspace-cleanup --run-id <run-id>
 
-# executor process (현재는 mock executor만)
-python -m atlas executor-start --run-id <run-id> --mock-mode success
+# executor process
+python -m atlas executor-start --run-id <run-id> --executor claude
+python -m atlas executor-start --run-id <run-id> --mock-mode success  # 개발·테스트용
 python -m atlas executor-show --run-id <run-id>
 python -m atlas executor-cancel --run-id <run-id>
 
@@ -89,6 +90,11 @@ python -m atlas reconcile
 | `ATLAS_GIT_TIMEOUT_SECONDS` | `30` | git 명령 timeout |
 | `ATLAS_LOGS_ROOT` | `<repo>/.atlas/logs` | Run별 executor log root |
 | `ATLAS_EXECUTOR_TIMEOUT_SECONDS` | `900` | executor process timeout |
+| `ATLAS_EXECUTOR` | `mock` | 사용할 executor adapter. `claude` 또는 `mock` |
+| `ATLAS_CLAUDE_EXECUTABLE` | (PATH 검색) | Claude Code 실행 파일 경로 |
+| `ATLAS_CLAUDE_MODEL` | (CLI 기본값) | Claude 모델 |
+| `ATLAS_CLAUDE_PERMISSION_MODE` | `acceptEdits` | Claude 권한 모드 |
+| `ATLAS_CLAUDE_TOOLS` | `Read,Edit,Write,Glob,Grep` | Claude에 허용할 도구 |
 | `ATLAS_EXECUTOR_GRACE_SECONDS` | `5` | graceful 종료 후 강제 종료까지 |
 | `ATLAS_EXECUTOR_MAX_OUTPUT_BYTES` | `1048576` | stdout/stderr 각각의 최대 저장 크기 |
 | `ATLAS_DISABLE_QUEUE_LABEL` | 미설정 | approval gate 해제. 신뢰된 repository에서만 사용 |
@@ -107,8 +113,9 @@ token은 저장소에 두지 않고 환경변수로만 주입합니다. database
 | Run lifecycle, heartbeat, reconciliation | Complete | Run record·heartbeat·restart recovery 구현; 별도 OS 프로세스 동시성 확인 |
 | Run별 branch·worktree 격리 | Complete | 전용 branch/worktree, 경계 검증, cleanup, workspace reconciliation 구현 |
 | Executor process runtime | Complete | provider-neutral adapter, mock executor, timeout·cancel, process identity, reconciliation 구현 |
-| 실제 Claude Code·Codex adapter | Not Implemented | mock executor만 있으며 provider 호출은 다음 slice |
-| self-hosted Claude Code automated path | Planned | primary automated executor로 결정됐지만 invocation 미구현 |
+| 실제 Claude Code adapter | Complete | `claude -p` 비대화형 실행, stdin prompt, 도구 제한, 변경 감지, no-op·policy 판정 |
+| Codex adapter | Not Implemented | manual/secondary 경로로 유지 |
+| self-hosted Claude Code automated path | Partial | 로컬에서 invocation까지 동작. always-available server 운영은 미구현 |
 | Atlas-to-Codex Cloud automation | Feasibility Unverified | adapter로 표시하기 전 integration validation 필요 |
 | Polling, claim, recovery, routing, validation delivery | Not Implemented | 문서 계약만 존재 |
 | API·Gemini·local-model adapters, dedicated mobile UI | Planned | vertical slice 이후 후보 |
@@ -157,7 +164,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 | Executor | 상태 | 현재 의미 |
 | --- | --- | --- |
 | Codex Cloud manual | Proven Manually | 사람이 직접 prompt를 전달하는 branch-to-PR workflow |
-| self-hosted Claude Code | Planned | always-available server의 primary automated executor; invocation 미구현 |
+| self-hosted Claude Code | Partial | primary automated executor. 로컬 CLI invocation 구현, server 운영 미구현 |
 | Atlas-to-Codex Cloud adapter | Feasibility Unverified | integration feasibility와 control boundary 검증 필요 |
 | Claude API, OpenAI API, Gemini | Not Implemented | future provider adapters |
 | local models | Not Implemented | future local adapters |
@@ -177,7 +184,11 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 ## Current Limitations
 
 - webhook ingestion이 없습니다. polling만 있으며 지연은 interval에 좌우됩니다.
-- executor는 mock만 있습니다. 실제 Claude Code나 Codex를 호출하지 않으며 provider credential도 주입하지 않습니다.
+- Claude Code는 **현재 로그인된 CLI 세션**을 씁니다. Atlas는 credential 값을 읽거나 저장하지 않고 API key를 argv에 넣지 않습니다.
+- Codex adapter는 없습니다.
+- **`changes_applied`는 "코드가 올바르다"는 뜻이 아닙니다.** worktree가 바뀌었다는 뜻일 뿐입니다. validation pipeline이 없어 구현 품질은 검증되지 않습니다.
+- 구현이 성공하면 Run은 `Succeeded`가 아니라 `Running`으로 남습니다. 아직 아무도 결과를 검증하지 않았기 때문입니다. heartbeat가 멈추므로 reconciliation이 결국 그 Run을 `Orphaned`로 표시합니다. validation slice가 이 전이를 담당할 때까지의 알려진 한계입니다.
+- allowed path 위반은 **탐지하고 기록만** 합니다. 자동으로 되돌리지 않습니다.
 - executor log는 redaction을 거쳐 저장되므로 원본과 byte 단위로 같지 않습니다. binary 출력은 UTF-8 대체 문자가 됩니다.
 - push, PR 생성, validation pipeline이 없습니다. executor가 worktree를 수정해도 그 결과를 전달하지 않습니다.
 - process identity 확인 방법이 플랫폼마다 다릅니다. 얻지 못하면 `unverifiable`로 남기고 그 process는 종료하지 않습니다.

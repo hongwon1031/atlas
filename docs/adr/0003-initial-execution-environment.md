@@ -41,6 +41,17 @@ Atlas는 개인 PC가 꺼져 있어도 GitHub Issue를 처리할 수 있어야 �
 - 장점: 완전한 lifecycle 제어가 가능합니다.
 - 단점: 이미 해결된 coding agent 기능을 재구현하며 MVP 범위를 크게 늘립니다.
 
+## Implementation Status (2026-09-06)
+
+이 결정의 primary automated path가 구현됐습니다. 결정 자체는 바뀌지 않았습니다.
+
+- Claude Code Executor Adapter를 구현했고 로컬 CLI를 비대화형으로 호출합니다.
+- Claude invocation 세부사항은 adapter 경계 안에만 있습니다. core contract는 provider-neutral로 유지됩니다.
+- Task별 branch, worktree, executor process, timeout, cancellation을 강제합니다.
+- `main` write와 merge 권한은 주지 않습니다. executor에 shell 도구를 주지 않아 commit·push 수단 자체가 없습니다.
+- always-available server 운영, hosting 위치, Codex adapter는 여전히 후속 결정입니다.
+- validation과 PR delivery는 아직 구현되지 않았습니다.
+
 ## Consequences
 
 - Atlas의 target MVP 실행 경로와 운영 책임이 명확해집니다.
@@ -66,7 +77,7 @@ Atlas는 개인 PC가 꺼져 있어도 GitHub Issue를 처리할 수 있어야 �
 - [ ] ADR-009 worker process supervision 제안 검토
 - [ ] ADR-010 Task execution isolation 제안 검토
 - [ ] always-available server의 hosting 위치와 운영 책임 정의
-- [ ] provider-neutral Executor Adapter interface 작성
-- [ ] Claude Code invocation, timeout, cancel, redaction contract 작성
-- [ ] repository allowlist, branch lock, isolated workspace 검증
+- [x] provider-neutral Executor Adapter interface 작성
+- [x] Claude Code invocation, timeout, cancel, redaction contract 작성
+- [x] repository allowlist, branch lock, isolated workspace 검증
 - [ ] 문서 전용 Issue → claim → Claude Code → validation → PR E2E PoC

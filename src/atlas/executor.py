@@ -142,6 +142,10 @@ class ExecutorRequest:
     secret_values: tuple[str, ...] = ()
     max_output_bytes: int = 1_048_576
     grace_period_seconds: float = 5.0
+    # process stdin으로 흘려보낼 텍스트. argv에 넣으면 길이 제한과 shell
+    # metacharacter 해석에 노출되므로, 임의 길이의 사용자 유래 텍스트는
+    # 반드시 이 경로로 전달합니다. 비어 있으면 stdin은 닫힌 채 시작합니다.
+    stdin_data: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         from .redaction import redact_argv
@@ -154,6 +158,8 @@ class ExecutorRequest:
             "timeout_seconds": self.timeout_seconds,
             "environment_keys": sorted(self.environment),
             "max_output_bytes": self.max_output_bytes,
+            # 내용은 남기지 않습니다. prompt에는 Issue 본문이 들어갑니다.
+            "stdin_bytes": len(self.stdin_data.encode("utf-8")),
         }
 
 

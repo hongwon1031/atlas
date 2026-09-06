@@ -20,6 +20,10 @@ DEFAULT_LOGS_DIRNAME = ".atlas/logs"
 # docs/specs/issue-command-contract.md의 queue 의도 label.
 QUEUE_LABEL = "atlas:queued"
 
+# 선택 가능한 executor adapter. provider 옵션은 여기 두지 않고 adapter
+# 경계(`claude_code.py`)에 둡니다.
+EXECUTOR_KINDS = frozenset({"mock", "claude"})
+
 
 def _require_positive(name: str, value: float) -> None:
     if value <= 0:
@@ -146,12 +150,20 @@ class ExecutorConfig:
     provider별 옵션은 여기 두지 않습니다. adapter 내부에 격리합니다.
     """
 
+    # 어떤 adapter를 쓸지. provider 옵션이 아니라 선택 이름입니다.
+    # `mock`은 개발·테스트용이고 `claude`는 실제 Claude Code CLI입니다.
+    kind: str = "mock"
     timeout_seconds: float = 900.0
     grace_period_seconds: float = 5.0
     # stdout/stderr 각각의 최대 저장 크기. 넘으면 잘라내고 truncated로 표시합니다.
     max_output_bytes: int = 1_048_576
 
     def __post_init__(self) -> None:
+        if self.kind not in EXECUTOR_KINDS:
+            raise ValueError(
+                f"알 수 없는 executor: {self.kind!r}. "
+                f"가능한 값: {', '.join(sorted(EXECUTOR_KINDS))}"
+            )
         _require_positive("timeout_seconds", self.timeout_seconds)
         _require_positive("grace_period_seconds", self.grace_period_seconds)
         _require_positive("max_output_bytes", self.max_output_bytes)
@@ -201,6 +213,8 @@ class WorkerConfig:
             workspace = replace(workspace, logs_root=logs_root)
 
         executor = config.executor
+        if kind := env.get("ATLAS_EXECUTOR", "").strip().lower():
+            executor = replace(executor, kind=kind)
         if timeout := _read_float(env, "ATLAS_EXECUTOR_TIMEOUT_SECONDS"):
             executor = replace(executor, timeout_seconds=timeout)
         if grace := _read_float(env, "ATLAS_EXECUTOR_GRACE_SECONDS"):

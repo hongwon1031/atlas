@@ -69,6 +69,9 @@ stable operation의 systemd 또는 Docker 설정은 별도 승인·구현 Task�
 - command allow/deny policy와 Task allowed/forbidden operations를 함께 적용합니다.
 - worktree/clone의 resolved path가 Project별 worker root 아래인지 확인하고 path traversal과 symlink escape를 거부합니다.
 - 한 Task마다 새 executor process를 시작하고 이전 conversation, shell, environment를 재사용하지 않습니다.
+- Claude Code executor는 `--no-session-persistence`로 실행해 Run 사이에 대화가 이어지지 않게 합니다.
+- Claude Code에 주는 도구를 `Read,Edit,Write,Glob,Grep`으로 제한합니다. shell을 주지 않으므로 executor가 임의 명령이나 git commit·push를 실행할 수단이 없습니다. 권한 모드는 `acceptEdits`까지만 열고 `bypassPermissions`와 `--dangerously-skip-permissions`는 쓰지 않습니다.
+- 사용자 유래 텍스트(Issue 본문 등)는 argv가 아니라 stdin으로 전달합니다. argv는 플랫폼에 따라 shell wrapper가 다시 파싱할 수 있습니다.
 - 여러 Task가 mutable worktree를 공유하거나 여러 Run이 같은 branch를 동시에 수정하지 않습니다.
 - timeout 또는 cancel 시 child process까지 종료하고 cleanup 결과를 audit event로 남깁니다.
 
@@ -83,6 +86,13 @@ stable operation의 systemd 또는 Docker 설정은 별도 승인·구현 Task�
 - 저장된 GitHub event와 validation artifact
 
 redaction 실패 또는 secret 탐지는 Run과 PR delivery를 중단하는 policy violation입니다.
+
+### Provider credential
+
+- Atlas는 provider credential의 raw value를 읽거나 저장하지 않습니다.
+- auth 파일 내용을 복사하지 않습니다.
+- API key를 argv에 넣지 않습니다.
+- Claude Code는 현재 로그인된 CLI 세션을 사용하며, 실행 환경은 기존 allowlist를 그대로 씁니다.
 
 ## Temporary Resource Cleanup
 

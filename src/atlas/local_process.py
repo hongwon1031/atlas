@@ -225,6 +225,25 @@ class _RedactingSink:
         self._sink.flush()
 
 
+def _write_stdin(stream, text: str) -> None:
+    """prompt를 stdin으로 흘려보내고 닫습니다.
+
+    child가 입력을 다 읽지 않고 끝날 수 있으므로 broken pipe를 정상 상황으로
+    다룹니다. 여기서 예외가 나면 실행 자체가 실패한 것처럼 보입니다.
+    """
+
+    try:
+        stream.write(text.encode("utf-8"))
+        stream.flush()
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+
 def _pump(stream, capture: _Capture) -> None:
     """pipe를 redaction하며 파일로 흘립니다.
 
@@ -297,7 +316,7 @@ class LocalProcessExecutor:
             "env": environment,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
-            "stdin": subprocess.DEVNULL,
+            "stdin": subprocess.PIPE if request.stdin_data else subprocess.DEVNULL,
             # shell을 쓰지 않습니다. argv list로만 실행합니다.
             "shell": False,
             "close_fds": True,
@@ -317,6 +336,13 @@ class LocalProcessExecutor:
 
         if sys.platform != "win32":
             group_id = process.pid
+
+        if request.stdin_data:
+            # child가 다 읽기 전에 write가 막힐 수 있으므로 별도 thread에서
+            # 흘려보내고 끝나면 닫습니다. 닫아야 child가 입력 끝을 압니다.
+            threading.Thread(
+                target=_write_stdin, args=(process.stdin, request.stdin_data), daemon=True
+            ).start()
 
         threads = [
             threading.Thread(target=_pump, args=(process.stdout, stdout_capture), daemon=True),

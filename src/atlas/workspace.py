@@ -394,6 +394,9 @@ class WorkspacePlanner:
             "branch_matches": False,
             "toplevel_matches": False,
             "repository_matches": False,
+            # executor가 보호 branch 위에서 실행되면 안 됩니다. 기록된 branch
+            # 이름과 실제 checkout 양쪽을 봅니다.
+            "branch_not_protected": branch not in PROTECTED_BRANCHES,
         }
 
         if checks["path_exists"]:
@@ -415,7 +418,11 @@ class WorkspacePlanner:
             runner = GitRunner(path, timeout_seconds=self._git.timeout_seconds)
             try:
                 checks["toplevel_matches"] = runner.toplevel().resolve() == resolved
-                checks["branch_matches"] = runner.current_branch() == branch
+                current = runner.current_branch()
+                checks["branch_matches"] = current == branch
+                checks["branch_not_protected"] = (
+                    checks["branch_not_protected"] and current not in PROTECTED_BRANCHES
+                )
                 checks["repository_matches"] = (
                     runner.common_dir().resolve() == self._git.common_dir().resolve()
                 )

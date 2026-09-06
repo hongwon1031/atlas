@@ -54,7 +54,110 @@
 | `Cancelled` | 사람 요청이나 정책으로 중단됨 | terminal |
 | `Orphaned` | heartbeat가 끊겨 상태를 증명할 수 없음. recovery review 대상 | terminal |
 
-Run 상태는 Task 상태와 다릅니다. Run이 `Succeeded`여도 Task는 사람 승인과 merge 전까지 `Completed`가 아닙니다. `Orphaned`는 "process 상태를 증명할 수 없으면 새 side effect를 허용하지 않고 recovery review로 기록한다"는 아래 Restart and Recovery 요구를 구현한 상태입니다.
+Run 상태는 Task 상태와 다릅니다. Run이 `Succeeded`여도 Task는 사람 승인과 merge 전까지 `Completed`가 아닙니다.
+
+이 표는 **provider adapter가 없는 generic 경로**입니다. Claude Code adapter는 아래 "구현 결과 판정"을 추가로 적용합니다.
+
+## Claude Code Adapter
+
+[ADR-003](../adr/0003-initial-execution-environment.md)의 primary automated executor입니다. provider 세부사항은 adapter 경계 안에만 둡니다. core contract는 Claude 옵션을 모릅니다.
+
+### 실행 방식
+
+| 항목 | 결정 | 근거 |
+| --- | --- | --- |
+| 비대화형 | `claude --print --output-format json` | TTY를 요구하지 않고 응답 후 종료합니다. |
+| prompt 전달 | **stdin** | argv에 넣으면 길이 제한과 shell metacharacter 해석에 노출됩니다. Windows에서 `claude`가 `.CMD` wrapper로 해석되면 cmd.exe가 argument를 다시 파싱합니다. Issue 본문은 사용자 입력이므로 argv에 넣지 않습니다. |
+| 권한 | `--permission-mode acceptEdits` | 파일 편집만 자동 승인합니다. `bypassPermissions`와 `--dangerously-skip-permissions`는 쓰지 않습니다. |
+| 도구 | `--tools Read,Edit,Write,Glob,Grep` | shell을 주지 않으므로 CLI가 git commit이나 push를 실행할 수단이 없습니다. |
+| 세션 | `--no-session-persistence` | Run 하나가 곧 대화 하나입니다. Run 사이에 대화가 이어지면 격리가 깨집니다. |
+| process 관리 | `LocalProcessExecutor` composition | timeout, cancel, process tree 종료, identity 확인, reconciliation 경로가 갈라지면 안 됩니다. Claude 전용 process manager를 만들지 않습니다. |
+
+### Executable resolution
+
+cwd에서 찾지 않습니다. 순서는 다음과 같습니다.
+
+1. `ATLAS_CLAUDE_EXECUTABLE`이 있으면 그 경로. 존재하지 않거나 일반 파일이 아니면 거부합니다.
+2. 없으면 `PATH`에서만 찾습니다.
+
+찾은 뒤 `claude --version`으로 probe합니다. **probe 자체에도 timeout이 있습니다.** 응답 없는 CLI가 worker를 잡아 두면 안 됩니다. 출력에 `Claude Code`가 없으면 다른 CLI로 보고 거부합니다.
+
+### Prompt
+
+Atlas가 저장된 Task에서 deterministic하게 만듭니다. **입력원은 DB의 current Task revision뿐입니다.** 자유 prompt로 Task 경계를 우회하는 경로를 만들지 않습니다. 개발용 override는 별도 flag로 분리합니다.
+
+Task 본문보다 앞에 실행 경계를 둡니다.
+
+- 격리된 worktree 안에서 실행 중이라는 사실
+- 현재 작업 디렉터리 밖 접근 금지
+- `main`/`master` 직접 수정 금지
+- commit, push, branch 전환, tag 생성 금지
+- Task 범위 밖 변경 금지
+- credential 출력 금지
+- 무엇을 왜 바꿨는지 보고
+
+각 항목에 길이 상한이 있습니다. Issue 본문은 길이 제한이 없으므로 잘라서 전달하고, 잘렸다는 사실을 prompt에 명시합니다.
+
+### 출력 해석
+
+`--output-format json`이 단일 JSON 객체를 줍니다. **`subtype`은 실패 신호가 아닙니다.** 실측에서 모델 오류에도 `subtype=success`가 나왔고 `is_error`가 실제 신호였습니다.
+
+응답 전체를 event에 저장하지 않습니다. log artifact에 남기고 event에는 분류와 짧은 요약만 둡니다. 요약도 redaction을 거칩니다.
+
+### 구현 결과 판정
+
+**"process가 exit 0으로 끝났다"와 "Task가 구현됐다"는 다릅니다.** 두 레벨을 분리합니다.
+
+| 레벨 | 판단 |
+| --- | --- |
+| executor process success | CLI가 정상 종료하고 `is_error`가 아님 |
+| task implementation result | worktree가 실제로 바뀌었고 허용 범위 안임 |
+
+실행 **전후로** worktree 상태를 찍어 비교합니다. 실행 후에만 보면 무엇이 이번 실행의 결과인지 구분할 수 없습니다.
+
+- before: HEAD, branch, `git status --porcelain`
+- after: 같은 항목
+- 차이: 변경 파일, HEAD 변경 여부, branch 변경 여부
+
+| 판정 | 조건 | Run 처리 |
+| --- | --- | --- |
+| `changes_applied` | 변경이 있고 위반 없음 | **Run을 종료하지 않습니다.** validation 대기 |
+| `no_changes` | exit 0인데 아무것도 바뀌지 않음 | `Failed` |
+| `policy_violation` | commit, branch 전환, `.git` 내부 수정, forbidden path, allowed scope 밖 변경 | `Failed(policy_violation)` |
+| `unknown` | process 실패 또는 git 상태를 읽지 못함 | provider category에 따름 |
+
+`changes_applied`를 `Succeeded`로 만들지 않는 이유는 **아직 아무도 결과를 검증하지 않았기 때문**입니다. validation pipeline이 없는 상태에서 exit 0을 성공으로 확정하면 "Claude가 끝났다 = 코드가 올바르다"가 됩니다.
+
+**알려진 한계**: Run이 `Running`으로 남으면 heartbeat가 멈추므로 reconciliation이 결국 그 Run을 `Orphaned`로 표시합니다. validation slice가 이 전이를 담당할 때까지의 한계입니다.
+
+allowed scope가 비어 있으면 범위 밖이라고 단정하지 않습니다. Task가 범위를 명시하지 않은 것이므로 없는 근거로 위반을 만들지 않습니다.
+
+**탐지만 하고 자동으로 되돌리지 않습니다.** 되돌리는 판단은 사람이나 이후 slice의 몫입니다.
+
+### Credential
+
+현재 로그인된 Claude Code CLI 세션을 씁니다. 이번 범위에서 credential injection을 새로 설계하지 않습니다.
+
+- Atlas는 credential raw value를 읽지 않습니다.
+- auth 파일 내용을 복사하지 않습니다.
+- API key를 argv에 넣지 않습니다.
+- 환경은 기존 allowlist를 그대로 씁니다. 실측 결과 Windows allowlist만으로 인증이 됐고 추가 변수가 필요하지 않았습니다.
+
+### Failure taxonomy
+
+provider category와 generic category를 분리합니다. provider별 어휘를 core taxonomy에 섞으면 다른 adapter가 쓸 수 없는 값이 생깁니다.
+
+| provider category | generic executor failure | Run failure category |
+| --- | --- | --- |
+| `claude_executable_missing` | `spawn_failed` | `transient_executor` |
+| `claude_version_probe_failed` | `spawn_failed` | `transient_executor` |
+| `claude_unsupported_cli` | `spawn_failed` | `transient_executor` |
+| `claude_auth_unavailable` | `unknown` | `authentication` |
+| `claude_cli_failed` | `nonzero_exit` | `transient_executor` |
+| `claude_timeout` | `timeout` | `timeout` |
+| `claude_no_changes` | `unknown` | `unknown` |
+| `claude_policy_violation` | `safety_gate` | `policy_violation` |
+| `claude_output_unparseable` | `unknown` | `unknown` | `Orphaned`는 "process 상태를 증명할 수 없으면 새 side effect를 허용하지 않고 recovery review로 기록한다"는 아래 Restart and Recovery 요구를 구현한 상태입니다.
 
 전이 규칙은 다음과 같습니다.
 
@@ -306,6 +409,19 @@ process spawn을 database transaction 안에서 잡지 않습니다.
 3. **final gate** — 예약 뒤 spawn 직전에 마지막으로 확인합니다. 실패하면 process를 만들지 않고 예약을 `Failed`로 정리해 ghost reservation을 남기지 않습니다.
 
 **subprocess spawn은 database transaction 밖에서 수행합니다.** transaction이 process 수명만큼 열려 있으면 다른 worker가 막힙니다.
+
+#### workspace 경계 재확인
+
+executor를 띄우기 전에 기록된 workspace가 여전히 쓸 수 있는 상태인지 확인합니다.
+
+- cwd가 DB에 기록된 worktree와 같은가
+- git toplevel이 그 worktree인가
+- 실제 checkout된 branch가 기록된 atlas branch인가
+- common git dir가 대상 repository인가
+- branch가 `main`/`master` 같은 보호 branch가 **아닌가**
+- worktree가 worker root 안에 있고 git에 등록돼 있는가
+
+하나라도 어긋나면 자동으로 복구하거나 다시 만들지 않고 거부합니다.
 
 ### Runtime 격리
 
