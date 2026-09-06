@@ -22,6 +22,9 @@
     python -m atlas validation-start --run-id <run-id>
     python -m atlas validation-show --run-id <run-id>
     python -m atlas validation-reconcile
+    python -m atlas publication-start --run-id <run-id>
+    python -m atlas publication-show --run-id <run-id>
+    python -m atlas publication-reconcile
 
 Exit code: 0 성공, 1 대상 없음 또는 lifecycle 위반, 2 source 오류.
 """
@@ -71,6 +74,9 @@ COMMANDS = (
     "validation-start",
     "validation-show",
     "validation-reconcile",
+    "publication-start",
+    "publication-show",
+    "publication-reconcile",
 )
 
 # mock executor 실행 모드. 개발과 테스트 전용이며 public UX가 아닙니다.
@@ -274,6 +280,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="validation process의 실제 상태를 판정합니다",
     )
 
+    publication_start = subparsers.add_parser(
+        "publication-start",
+        parents=[common, executor_common],
+        help="Succeeded Run을 commit·push하고 draft PR을 만듭니다",
+    )
+    publication_start.add_argument("--worker-id", default=None)
+    publication_start.add_argument(
+        "--remote", default=None, help="push할 remote 이름. 기본값은 ATLAS_GIT_REMOTE"
+    )
+    subparsers.add_parser(
+        "publication-show",
+        parents=[common, executor_common],
+        help="Run의 commit·branch·PR 연결을 봅니다",
+    )
+    publication_reconcile = subparsers.add_parser(
+        "publication-reconcile",
+        parents=[common, executor_common],
+        help="publication의 외부 상태를 확인하고 판정합니다",
+    )
+    publication_reconcile.add_argument(
+        "--skip-remote",
+        action="store_true",
+        help="network 없이 로컬 근거만 확인합니다",
+    )
+
     subparsers.add_parser(
         "executor-show",
         parents=[common, executor_common],
@@ -395,6 +426,12 @@ def main(argv: list[str] | None = None) -> int:
             return _run_validation_show(args, config)
         if args.command == "validation-reconcile":
             return _run_validation_reconcile(args, config)
+        if args.command == "publication-start":
+            return _run_publication_start(args, config)
+        if args.command == "publication-show":
+            return _run_publication_show(args, config)
+        if args.command == "publication-reconcile":
+            return _run_publication_reconcile(args, config)
     except IssueSourceError as error:
         _emit(
             {"status": "SourceError", "category": error.category, "message": error.message},
@@ -850,6 +887,85 @@ def _run_validation_reconcile(args: argparse.Namespace, config: WorkerConfig) ->
         findings = RunReconciler(store, config.run).reconcile_validations()
     _emit(
         {"status": "ValidationReconciled", "findings": findings},
+        _option(args, "indent", 2),
+    )
+    return 0
+
+
+def _publication_service(store: TaskStore, config: WorkerConfig, remote: str | None = None):
+    from .publication import PublicationConfig, PublicationService
+
+    publication_config = PublicationConfig.from_env()
+    if remote:
+        publication_config = replace(publication_config, remote=remote)
+    return PublicationService(
+        store,
+        _workspace_service(store, config),
+        publication_config,
+        config.run,
+    )
+
+
+def _run_publication_start(args: argparse.Namespace, config: WorkerConfig) -> int:
+    """Succeeded Run만 게시합니다. 다른 상태는 store가 거부합니다."""
+
+    from .publication import PublicationGateFailed
+    from .publication_models import PublicationError as PublicationSideEffectError
+
+    worker_id = args.worker_id or _default_worker_id()
+    with TaskStore(config.database_path) as store:
+        service = _publication_service(store, config, _option(args, "remote", None))
+        try:
+            report = service.publish(args.run_id, worker_id)
+        except PublicationGateFailed as error:
+            _emit(
+                {
+                    "status": "PublicationRejected",
+                    "run_id": args.run_id,
+                    "category": error.category,
+                    "detail": error.message,
+                    "failed_checks": list(error.failed_checks),
+                },
+                _option(args, "indent", 2),
+            )
+            return 1
+        except PublicationSideEffectError as error:
+            _emit(
+                {
+                    "status": "PublicationFailed",
+                    "run_id": args.run_id,
+                    "category": error.category,
+                    "detail": error.message,
+                    "recoverable": error.recoverable,
+                },
+                _option(args, "indent", 2),
+            )
+            return 1
+    _emit({"status": "Published", **report.to_dict()}, _option(args, "indent", 2))
+    return 0
+
+
+def _run_publication_show(args: argparse.Namespace, config: WorkerConfig) -> int:
+    with TaskStore(config.database_path) as store:
+        report = _publication_service(store, config).show(args.run_id)
+    _emit({"status": "Publications", **report}, _option(args, "indent", 2))
+    return 0
+
+
+def _run_publication_reconcile(args: argparse.Namespace, config: WorkerConfig) -> int:
+    from .github_pr import GitHubPullRequestClient
+    from .publication_reconciliation import PublicationReconciler
+
+    skip_remote = bool(_option(args, "skip_remote", False))
+    with TaskStore(config.database_path) as store:
+        reconciler = PublicationReconciler(
+            store,
+            pull_requests=None if skip_remote else GitHubPullRequestClient(),
+            check_remote=not skip_remote,
+        )
+        findings = reconciler.reconcile()
+    _emit(
+        {"status": "PublicationReconciled", "findings": findings},
         _option(args, "indent", 2),
     )
     return 0

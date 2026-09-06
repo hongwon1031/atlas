@@ -2,9 +2,9 @@
 
 Atlas는 사람이 휴대전화에서 업무를 지시하면 여러 AI 개발 에이전트가 올바른 프로젝트 컨텍스트를 불러오고, 격리된 환경에서 작업하고, 검증 가능한 결과와 Pull Request를 생성하도록 조율하는 AI Workforce Operating System입니다.
 
-> **현재 작업 단계:** In Progress — Issue intake부터 실제 Claude Code 구현까지 이어지고, 이제 **Atlas가 그 결과를 검증해 Run을 Succeeded/Failed로 확정**합니다. git commit, push, PR delivery는 아직 없습니다.
+> **현재 작업 단계:** In Progress — Issue에서 draft PR까지 MVP 핵심 경로가 이어집니다. Atlas가 Task를 검증·claim하고, 격리된 worktree에서 Claude Code로 구현하고, 결과를 검증한 뒤, **commit·push하고 draft PR을 만듭니다.** merge는 항상 사람이 합니다.
 >
-> 이 저장소는 제품 정의, 실행 계약, 기여 거버넌스와 함께 GitHub Issue를 polling해 Task로 검증·저장하고, lease로 claim한 뒤, Run별 격리된 branch·worktree에서 Claude Code를 실행해 코드를 수정하고, 그 결과를 deterministic validation으로 검증하는 worker 코드를 포함합니다. git commit, push, PR delivery automation, webhook은 아직 구현하지 않았습니다.
+> 이 저장소는 제품 정의, 실행 계약, 기여 거버넌스와 함께 GitHub Issue를 polling해 Task로 검증·저장하고, lease로 claim한 뒤, Run별 격리된 branch·worktree에서 Claude Code를 실행해 코드를 수정하고, 그 결과를 deterministic validation으로 검증한 다음, commit·push하고 draft Pull Request를 만드는 worker 코드를 포함합니다. auto merge, webhook, mobile notification은 구현하지 않았습니다.
 
 ## 핵심 MVP
 
@@ -70,6 +70,11 @@ python -m atlas validation-start --run-id <run-id>
 python -m atlas validation-show --run-id <run-id>
 python -m atlas validation-reconcile
 
+# publication
+python -m atlas publication-start --run-id <run-id>
+python -m atlas publication-show --run-id <run-id>
+python -m atlas publication-reconcile
+
 # worker 재시작 후 stale Run과 workspace 정리
 python -m atlas reconcile --dry-run   # 판정만
 python -m atlas reconcile
@@ -102,6 +107,9 @@ python -m atlas reconcile
 | `ATLAS_CLAUDE_TOOLS` | `Read,Edit,Write,Glob,Grep` | Claude에 허용할 도구. safe set의 subset만 허용하고 shell 계열은 거부됩니다 |
 | `ATLAS_VALIDATION_TRUST` | `untrusted` | validation이 repository 코드를 실행해도 되는지 |
 | `ATLAS_TRUSTED_REPOSITORIES` | (없음) | 신뢰하는 `owner/name` 목록 |
+| `ATLAS_GIT_REMOTE` | `origin` | push할 remote 이름 |
+| `ATLAS_COMMIT_AUTHOR_NAME` | `Atlas` | commit author |
+| `ATLAS_COMMIT_AUTHOR_EMAIL` | `atlas@users.noreply.github.com` | commit author email |
 | `ATLAS_EXECUTOR_GRACE_SECONDS` | `5` | graceful 종료 후 강제 종료까지 |
 | `ATLAS_EXECUTOR_MAX_OUTPUT_BYTES` | `1048576` | stdout/stderr 각각의 최대 저장 크기 |
 | `ATLAS_DISABLE_QUEUE_LABEL` | 미설정 | approval gate 해제. 신뢰된 repository에서만 사용 |
@@ -123,6 +131,8 @@ token은 저장소에 두지 않고 환경변수로만 주입합니다. database
 | 실제 Claude Code adapter | Complete | `claude -p` 비대화형 실행, stdin prompt, 도구 제한, 변경 감지, no-op·policy 판정 |
 | Codex adapter | Not Implemented | manual/secondary 경로로 유지 |
 | Validation pipeline | Complete | workspace/git policy, tests, compile, lint·typecheck를 repository 근거로 선택해 실행하고 Run을 확정 |
+| Git publication | Complete | 최종 무결성 재확인 후 deterministic commit, 정확한 refspec push, draft PR 생성, crash-window 복구 |
+| Auto merge | Not Implemented | Atlas는 merge하지 않습니다. 사람이 최종 gate입니다 |
 | self-hosted Claude Code automated path | Partial | 로컬에서 invocation까지 동작. always-available server 운영은 미구현 |
 | Atlas-to-Codex Cloud automation | Feasibility Unverified | adapter로 표시하기 전 integration validation 필요 |
 | Polling, claim, recovery, routing, validation delivery | Not Implemented | 문서 계약만 존재 |
@@ -202,7 +212,12 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 - lint와 typecheck는 repository contract가 있을 때만 required입니다. `pyproject.toml`의 `[tool.X]` table만 있는 경우는 약한 근거로 보고 도구가 없으면 건너뜁니다.
 - allowed path 위반은 **탐지하고 기록만** 합니다. 자동으로 되돌리지 않습니다.
 - executor log는 redaction을 거쳐 저장되므로 원본과 byte 단위로 같지 않습니다. binary 출력은 UTF-8 대체 문자가 됩니다.
-- git commit, push, PR 생성이 없습니다. 검증을 통과해도 결과를 GitHub로 전달하지 않습니다.
+- **Atlas는 merge하지 않습니다.** draft PR만 만들고 approve, ready-for-review 전환, merge를 하지 않습니다.
+- **force push를 하지 않습니다.** remote branch가 다른 commit을 가리키면 덮어쓰지 않고 recovery로 남깁니다.
+- `main`/`master` 같은 보호 branch에 push하지 않습니다.
+- PR 본문은 `Refs #N`만 씁니다. `Closes #N`을 쓰지 않습니다. PR merge가 곧 Task 종료인지 아직 정하지 않았습니다.
+- publication 실패가 Run을 `Succeeded`에서 되돌리지 않습니다. 구현과 검증의 성공은 사실로 남고 게시 실패는 별도로 기록합니다.
+- 실제 GitHub PR 생성은 network와 credential에 의존합니다. 이번 검증은 로컬 bare remote와 fake PR client로 수행했습니다.
 - process identity 확인 방법이 플랫폼마다 다릅니다. 얻지 못하면 `unverifiable`로 남기고 그 process는 종료하지 않습니다.
 - Windows에서는 parent가 먼저 종료하면 child를 tree로 추적할 수 없습니다. graceful 단계에서 parent를 즉시 죽이지 않는 방식으로 완화했지만 Job Object만큼 견고하지는 않습니다.
 - executor log는 자동 삭제하지 않습니다. retention 정책이 아직 없습니다.
@@ -268,6 +283,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 - [Pull Request Output Contract](docs/specs/pr-output-contract.md)
 - [Execution Runtime](docs/specs/execution-runtime.md)
 - [Validation Pipeline](docs/specs/validation-pipeline.md)
+- [Git Publication](docs/specs/publication.md)
 - [Agent Registry](docs/specs/agent-registry.md)
 - [Usage and Availability](docs/specs/usage-availability.md)
 - [GitHub Event Ingestion](docs/specs/github-event-ingestion.md)

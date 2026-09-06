@@ -120,6 +120,21 @@ Atlas가 지키는 것과 지키지 않는 것을 나눠 적습니다.
 | **실행된 코드의 filesystem 경계** | **아니오** |
 | **실행된 코드의 subprocess 제한** | **아니오** |
 
+### Git publication
+
+- Atlas는 **merge하지 않습니다.** draft PR만 만들고 approve, ready-for-review 전환, merge, squash, rebase를 하지 않습니다. 사람이 최종 gate입니다.
+- **force push를 하지 않습니다.** `--force`도 `--force-with-lease`도 `+refs/...` refspec도 쓰지 않습니다. remote가 다른 commit을 가리키면 덮어쓰지 않고 recovery로 남깁니다.
+- `main`/`master` 같은 보호 branch에 push하지 않습니다.
+- push refspec은 명시적입니다. 현재 branch나 기본 branch를 추측하지 않습니다.
+- **`origin`을 무조건 믿지 않습니다.** remote URL을 parse해 GitHub host와 정확한 `owner/repo`가 Task repository와 같은지 확인합니다. lookalike 경로와 다른 host를 거부합니다. 이 검증은 환경변수로 끌 수 없습니다.
+- `git add -A`를 쓰지 않습니다. 검증이 승인한 경로만 stage하고, stage 결과가 승인 집합과 다르면 중단합니다.
+- 전역 git config를 바꾸지 않습니다. commit identity는 해당 명령에만 지정합니다.
+- commit hook을 실행하지 않습니다. hook은 repository가 제어하는 임의 코드입니다.
+- commit message에는 식별자만 넣습니다. 사용자 텍스트를 git history에 영구히 남기지 않습니다.
+- PR 본문에 검증 로그 전문, 로컬 artifact 경로, provider 응답 전문을 넣지 않습니다.
+- **git/GitHub credential 값을 읽어 저장하지 않습니다.** argv, DB, log, event, 오류 메시지 어디에도 넣지 않습니다. 환경의 credential helper와 Authorization 헤더로만 씁니다.
+- 외부 side effect마다 durable checkpoint를 남기고, 모호한 외부 상태를 자동으로 덮어쓰지 않습니다.
+
 ### Provider credential
 
 - Atlas는 provider credential의 raw value를 읽거나 저장하지 않습니다.

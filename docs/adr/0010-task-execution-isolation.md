@@ -59,6 +59,17 @@ Project owner가 validation pipeline 구현을 지시하면서 검증 실행 경
 - dependency를 설치하지 않습니다.
 - 검증 process도 같은 process identity·timeout·cancellation·reconciliation 경로를 씁니다. 별도 process manager를 만들지 않습니다.
 
+### Accepted (2026-09-06, 게시 경계)
+
+Project owner가 git publication 구현을 지시하면서 게시 경계를 승인했습니다.
+
+- Atlas는 draft PR만 만들고 merge하지 않습니다. 사람이 최종 gate입니다.
+- force push를 하지 않습니다. remote 충돌은 덮어쓰지 않고 recovery로 남깁니다.
+- 보호 branch에 push하지 않습니다.
+- push refspec은 명시적이고 remote identity를 정확히 검증합니다.
+- 검증이 승인한 경로만 commit합니다.
+- 외부 side effect마다 durable checkpoint를 남기고 모호한 상태를 자동으로 덮어쓰지 않습니다.
+
 ### 계속 Proposed
 
 - Codex의 호출 형식과 옵션.

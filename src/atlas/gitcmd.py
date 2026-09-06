@@ -168,6 +168,107 @@ class GitRunner:
 
         return bool(self.run("status", "--porcelain").lines())
 
+    def status_entries(self) -> list[str]:
+        """`git status --porcelain=v1` 줄 목록. untracked 파일도 포함합니다."""
+
+        return self.run("status", "--porcelain=v1", "--untracked-files=all").lines()
+
+    def staged_paths(self) -> set[str]:
+        """staging area에 올라간 경로.
+
+        rename은 `R  old -> new`가 아니라 `--name-only`가 새 경로만 주므로,
+        원본 경로도 얻기 위해 status를 함께 봅니다.
+        """
+
+        paths = {
+            line.strip().replace("\\", "/")
+            for line in self.run("diff", "--cached", "--name-only").lines()
+            if line.strip()
+        }
+        for entry in self.status_entries():
+            if len(entry) < 4 or entry[0] == " " or entry[0] == "?":
+                continue
+            for part in entry[3:].split(" -> "):
+                cleaned = part.strip().strip('"').replace("\\", "/")
+                if cleaned:
+                    paths.add(cleaned)
+        return paths
+
+    def stage_paths(self, paths: tuple[str, ...] | list[str]) -> None:
+        """지정한 경로만 stage합니다.
+
+        `git add -A`를 쓰지 않습니다. 검증이 승인한 경로만 올려야 합니다.
+        `--`로 경로 인자를 구분해 `-`로 시작하는 이름이 옵션으로 해석되지
+        않게 합니다. `--` 이후는 pathspec이므로 임의 옵션이 들어갈 수 없습니다.
+        """
+
+        targets = [str(path) for path in paths if str(path).strip()]
+        if not targets:
+            return
+        # 삭제된 파일도 반영하려면 `--all` pathspec 모드가 필요합니다. 이것은
+        # `git add -A`와 다릅니다. 지정한 경로에만 적용됩니다.
+        self.run("add", "--all", "--", *targets)
+
+    def commit(
+        self,
+        message: str,
+        *,
+        author_name: str,
+        author_email: str,
+        allow_empty: bool = False,
+    ) -> str:
+        """staged 내용을 commit하고 새 HEAD를 돌려줍니다.
+
+        전역 git config를 바꾸지 않습니다. 이 명령에만 identity를 지정합니다.
+        """
+
+        args = [
+            "-c",
+            f"user.name={author_name}",
+            "-c",
+            f"user.email={author_email}",
+            # commit hook이 임의 코드를 실행할 수 있습니다. Atlas가 만드는
+            # commit에는 실행하지 않습니다.
+            "commit",
+            "--no-verify",
+            "--no-gpg-sign",
+            "-m",
+            message,
+        ]
+        if allow_empty:
+            args.append("--allow-empty")
+        self.run(*args)
+        return self.head_revision()
+
+    def remote_head(self, remote: str, branch: str) -> str | None:
+        """remote branch가 가리키는 commit. 없으면 `None`입니다."""
+
+        result = self.run("ls-remote", "--heads", remote, f"refs/heads/{branch}")
+        for line in result.lines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == f"refs/heads/{branch}":
+                return parts[0]
+        return None
+
+    def push_branch(self, remote: str, branch: str, expected_head: str) -> None:
+        """정확한 refspec으로 push합니다.
+
+        - 현재 branch나 기본 branch를 추측하지 않습니다.
+        - **force 계열 옵션을 쓰지 않습니다.** `--force`도 `--force-with-lease`도
+          쓰지 않습니다. 남의 commit을 덮어쓸 수단을 두지 않습니다.
+        - push할 commit이 지금 HEAD인지 먼저 확인합니다.
+        """
+
+        head = self.head_revision()
+        if head != expected_head:
+            raise GitError(
+                ["git", "push"],
+                1,
+                f"HEAD가 기대한 commit과 다릅니다: {head} != {expected_head}",
+                "head_mismatch",
+            )
+        self.run("push", "--no-verify", remote, f"{expected_head}:refs/heads/{branch}")
+
     def worktrees(self) -> list[dict[str, str]]:
         """`git worktree list --porcelain` 결과를 dict 목록으로 돌려줍니다."""
 

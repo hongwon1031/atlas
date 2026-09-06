@@ -80,4 +80,4 @@ Atlas는 개인 PC가 꺼져 있어도 GitHub Issue를 처리할 수 있어야 �
 - [x] provider-neutral Executor Adapter interface 작성
 - [x] Claude Code invocation, timeout, cancel, redaction contract 작성
 - [x] repository allowlist, branch lock, isolated workspace 검증
-- [ ] 문서 전용 Issue → claim → Claude Code → validation → PR E2E PoC
+- [x] 문서 전용 Issue → claim → Claude Code → validation → PR E2E PoC (draft PR까지. merge는 사람이 수행)
