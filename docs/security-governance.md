@@ -91,6 +91,14 @@ redaction 실패 또는 secret 탐지는 Run과 PR delivery를 중단하는 poli
 
 provider의 구조화된 출력을 해석해야 할 때는 **저장본이 아니라 별도의 임시 메모리 버퍼**를 씁니다. redaction은 텍스트 치환이므로 JSON 같은 구조를 깨뜨릴 수 있고, 깨진 구조를 되살리려고 저장본의 redaction을 약화해서는 안 됩니다. 임시 버퍼는 상한이 있고 디스크나 DB에 저장되지 않으며 한 번 읽히면 즉시 폐기됩니다.
 
+### Validation process
+
+- 검증 명령은 repository에서 발견한 근거로만 선택합니다. 사용자 입력이나 임의 텍스트가 명령에 들어가지 않습니다.
+- `shell=True`를 쓰지 않고 argv list로만 실행합니다. `package.json`의 script 본문을 직접 실행하지 않고 package manager에 맡깁니다.
+- **dependency를 설치하지 않습니다.** 도구가 없으면 없다고 보고합니다.
+- 검증 process에는 executor에 주었던 credential 환경을 넘기지 않습니다. OS 기본 allowlist만 씁니다.
+- 검증 출력도 기존 redaction boundary를 그대로 거칩니다. event에는 전체 출력을 저장하지 않고 요약만 남깁니다.
+
 ### Provider credential
 
 - Atlas는 provider credential의 raw value를 읽거나 저장하지 않습니다.

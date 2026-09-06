@@ -52,6 +52,8 @@
 | `Succeeded` | 실행이 성공적으로 끝남 | terminal |
 | `Failed` | 실행이 실패했고 분류된 사유가 기록됨 | terminal |
 | `Cancelled` | 사람 요청이나 정책으로 중단됨 | terminal |
+| `AwaitingValidation` | 구현이 끝났고 검증을 기다림. heartbeat 대상 아님 | `Validating`, terminal |
+| `Validating` | 검증 process가 돌고 있음. heartbeat 대상 | `Succeeded`, `Failed` |
 | `Orphaned` | heartbeat가 끊겨 상태를 증명할 수 없음. recovery review 대상 | terminal |
 
 Run 상태는 Task 상태와 다릅니다. Run이 `Succeeded`여도 Task는 사람 승인과 merge 전까지 `Completed`가 아닙니다.
@@ -187,7 +189,7 @@ Running → AwaitingValidation   (changes_applied)
 Running → Failed               (no_changes / policy_violation / executor 실패)
 ```
 
-다음 validation slice에서 `AwaitingValidation → Validating → Succeeded/Failed`로 확장합니다.
+`AwaitingValidation → Validating → Succeeded/Failed`는 [Validation Pipeline](validation-pipeline.md)에서 정의합니다.
 
 allowed scope가 비어 있으면 범위 밖이라고 단정하지 않습니다. Task가 범위를 명시하지 않은 것이므로 없는 근거로 위반을 만들지 않습니다.
 
