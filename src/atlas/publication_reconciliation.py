@@ -23,6 +23,7 @@ from typing import Any
 from .github_pr import PullRequestClient
 from .gitcmd import GitError, GitRunner
 from .publication_models import PublicationFailure, PublicationStatus
+from .worktree_changes import ContentDigest, safe_content_digest
 from .store import TaskStore, utcnow
 
 DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
@@ -100,9 +101,22 @@ class PublicationReconciler:
                 moment,
             )
 
+        # 예약 시점 remote와 지금 remote가 같은지 확인합니다. URL 자체는
+        # 근거에 넣지 않습니다. credential이 박혀 있을 수 있습니다.
+        current_url = git.remote_url(row["remote"] or "origin") or ""
+        expected_url = row["remote_url"] or ""
+        if expected_url and current_url != expected_url:
+            return self._record(
+                row,
+                "publication_remote_changed",
+                "예약 이후 remote URL이 바뀌었습니다.",
+                {**detail, "url_changed": True, "severity": "high"},
+                moment,
+            )
+
         # A. commit은 성공했는데 저장 전에 죽은 경우.
         if not recorded_commit:
-            adopted = self._adoptable_commit(git, run, local_head)
+            adopted = self._adoptable_commit(row, git, run, local_head)
             if adopted:
                 self._store.update_publication(
                     row["publication_id"],
@@ -112,6 +126,16 @@ class PublicationReconciler:
                 )
                 detail["adopted_commit"] = adopted
                 recorded_commit = adopted
+            elif local_head != (run.base_revision or ""):
+                # base보다 앞서 있는데 우리 것으로 증명하지 못했습니다.
+                # 사람이 만든 commit일 수 있으므로 덮어쓰지 않습니다.
+                return self._record(
+                    row,
+                    "publication_content_mismatch",
+                    "branch에 검증한 내용과 다른 commit이 있습니다.",
+                    {**detail, "severity": "high"},
+                    moment,
+                )
             else:
                 return self._record(
                     row,
@@ -181,24 +205,45 @@ class PublicationReconciler:
             )
         return self._reconcile_pull_request(row, detail, moment)
 
-    def _adoptable_commit(self, git: GitRunner, run, local_head: str) -> str | None:
-        """local HEAD를 Atlas가 만든 commit으로 볼 수 있는지 확인합니다.
+    def _adoptable_commit(self, row: Any, git: GitRunner, run, local_head: str) -> str | None:
+        """local HEAD를 이번 publication의 commit으로 볼 수 있는지 확인합니다.
 
-        base revision에서 정확히 한 걸음 전진했고 working tree가 깨끗하면
-        우리가 만든 commit으로 봅니다. 그 이상은 사람이 만졌을 수 있습니다.
+        **metadata만으로는 증명되지 않습니다.** base+1이고 깨끗하다는 사실은
+        사람이 만든 commit도 만족할 수 있습니다. 예약 시점에 저장한 내용
+        지문과 commit의 내용이 같은지 확인합니다.
+
+        지문이 없으면 채택하지 않습니다(fail closed). service의 판정과 같은
+        근거를 씁니다.
         """
 
         base = run.base_revision
-        if not base or local_head == base:
+        expected = self._recorded_digest(row)
+        if not base or local_head == base or expected is None:
             return None
         try:
-            distance = git.run("rev-list", "--count", f"{base}..{local_head}").text
-            dirty = git.is_dirty()
+            if git.run("rev-list", "--count", f"{base}..{local_head}").text != "1":
+                return None
+            if git.is_dirty():
+                return None
         except (GitError, OSError):
             return None
-        if distance != "1" or dirty:
+
+        actual = safe_content_digest(
+            git.cwd, base, local_head, timeout_seconds=self._git_timeout
+        )
+        if not expected.matches(actual):
             return None
         return local_head
+
+    @staticmethod
+    def _recorded_digest(row: Any) -> ContentDigest | None:
+        raw = row["content_digest"] if "content_digest" in row.keys() else None
+        if not raw:
+            return None
+        try:
+            return ContentDigest.from_dict(json.loads(raw))
+        except (ValueError, TypeError):
+            return None
 
     def _reconcile_pull_request(
         self, row: Any, detail: dict[str, Any], moment: datetime
@@ -261,16 +306,81 @@ class PublicationReconciler:
     # -- published ---------------------------------------------------------
 
     def _verify_published(self, row: Any, moment: datetime) -> dict[str, Any] | None:
-        """Published 기록에 외부 증거가 남아 있는지 확인합니다."""
+        """Published 기록에 외부 증거가 실제로 남아 있는지 확인합니다.
 
-        if not self._check_remote or self._pull_requests is None:
-            return None
+        DB만 보고 "게시됐다"고 믿지 않습니다. remote branch와 PR이 실제로
+        있는지 봅니다. 없으면 사람이 판단해야 합니다.
+
+        **자동으로 고치지 않습니다.** 닫히거나 merge된 PR도 정책이 정해지지
+        않았으므로 finding만 남깁니다.
+        """
+
         if not row["pr_number"]:
             return self._record(
                 row,
                 "publication_published_without_pr",
                 "Published인데 PR 번호가 없습니다.",
                 {"severity": "high"},
+                moment,
+            )
+        if not self._check_remote:
+            return None
+
+        # remote branch 증거
+        run = self._store.run(row["run_id"])
+        if run is not None and run.worktree_path:
+            git = GitRunner(run.worktree_path, timeout_seconds=self._git_timeout)
+            try:
+                remote_sha = git.remote_head(row["remote"] or "origin", row["branch"])
+            except (GitError, OSError):
+                remote_sha = None
+                return self._record(
+                    row,
+                    "publication_remote_unreachable",
+                    "Published 기록의 remote를 확인하지 못했습니다.",
+                    {},
+                    moment,
+                )
+            if remote_sha is None:
+                return self._record(
+                    row,
+                    "publication_remote_evidence_missing",
+                    "Published인데 remote branch가 없습니다.",
+                    {"severity": "high", "branch": row["branch"]},
+                    moment,
+                )
+            if row["pushed_sha"] and remote_sha != row["pushed_sha"]:
+                return self._record(
+                    row,
+                    "publication_remote_evidence_changed",
+                    "Published 이후 remote branch가 다른 commit을 가리킵니다.",
+                    {"severity": "high", "remote_sha": remote_sha},
+                    moment,
+                )
+
+        # PR 증거
+        if self._pull_requests is None:
+            return None
+        try:
+            found = self._pull_requests.find_open(
+                row["github_repository"], row["branch"], row["base_branch"]
+            )
+        except Exception as error:  # noqa: BLE001
+            return self._record(
+                row,
+                "publication_pr_unreachable",
+                f"Published 기록의 PR을 확인하지 못했습니다: {type(error).__name__}",
+                {},
+                moment,
+            )
+        numbers = [p.number for p in found]
+        if row["pr_number"] not in numbers:
+            # 닫혔거나 merge됐을 수 있습니다. 정책이 없으므로 기록만 합니다.
+            return self._record(
+                row,
+                "publication_pr_no_longer_open",
+                "Published 기록의 PR이 더 이상 열려 있지 않습니다. 자동으로 고치지 않습니다.",
+                {"pr_number": row["pr_number"], "open_numbers": numbers},
                 moment,
             )
         return None
@@ -309,6 +419,8 @@ class PublicationReconciler:
 # 자동으로 진행할 수 없는 판정. 사람이 외부 상태를 봐야 합니다.
 _RECOVERY_KINDS: dict[str, PublicationFailure] = {
     "publication_remote_conflict": PublicationFailure.REMOTE_CONFLICT,
+    "publication_content_mismatch": PublicationFailure.CONTENT_MISMATCH,
+    "publication_remote_changed": PublicationFailure.REMOTE_CHANGED,
     "publication_pr_conflict": PublicationFailure.PR_CONFLICT,
     "publication_local_drift": PublicationFailure.STATE_AMBIGUOUS,
     "publication_branch_mismatch": PublicationFailure.STATE_AMBIGUOUS,

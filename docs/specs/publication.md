@@ -53,6 +53,23 @@ Run 하나에 active publication은 최대 하나입니다. **database의 partia
 
 **예약 transaction 안에서 다시 확인합니다.** git과 GitHub side effect는 이 transaction 밖에서 수행합니다.
 
+### side effect 직전 authorization 재확인
+
+예약 guard를 통과한 뒤에도 승인 회수, claim 해제, owner 변경, lease 만료가 commit과 push와 PR 생성 사이에 일어날 수 있습니다.
+
+그래서 **외부 side effect를 만들기 직전마다** 다시 확인합니다.
+
+| 시점 | 확인 | 실패 시 |
+| --- | --- | --- |
+| push 직전 | 승인·claim·owner·lease·workspace·branch | push하지 않음. `publication_authorization_lost` |
+| PR 생성 직전 | 같은 항목 | PR을 만들지 않음. **이미 push한 branch는 되돌리지 않음** |
+
+시작 gate와 다른 검사 집합을 씁니다. 진행 중에는 Run이 이미 `Validating`이 아니고 publication도 이미 active이므로, 문맥에 의존하는 항목(`not_already_published`, `run_succeeded` 등)까지 보면 정상 경로가 막힙니다. **재사용 가능한 `authorization_checks`**로 분리했습니다.
+
+**이미 만든 side effect를 되돌리지 않습니다.** push된 branch를 force push나 삭제로 정리하려 들면 더 큰 문제를 만듭니다. checkpoint를 남기고 `publication_authorization_lost`로 실패시킵니다. 근거에 `side_effects_exist`를 남겨 사람이 무엇이 남아 있는지 알 수 있게 합니다.
+
+이미 있는 PR을 채택하는 경로도 authorization 없이 `Published`로 확정하지 않습니다.
+
 publication은 terminal Run(`Succeeded`)에서 돌기 때문에 execution·validation이 쓰는 `run_active` guard를 쓰지 않고 별도 guard를 씁니다. 승인과 claim은 여전히 살아 있어야 합니다. **승인이 회수된 Task의 결과를 GitHub에 올리면 안 됩니다.**
 
 ## 최종 무결성 재확인
@@ -71,16 +88,42 @@ commit 직전에 검증 이후 worktree가 그대로인지 확인합니다.
 
 지문은 [Validation Pipeline](validation-pipeline.md)의 것과 같습니다. 파일 이름 집합이 아니라 내용 기반입니다.
 
-### 재시도 경로
+### 재시도 경로와 내용 기반 채택
 
-앞선 시도가 이미 commit을 만들었을 수 있습니다. 그 경우 HEAD가 base보다 하나 앞서는 것이 정상입니다. 다음이 **모두** 맞을 때만 우리 commit으로 채택합니다.
+앞선 시도가 이미 commit을 만들었을 수 있습니다. 그 경우 HEAD가 base보다 하나 앞서는 것이 정상입니다.
+
+**metadata만으로는 우리 commit임을 증명할 수 없습니다.** 사람이 같은 branch에서 base+1 commit을 만들고 subject까지 `atlas: implement <task-id>`로 맞출 수 있습니다. 경로가 허용 범위 안이면 범위 검사도 통과합니다. 그렇게 만들어진 commit을 채택하면 검증하지 않은 내용을 게시하게 됩니다.
+
+그래서 채택은 **내용**에 근거합니다.
 
 1. base보다 정확히 하나 앞선다
 2. working tree가 깨끗하다
-3. subject가 이 Task의 결정적 commit subject와 같다
-4. branch가 기대한 atlas branch다
+3. branch가 기대한 atlas branch다
+4. subject가 이 Task의 결정적 commit subject와 같다
+5. **commit의 내용 지문이 무결성 확인 시점에 저장한 지문과 같다**
 
-채택하더라도 범위 검사는 건너뛰지 않습니다.
+5번이 실제 증명이고 1~4는 값싼 사전 거름입니다. 기록된 지문이 없으면 채택하지 않습니다(fail closed). 같은 Run의 이전 attempt가 남긴 지문은 유효한 근거로 인정합니다.
+
+내용이 다른 commit이 branch에 있으면 `publication_content_mismatch`이고 `RecoveryRequired`입니다. 덮어쓰지 않습니다.
+
+정상 경로에서도 **방금 만든 commit이 검증한 내용과 같은지 확인합니다.** stage 과정의 예상치 못한 변환이 있었다면 여기서 드러납니다.
+
+#### 내용 지문
+
+commit 전후로 같은 값이 나와야 하므로 `git diff HEAD` 기반 지문을 쓸 수 없습니다. commit하면 dirty 변경이 tree로 옮겨가 diff가 비기 때문입니다.
+
+base revision을 기준으로 잡고 각 경로의 **blob 해시**를 씁니다. `git hash-object`가 내는 값과 commit 안의 blob sha는 같으므로 commit 전후 비교가 성립합니다.
+
+canonical 표현입니다.
+
+- 정렬된 `<status>\x00<path>\x00<blob-sha>` 목록의 SHA-256
+- 수정·추가는 `M`, 삭제는 `D`
+- rename은 `--no-renames`로 삭제 + 추가로 펼칩니다. 표현이 안정적입니다
+- untracked 파일도 포함합니다
+
+담지 않는 것은 **raw source**입니다. digest와 개수만 저장합니다. 파일 mode도 담지 않습니다. Windows에서 실행 비트를 신뢰할 수 없기 때문이고, 이것은 알려진 한계입니다.
+
+`PublicationService`의 resume와 `PublicationReconciler`의 채택이 **같은 verifier**를 씁니다.
 
 ## Commit policy
 
@@ -144,6 +187,23 @@ git push --no-verify <remote> <commit>:refs/heads/<expected-branch>
 suffix 비교는 `https://github.com/evil/owner/repo.git` 같은 lookalike URL을 통과시키므로 쓰지 않습니다. 다른 host도 거부합니다.
 
 이 검증은 **주입 가능한 경계**입니다. 기본 구현은 엄격한 GitHub 검증이고 환경변수로 끌 수 없습니다. 다른 검증이 필요하면 호출자가 명시적으로 다른 구현을 넘겨야 합니다.
+
+### 검증과 사용 사이의 간격
+
+예약 시점에 한 번 검증하고 이후 remote **이름**으로만 push하면, 그 사이에 `git remote set-url`로 다른 repository를 가리키게 만들 수 있습니다. 이름은 그대로지만 대상이 바뀝니다.
+
+그래서 **push 직전에 URL을 다시 읽습니다.**
+
+1. 현재 remote URL을 읽습니다.
+2. 예약에 저장된 `remote_url`과 정확히 같은지 확인합니다.
+3. 같더라도 `GitHubRemoteIdentity`로 host와 `owner/repo`를 다시 검증합니다.
+4. 다르면 `publication_remote_changed`입니다. push하지 않습니다.
+
+그리고 **확인한 URL을 그대로 push 대상으로 씁니다.** 이름을 한 번 더 거치지 않으므로 확인과 사용 사이의 간격이 사라집니다. `ls-remote`도 같은 대상을 씁니다.
+
+URL에 credential이 박혀 있으면(`https://user:token@host/...`) argv에 넣을 수 없으므로 그때만 remote 이름을 씁니다. 그 경우에도 직전에 URL을 검증했습니다.
+
+reconciliation도 저장된 `remote_url`과 현재 URL이 다르면 `publication_remote_changed`로 남깁니다. 근거에 URL 자체를 넣지 않습니다. credential이 박혀 있을 수 있습니다.
 
 ## Credential
 
@@ -237,6 +297,21 @@ K. Published 확정
 | `publication_local_drift` | **RecoveryRequired** |
 | `publication_branch_mismatch` | **RecoveryRequired** |
 | `publication_published_without_pr` | **RecoveryRequired** |
+| `publication_content_mismatch` | **RecoveryRequired** |
+| `publication_remote_changed` | **RecoveryRequired** |
+
+### Published 기록의 외부 증거
+
+DB만 보고 "게시됐다"고 믿지 않습니다. remote branch와 PR이 실제로 있는지 확인합니다.
+
+| 판정 | 의미 |
+| --- | --- |
+| `publication_published_without_pr` | Published인데 PR 번호가 없음 |
+| `publication_remote_evidence_missing` | Published인데 remote branch가 없음 |
+| `publication_remote_evidence_changed` | Published 이후 remote branch가 다른 commit을 가리킴 |
+| `publication_pr_no_longer_open` | PR이 더 이상 열려 있지 않음 |
+
+**자동으로 고치지 않습니다.** 닫히거나 merge된 PR의 처리 정책이 정해지지 않았으므로 finding만 남깁니다.
 
 **reconciliation은 side effect를 만들지 않습니다.** 확인과 채택과 기록만 합니다. commit·push·PR 생성을 대신 수행하지 않습니다.
 
@@ -258,6 +333,9 @@ Run failure taxonomy와 **분리합니다.**
 | `publication_pr_conflict` | PR이 여러 개거나 조건 충돌 | **예** |
 | `publication_state_ambiguous` | 외부 상태를 확정할 수 없음 | **예** |
 | `publication_nothing_to_publish` | 게시할 변경 없음 | 아니오 |
+| `publication_remote_changed` | 예약 이후 remote가 다른 대상 | 아니오 |
+| `publication_authorization_lost` | 예약 이후 승인·claim 상실 | 아니오 |
+| `publication_content_mismatch` | commit 내용이 검증한 내용과 다름 | **예** |
 
 ## CLI
 

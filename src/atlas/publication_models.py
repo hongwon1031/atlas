@@ -81,6 +81,12 @@ class PublicationFailure(str, Enum):
     PR_CONFLICT = "publication_pr_conflict"
     STATE_AMBIGUOUS = "publication_state_ambiguous"
     NOTHING_TO_PUBLISH = "publication_nothing_to_publish"
+    # 예약 이후 remote가 다른 repository를 가리킵니다.
+    REMOTE_CHANGED = "publication_remote_changed"
+    # 예약 이후 승인이나 claim을 잃었습니다.
+    AUTHORIZATION_LOST = "publication_authorization_lost"
+    # commit 내용이 검증한 내용과 다릅니다.
+    CONTENT_MISMATCH = "publication_content_mismatch"
 
 
 @dataclass(frozen=True)
@@ -175,6 +181,8 @@ _RECOVERY_FAILURES = frozenset(
         PublicationFailure.REMOTE_CONFLICT,
         PublicationFailure.PR_CONFLICT,
         PublicationFailure.STATE_AMBIGUOUS,
+        # 내용이 다른 commit이 이미 branch에 있습니다. 사람이 봐야 합니다.
+        PublicationFailure.CONTENT_MISMATCH,
     }
 )
 

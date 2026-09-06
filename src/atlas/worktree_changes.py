@@ -365,6 +365,158 @@ def fingerprint(
     )
 
 
+@dataclass(frozen=True)
+class ContentDigest:
+    """base revision 대비 변경 **내용**의 지문.
+
+    `WorktreeFingerprint`와 목적이 다릅니다. 저쪽은 "지금 worktree가 그때와
+    같은가"를 보고, 이쪽은 **commit 전후로 같은 값이 나오도록** 설계했습니다.
+
+    commit하면 dirty 변경이 tree로 옮겨가므로 `git diff HEAD` 기반 지문은
+    비어 버립니다. 그래서 base revision을 기준으로 잡고, 각 경로의 **blob
+    해시**를 씁니다. `git hash-object`가 내는 값과 commit 안의 blob sha는
+    같으므로 commit 전후 비교가 성립합니다.
+
+    canonical 표현입니다.
+
+    - 정렬된 `<status>\x00<path>\x00<blob-sha>` 목록
+    - 수정·추가는 `M`, 삭제는 `D`
+    - rename은 `--no-renames`로 삭제 + 추가로 펼칩니다. 표현이 안정적입니다
+    - untracked 파일도 포함합니다
+
+    담지 않는 것입니다.
+
+    - raw source. digest와 개수만 남깁니다
+    - 파일 mode. Windows에서 실행 비트를 신뢰할 수 없어 제외했습니다
+    """
+
+    digest: str
+    entry_count: int = 0
+    base: str = ""
+    computed: bool = True
+    reason: str = ""
+
+    def matches(self, other: "ContentDigest | None") -> bool:
+        if other is None or not (self.computed and other.computed):
+            return False
+        return bool(self.digest) and self.digest == other.digest
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "digest": self.digest,
+            "entry_count": self.entry_count,
+            "base": self.base,
+            "computed": self.computed,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "ContentDigest | None":
+        if not isinstance(payload, dict) or not payload.get("digest"):
+            return None
+        return cls(
+            digest=str(payload["digest"]),
+            entry_count=int(payload.get("entry_count") or 0),
+            base=str(payload.get("base") or ""),
+            computed=bool(payload.get("computed", True)),
+            reason=str(payload.get("reason") or ""),
+        )
+
+
+def _digest_entries(
+    git: GitRunner, base: str, commit_ref: str | None
+) -> list[tuple[str, str, str]]:
+    """`(status, path, blob-sha)` 목록을 만듭니다.
+
+    `commit_ref`가 있으면 그 commit을, 없으면 working tree를 봅니다. 두 경로가
+    같은 내용에 대해 같은 값을 내야 합니다.
+    """
+
+    entries: list[tuple[str, str, str]] = []
+
+    if commit_ref:
+        raw = git.run("diff", "--name-status", "--no-renames", base, commit_ref).lines()
+        for line in raw:
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            status, path = parts[0].strip(), parts[-1].strip()
+            if status.startswith("D"):
+                entries.append(("D", path, ""))
+            else:
+                entries.append(("M", path, git.run("rev-parse", f"{commit_ref}:{path}").text))
+        return sorted(set(entries))
+
+    # working tree를 봅니다. tracked 변경과 untracked 파일을 모두 모읍니다.
+    for line in git.run("diff", "--name-status", "--no-renames", base).lines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        status, path = parts[0].strip(), parts[-1].strip()
+        if status.startswith("D"):
+            entries.append(("D", path, ""))
+        else:
+            entries.append(("M", path, git.run("hash-object", "--", path).text))
+
+    for line in git.run("ls-files", "--others", "--exclude-standard").lines():
+        path = line.strip().strip('"')
+        if path:
+            entries.append(("M", path, git.run("hash-object", "--", path).text))
+
+    return sorted(set(entries))
+
+
+def content_digest(
+    worktree: Path | str,
+    base: str,
+    commit_ref: str | None = None,
+    timeout_seconds: float = 30.0,
+) -> ContentDigest:
+    """base 대비 변경 내용의 지문을 계산합니다.
+
+    `commit_ref`를 주면 그 commit의 내용을, 주지 않으면 working tree의 내용을
+    봅니다. 같은 내용이면 두 경우가 같은 digest를 냅니다.
+    """
+
+    git = GitRunner(worktree, timeout_seconds=timeout_seconds)
+    if not base:
+        return ContentDigest("", computed=False, reason="missing_base")
+    try:
+        entries = _digest_entries(git, base, commit_ref)
+    except (GitError, OSError) as error:
+        return ContentDigest(
+            "", computed=False, base=base, reason=f"git_unreadable:{type(error).__name__}"
+        )
+
+    digest = hashlib.sha256()
+    for status, path, sha in entries:
+        digest.update(status.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(sha.encode("utf-8"))
+        digest.update(b"\x01")
+    return ContentDigest(
+        digest=digest.hexdigest(), entry_count=len(entries), base=base
+    )
+
+
+def safe_content_digest(
+    worktree: Path | str,
+    base: str,
+    commit_ref: str | None = None,
+    timeout_seconds: float = 30.0,
+) -> ContentDigest:
+    """계산하지 못해도 예외를 던지지 않습니다. 실패는 `computed=False`입니다."""
+
+    try:
+        return content_digest(worktree, base, commit_ref, timeout_seconds)
+    except (GitError, OSError) as error:
+        return ContentDigest(
+            "", computed=False, base=base, reason=f"unexpected:{type(error).__name__}"
+        )
+
+
 def safe_fingerprint(
     worktree: Path | str, timeout_seconds: float = 30.0
 ) -> WorktreeFingerprint:

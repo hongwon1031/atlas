@@ -35,7 +35,7 @@ from .schema import (
     WorkspaceStatus,
 )
 
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "9"
 
 _PRIORITY_RANK = {
     Priority.LOW: 0,
@@ -259,6 +259,9 @@ CREATE TABLE IF NOT EXISTS publications (
     remote_url        TEXT,
     commit_sha        TEXT,
     committed_at      TEXT,
+    -- 검증한 변경 내용의 지문. commit 채택이 metadata가 아니라 내용에
+    -- 근거하도록 예약 직후 저장합니다.
+    content_digest    TEXT,
     pushed_at         TEXT,
     pushed_sha        TEXT,
     pr_number         INTEGER,
@@ -468,6 +471,15 @@ class TaskStore:
         }
         if "run_id" not in event_columns:
             self._connection.execute("ALTER TABLE events ADD COLUMN run_id TEXT")
+        # schema v8의 publications에는 content_digest가 없습니다.
+        publication_columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(publications)")
+        }
+        if publication_columns and "content_digest" not in publication_columns:
+            self._connection.execute(
+                "ALTER TABLE publications ADD COLUMN content_digest TEXT"
+            )
+
         # schema v5의 active Run 인덱스는 AwaitingValidation을 모릅니다. 그대로
         # 두면 구현을 마친 Run이 슬롯을 지키지 못해 같은 Task로 새 Run이
         # 시작될 수 있습니다. 정의가 다르면 다시 만듭니다.
@@ -2336,6 +2348,7 @@ class TaskStore:
         status: "PublicationStatus | None" = None,
         commit_sha: str | None = None,
         committed_at: str | None = None,
+        content_digest: dict[str, Any] | None = None,
         pushed_sha: str | None = None,
         pushed_at: str | None = None,
         pull_request: dict[str, Any] | None = None,
@@ -2367,6 +2380,8 @@ class TaskStore:
         if commit_sha is not None:
             add("commit_sha", commit_sha)
             add("committed_at", committed_at or stamp)
+        if content_digest is not None:
+            add("content_digest", json.dumps(content_digest, ensure_ascii=False))
         if pushed_sha is not None:
             add("pushed_sha", pushed_sha)
             add("pushed_at", pushed_at or stamp)

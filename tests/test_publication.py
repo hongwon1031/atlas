@@ -45,6 +45,7 @@ from atlas.validation import validate_intake
 from atlas.validation_models import ValidationStatus
 from atlas.workspace import PROTECTED_BRANCHES, WorkspacePlanner
 from atlas.workspace_service import WorkspaceService
+from atlas.worktree_changes import content_digest
 from tests.fixtures import make_issue
 
 GIT_AVAILABLE = shutil.which("git") is not None
@@ -527,6 +528,13 @@ class PublicationTestCase(unittest.TestCase):
     def remote_head(self, branch=None, run=None):
         return GitRunner(self.repo).remote_head("bare", branch or (run or self.run).branch)
 
+    def bare_head(self, branch=None, run=None):
+        """remote 이름이 바뀐 뒤에도 bare repository를 직접 확인합니다."""
+
+        return GitRunner(self.repo).remote_head(
+            str(self.bare), branch or (run or self.run).branch
+        )
+
 
 class HappyPathTest(PublicationTestCase):
     def test_succeeded_run_is_published(self):
@@ -797,11 +805,14 @@ class IdempotencyTest(PublicationTestCase):
 
         self.assertEqual(caught.exception.category, "publication_already_active")
 
-    def test_push_is_skipped_when_remote_already_matches(self):
+    def test_retry_after_failure_adopts_everything(self):
+        """앞선 attempt가 남긴 지문을 근거로 재시도가 채택합니다."""
+
         report = self.publish()
-        # publication 기록을 지워 다시 시도할 수 있게 만듭니다.
+        # 첫 attempt를 실패로 되돌려 재시도 가능한 상태로 만듭니다. 내용
+        # 지문은 그대로 남습니다.
         self.store._connection.execute(
-            "DELETE FROM publications WHERE run_id = ?", (self.run.run_id,)
+            "UPDATE publications SET status = 'Failed' WHERE run_id = ?", (self.run.run_id,)
         )
         self.store._connection.commit()
 
@@ -812,6 +823,22 @@ class IdempotencyTest(PublicationTestCase):
         self.assertIn("remote_branch", again.adopted)
         self.assertIn("pull_request", again.adopted)
         self.assertEqual(len(self.pull_requests.created), 1)
+
+    def test_retry_without_any_recorded_digest_is_refused(self):
+        """증명할 근거가 없으면 채택하지 않습니다."""
+
+        self.publish()
+        self.store._connection.execute(
+            "UPDATE publications SET status = 'Failed', content_digest = NULL "
+            "WHERE run_id = ?",
+            (self.run.run_id,),
+        )
+        self.store._connection.commit()
+
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+
+        self.assertIs(caught.exception.failure, PublicationFailure.WORKSPACE_DRIFT)
 
     def test_existing_open_pr_is_adopted(self):
         self.pull_requests.existing.append(
@@ -945,8 +972,14 @@ class CrashWindowTest(PublicationTestCase):
         kwargs.setdefault("pull_requests", self.pull_requests)
         return PublicationReconciler(self.store, **kwargs)
 
-    def start_publication(self):
-        return self.store.start_publication(
+    def start_publication(self, with_digest=True):
+        """실제 중단 상황을 흉내 냅니다.
+
+        무결성 확인까지 마친 뒤 중단됐다면 내용 지문이 저장돼 있습니다.
+        `with_digest=False`는 지문이 없을 때 채택하지 않는지 보기 위한 것입니다.
+        """
+
+        publication_id = self.store.start_publication(
             self.run.run_id,
             worker_id=WORKER,
             github_repository=REPOSITORY,
@@ -955,6 +988,10 @@ class CrashWindowTest(PublicationTestCase):
             remote="bare",
             remote_url=str(self.bare),
         )
+        if with_digest:
+            digest = content_digest(self.run.worktree_path, self.run.base_revision)
+            self.store.update_publication(publication_id, content_digest=digest.to_dict())
+        return publication_id
 
     def make_commit(self):
         worktree = Path(self.run.worktree_path)
@@ -1068,6 +1105,462 @@ class CrashWindowTest(PublicationTestCase):
 
         self.assertEqual(len(self.pull_requests.created), 0)
         self.assertIsNone(self.remote_head())
+
+
+class ContentBoundAdoptionTest(PublicationTestCase):
+    """commit 채택은 metadata가 아니라 내용에 근거해야 합니다."""
+
+    def reconciler(self, **kwargs):
+        kwargs.setdefault("pull_requests", self.pull_requests)
+        return PublicationReconciler(self.store, **kwargs)
+
+    def start_with_digest(self):
+        publication_id = self.store.start_publication(
+            self.run.run_id,
+            worker_id=WORKER,
+            github_repository=REPOSITORY,
+            branch=self.run.branch,
+            base_branch="main",
+            remote="bare",
+            remote_url=str(self.bare),
+        )
+        digest = content_digest(self.run.worktree_path, self.run.base_revision)
+        self.store.update_publication(publication_id, content_digest=digest.to_dict())
+        return publication_id
+
+    def human_commit(self, text, subject=None):
+        """사람이 같은 branch에서 base+1 commit을 만듭니다."""
+
+        worktree = Path(self.run.worktree_path)
+        write(worktree / "docs" / "note.md", text)
+        git("add", "-A", cwd=worktree)
+        git(
+            "-c", "user.email=h@e.com", "-c", "user.name=H",
+            "commit", "-m", subject or commit_subject(self.run.task_id), cwd=worktree,
+        )
+        return GitRunner(worktree).head_revision()
+
+    def atlas_commit(self):
+        """Atlas가 만들었을 commit과 정확히 같은 내용으로 commit합니다."""
+
+        worktree = Path(self.run.worktree_path)
+        wt = GitRunner(worktree)
+        wt.stage_paths(("docs/note.md",))
+        return wt.commit(
+            commit_message(self.run.task_id, self.run.run_id),
+            author_name="Atlas",
+            author_email="atlas@users.noreply.github.com",
+        )
+
+    def test_human_commit_with_matching_subject_is_rejected(self):
+        """subject를 똑같이 맞춰도 내용이 다르면 채택하지 않습니다."""
+
+        publication_id = self.start_with_digest()
+        head = self.human_commit("사람이 쓴 다른 내용\n")
+        self.store._connection.execute(
+            "UPDATE publications SET status = 'Failed' WHERE publication_id = ?",
+            (publication_id,),
+        )
+        self.store._connection.commit()
+
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+
+        self.assertIs(caught.exception.failure, PublicationFailure.CONTENT_MISMATCH)
+        self.assertIsNone(self.remote_head())
+        self.assertEqual(len(self.pull_requests.created), 0)
+
+    def test_human_commit_in_allowed_paths_is_still_rejected(self):
+        """경로가 허용 범위 안이어도 내용이 다르면 채택하지 않습니다."""
+
+        publication_id = self.start_with_digest()
+        self.human_commit("허용 경로지만 다른 내용\n")
+
+        findings = self.reconciler(check_remote=False).reconcile()
+
+        self.assertTrue(
+            any(f["kind"] == "publication_content_mismatch" for f in findings), findings
+        )
+        row = self.store.publication(publication_id)
+        self.assertIsNone(row["commit_sha"])
+        self.assertEqual(row["status"], PublicationStatus.RECOVERY_REQUIRED.value)
+
+    def test_exact_atlas_commit_is_adopted(self):
+        publication_id = self.start_with_digest()
+        head = self.atlas_commit()
+
+        findings = self.reconciler(check_remote=False).reconcile()
+
+        row = self.store.publication(publication_id)
+        self.assertEqual(row["commit_sha"], head)
+        self.assertTrue(any(f["kind"] == "publication_local_only_check" for f in findings))
+
+    def test_rename_delete_untracked_content_is_comparable(self):
+        """rename·삭제·untracked가 섞여도 commit 전후 지문이 같아야 합니다."""
+
+        worktree = Path(self.run.worktree_path)
+        write(worktree / "docs" / "renamed.md", "옮긴 내용\n")
+        (worktree / "docs" / "note.md").unlink()
+        write(worktree / "src" / "added.py", "VALUE = 1\n")
+        before = content_digest(worktree, self.run.base_revision)
+
+        wt = GitRunner(worktree)
+        wt.stage_paths(("docs/renamed.md", "docs/note.md", "src/added.py"))
+        head = wt.commit(
+            commit_message(self.run.task_id, self.run.run_id),
+            author_name="Atlas",
+            author_email="atlas@users.noreply.github.com",
+        )
+        after = content_digest(worktree, self.run.base_revision, head)
+
+        self.assertTrue(before.matches(after))
+        self.assertEqual(before.entry_count, after.entry_count)
+
+    def test_different_content_produces_a_different_digest(self):
+        worktree = Path(self.run.worktree_path)
+        first = content_digest(worktree, self.run.base_revision)
+        write(worktree / "docs" / "note.md", "다른 내용\n")
+        second = content_digest(worktree, self.run.base_revision)
+
+        self.assertFalse(first.matches(second))
+
+    def test_no_raw_source_in_digest_or_database(self):
+        marker = "VERY-DISTINCTIVE-SOURCE-LINE"
+        write(Path(self.run.worktree_path) / "docs" / "note.md", f"{marker}\n")
+        digest = content_digest(self.run.worktree_path, self.run.base_revision)
+        publication_id = self.start_with_digest()
+        self.store.update_publication(publication_id, content_digest=digest.to_dict())
+
+        blob = json.dumps(digest.to_dict(), ensure_ascii=False)
+        blob += json.dumps([dict(r) for r in self.store.events()], ensure_ascii=False)
+        blob += Path(self.db).read_bytes().decode("latin-1")
+        self.assertNotIn(marker, blob)
+        self.assertEqual(len(digest.digest), 64)
+
+    def test_digest_is_checkpointed_during_publish(self):
+        self.publish()
+
+        row = self.store.publications(self.run.run_id)[0]
+        self.assertTrue(row["content_digest"])
+        stored = json.loads(row["content_digest"])
+        self.assertEqual(len(stored["digest"]), 64)
+
+
+class RemoteSwapTest(PublicationTestCase):
+    """예약 이후 remote가 바뀌면 push하지 않습니다."""
+
+    def swap_remote(self, url):
+        git("remote", "set-url", "bare", url, cwd=Path(self.run.worktree_path))
+
+    def publish_with_swap(self, url):
+        original = self.service._revalidate_remote
+
+        def swapping(run, publication_id):
+            # 예약과 검증 사이가 아니라, 검증 직전에 바꿔치기합니다.
+            self.swap_remote(url)
+            return original(run, publication_id)
+
+        self.service._revalidate_remote = swapping
+        try:
+            return self.publish()
+        finally:
+            self.service._revalidate_remote = original
+
+    def test_remote_url_change_blocks_push(self):
+        other = self.root / "other.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(other)], check=True, capture_output=True
+        )
+
+        with self.assertRaises(PublicationError) as caught:
+            self.publish_with_swap(str(other))
+
+        self.assertIs(caught.exception.failure, PublicationFailure.REMOTE_CHANGED)
+        self.assertIsNone(self.bare_head())
+        self.assertIsNone(GitRunner(self.repo).remote_head(str(other), self.run.branch))
+
+    def test_lookalike_github_url_blocks_push(self):
+        with self.assertRaises(PublicationError) as caught:
+            self.publish_with_swap("https://github.com/evil/hongwon1031/atlas.git")
+
+        self.assertIn(
+            caught.exception.failure,
+            (PublicationFailure.REMOTE_CHANGED, PublicationFailure.REMOTE_INVALID),
+        )
+        self.assertIsNone(self.bare_head())
+
+    def test_different_owner_repo_blocks_push(self):
+        with self.assertRaises(PublicationError) as caught:
+            self.publish_with_swap("https://github.com/someone/else.git")
+
+        self.assertIn(
+            caught.exception.failure,
+            (PublicationFailure.REMOTE_CHANGED, PublicationFailure.REMOTE_INVALID),
+        )
+        self.assertIsNone(self.bare_head())
+
+    def test_unchanged_remote_publishes_normally(self):
+        report = self.publish()
+
+        self.assertIs(report.status, PublicationStatus.PUBLISHED)
+        self.assertEqual(self.remote_head(), report.commit_sha)
+
+    def test_identity_is_reverified_before_push(self):
+        """주입한 identity 구현이 push 직전에도 호출돼야 합니다."""
+
+        before = len(self.identity.calls)
+
+        self.publish()
+
+        self.assertGreater(len(self.identity.calls), before + 0)
+        self.assertGreaterEqual(len(self.identity.calls), 2)
+
+    def test_reconciliation_reports_remote_change(self):
+        publication_id = self.store.start_publication(
+            self.run.run_id,
+            worker_id=WORKER,
+            github_repository=REPOSITORY,
+            branch=self.run.branch,
+            base_branch="main",
+            remote="bare",
+            remote_url=str(self.bare),
+        )
+        self.swap_remote("https://github.com/someone/else.git")
+
+        findings = PublicationReconciler(
+            self.store, pull_requests=self.pull_requests
+        ).reconcile()
+
+        self.assertTrue(any(f["kind"] == "publication_remote_changed" for f in findings))
+        row = self.store.publication(publication_id)
+        self.assertEqual(row["status"], PublicationStatus.RECOVERY_REQUIRED.value)
+
+
+class AuthorizationRaceTest(PublicationTestCase):
+    """예약 이후에도 승인과 claim을 다시 확인합니다."""
+
+    def sabotage_before_push(self, action):
+        original = self.service._push
+
+        def wrapped(publication_id, run, remote, commit_sha):
+            raise AssertionError("push가 호출되면 안 됩니다")
+
+        # 실제로는 _require_authorization이 먼저 막아야 하므로, push가 불리면
+        # 테스트가 실패합니다.
+        action()
+        self.service._push = wrapped
+        try:
+            return self.publish()
+        finally:
+            self.service._push = original
+
+    def test_approval_revoked_after_reservation_blocks_push(self):
+        original = self.service._commit
+
+        def revoke_then_commit(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.store.revoke_approval(self.run.task_id, "회수")
+            return result
+
+        self.service._commit = revoke_then_commit
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+        self.service._commit = original
+
+        self.assertIs(caught.exception.failure, PublicationFailure.AUTHORIZATION_LOST)
+        self.assertIsNone(self.remote_head())
+        self.assertEqual(len(self.pull_requests.created), 0)
+
+    def test_claim_release_after_reservation_blocks_push(self):
+        original = self.service._commit
+
+        def release_then_commit(*args, **kwargs):
+            result = original(*args, **kwargs)
+            claim = self.store.claim_for(self.run.claim_id)
+            self.store.release(claim["claim_id"], "해제")
+            return result
+
+        self.service._commit = release_then_commit
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+        self.service._commit = original
+
+        self.assertIs(caught.exception.failure, PublicationFailure.AUTHORIZATION_LOST)
+        self.assertIsNone(self.remote_head())
+
+    def test_lease_expiry_between_commit_and_push_blocks_push(self):
+        original = self.service._commit
+
+        def expire_then_commit(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.store._connection.execute(
+                "UPDATE claims SET lease_expires_at = ? WHERE claim_id = ?",
+                ("2000-01-01T00:00:00Z", self.run.claim_id),
+            )
+            self.store._connection.commit()
+            return result
+
+        self.service._commit = expire_then_commit
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+        self.service._commit = original
+
+        self.assertIs(caught.exception.failure, PublicationFailure.AUTHORIZATION_LOST)
+        self.assertIsNone(self.remote_head())
+
+    def test_approval_revoked_after_push_blocks_pr_creation(self):
+        """이미 push된 branch는 되돌리지 않고 recovery로 넘깁니다."""
+
+        original = self.service._push
+
+        def revoke_after_push(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.store.revoke_approval(self.run.task_id, "회수")
+            return result
+
+        self.service._push = revoke_after_push
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+        self.service._push = original
+
+        self.assertIs(caught.exception.failure, PublicationFailure.AUTHORIZATION_LOST)
+        # PR은 만들지 않았습니다.
+        self.assertEqual(len(self.pull_requests.created), 0)
+        # push는 이미 일어났고 되돌리지 않았습니다.
+        row = self.store.publications(self.run.run_id)[0]
+        self.assertTrue(row["pushed_sha"])
+        self.assertEqual(self.remote_head(), row["pushed_sha"])
+        self.assertTrue(caught.exception.evidence["side_effects_exist"])
+
+    def test_owner_mismatch_after_reservation_blocks_side_effects(self):
+        original = self.service._commit
+
+        def steal_then_commit(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.store._connection.execute(
+                "UPDATE claims SET lease_owner = 'worker-b' WHERE claim_id = ?",
+                (self.run.claim_id,),
+            )
+            self.store._connection.commit()
+            return result
+
+        self.service._commit = steal_then_commit
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+        self.service._commit = original
+
+        self.assertIs(caught.exception.failure, PublicationFailure.AUTHORIZATION_LOST)
+        self.assertIsNone(self.remote_head())
+
+    def test_authorization_loss_is_recorded(self):
+        original = self.service._commit
+
+        def revoke(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.store.revoke_approval(self.run.task_id, "회수")
+            return result
+
+        self.service._commit = revoke
+        try:
+            self.publish()
+        except PublicationError:
+            pass
+        self.service._commit = original
+
+        kinds = [row["kind"] for row in self.store.events()]
+        self.assertIn("publication_authorization_lost", kinds)
+
+    def test_normal_path_is_unaffected(self):
+        report = self.publish()
+
+        self.assertIs(report.status, PublicationStatus.PUBLISHED)
+        self.assertEqual(len(self.pull_requests.created), 1)
+
+    def test_authorization_checks_exclude_context_dependent_items(self):
+        run = self.store.run(self.run.run_id)
+        checks = self.service.authorization_checks(run, WORKER)
+
+        self.assertNotIn("not_already_published", checks)
+        self.assertNotIn("run_succeeded", checks)
+        self.assertNotIn("no_active_validation", checks)
+        self.assertTrue(all(checks.values()))
+
+
+class PublishedEvidenceTest(PublicationTestCase):
+    """Published 기록에 외부 증거가 실제로 있는지 확인합니다."""
+
+    def reconciler(self, **kwargs):
+        kwargs.setdefault("pull_requests", self.pull_requests)
+        return PublicationReconciler(self.store, **kwargs)
+
+    def test_healthy_published_record_produces_no_finding(self):
+        self.publish()
+
+        findings = self.reconciler().reconcile()
+
+        self.assertEqual(findings, [])
+
+    def test_missing_remote_branch_is_reported(self):
+        report = self.publish()
+        # remote에서 branch를 지웁니다.
+        subprocess.run(
+            ["git", "-C", str(self.bare), "update-ref", "-d", f"refs/heads/{self.run.branch}"],
+            check=True, capture_output=True, shell=False,
+        )
+
+        findings = self.reconciler().reconcile()
+
+        self.assertTrue(
+            any(f["kind"] == "publication_remote_evidence_missing" for f in findings), findings
+        )
+
+    def test_changed_remote_branch_is_reported(self):
+        self.publish()
+        other = self.root / "mover"
+        subprocess.run(
+            ["git", "clone", "-q", str(self.bare), str(other)], check=True, capture_output=True
+        )
+        git("config", "user.email", "m@e.com", cwd=other)
+        git("config", "user.name", "M", cwd=other)
+        git("checkout", "-q", self.run.branch, cwd=other)
+        write(other / "extra.txt", "다른 사람\n")
+        git("add", "-A", cwd=other)
+        git("commit", "-m", "mover", cwd=other)
+        git("push", "-q", "origin", self.run.branch, cwd=other)
+
+        findings = self.reconciler().reconcile()
+
+        self.assertTrue(
+            any(f["kind"] == "publication_remote_evidence_changed" for f in findings), findings
+        )
+
+    def test_closed_pr_is_reported_not_fixed(self):
+        report = self.publish()
+        # PR을 닫습니다. 정책이 없으므로 자동으로 고치지 않아야 합니다.
+        self.pull_requests.existing = []
+
+        findings = self.reconciler().reconcile()
+
+        self.assertTrue(
+            any(f["kind"] == "publication_pr_no_longer_open" for f in findings), findings
+        )
+        row = self.store.publication(report.publication_id)
+        self.assertEqual(row["status"], PublicationStatus.PUBLISHED.value)
+        self.assertEqual(len(self.pull_requests.created), 1)
+
+    def test_published_without_pr_number_is_reported(self):
+        report = self.publish()
+        self.store._connection.execute(
+            "UPDATE publications SET pr_number = NULL WHERE publication_id = ?",
+            (report.publication_id,),
+        )
+        self.store._connection.commit()
+
+        findings = self.reconciler().reconcile()
+
+        self.assertTrue(
+            any(f["kind"] == "publication_published_without_pr" for f in findings), findings
+        )
 
 
 class SecurityTest(PublicationTestCase):

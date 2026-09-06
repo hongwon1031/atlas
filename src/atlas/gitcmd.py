@@ -202,12 +202,26 @@ class GitRunner:
         않게 합니다. `--` 이후는 pathspec이므로 임의 옵션이 들어갈 수 없습니다.
         """
 
-        targets = [str(path) for path in paths if str(path).strip()]
+        targets = [str(path).strip() for path in paths if str(path).strip()]
         if not targets:
+            return
+
+        # git에 아무것도 해당하지 않는 경로가 섞이면 `git add`가 통째로
+        # 실패합니다. 한 번도 추적된 적 없는 파일이 사라진 경우가 그렇습니다.
+        # 그 경로는 stage할 것이 없으므로 조용히 빼되, 나머지는 정상 처리합니다.
+        tracked = {
+            line.strip().replace("\\", "/")
+            for line in self.run("ls-files", "--", *targets).lines()
+            if line.strip()
+        }
+        stageable = [
+            path for path in targets if (self.cwd / path).exists() or path in tracked
+        ]
+        if not stageable:
             return
         # 삭제된 파일도 반영하려면 `--all` pathspec 모드가 필요합니다. 이것은
         # `git add -A`와 다릅니다. 지정한 경로에만 적용됩니다.
-        self.run("add", "--all", "--", *targets)
+        self.run("add", "--all", "--", *stageable)
 
     def commit(
         self,

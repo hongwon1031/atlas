@@ -834,3 +834,98 @@ remote 충돌 시 덮어쓰기, 무결성 재확인 제거, staged 경로 검증
 - POSIX에서의 동작. 이 검증은 Windows에서 수행했습니다.
 - 여러 Run이 동시에 같은 repository로 게시할 때의 경쟁.
 - branch cleanup. 게시 후 remote branch를 정리하지 않습니다.
+
+### 2026-09-06 추가 — 내용 기반 commit 채택, remote TOCTOU, 게시 중 권한 상실
+
+merge-blocking review 세 건과 추가 점검 하나를 고치고 다시 검증했습니다.
+
+#### crash recovery commit 채택이 metadata에만 의존하던 문제
+
+기존 조건(base+1, clean, subject 일치, 기대 branch)은 **사람이 만든 commit도 만족할 수 있습니다.** subject를 `atlas: implement <task-id>`로 맞추고 허용 경로 안에서 다른 내용을 commit하면 채택돼, 검증하지 않은 내용이 게시됩니다.
+
+commit 전후로 같은 값이 나오는 **내용 지문**을 도입했습니다. base revision 기준으로 각 경로의 blob 해시를 모아 SHA-256으로 요약합니다. `git hash-object`가 내는 값과 commit 안의 blob sha가 같다는 사실을 실측으로 확인한 뒤 설계했습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| commit 전 지문 == commit 후 지문 | 일치 |
+| rename·삭제·untracked 혼합 | 일치. entry 수도 동일 |
+| 내용이 다른 commit | 지문 불일치 |
+| subject를 맞춘 사람 commit | `publication_content_mismatch`. 채택하지 않음 |
+| 허용 경로 안의 사람 commit | reconciliation이 `content_mismatch`로 판정, `RecoveryRequired` |
+| 정확한 Atlas commit | 채택 |
+| 지문이 아예 없는 경우 | 채택하지 않음(fail closed) |
+| 같은 Run의 이전 attempt 지문 | 유효한 근거로 인정 |
+| 정상 commit 직후 | 만든 commit의 내용을 다시 확인 |
+| raw source | 지문·event·DB 어디에도 없음. digest 64자만 |
+| service와 reconciler | 같은 verifier 사용 |
+
+파일 mode는 지문에 넣지 않았습니다. Windows에서 실행 비트를 신뢰할 수 없기 때문이고, 알려진 한계로 문서에 적었습니다.
+
+#### remote identity TOCTOU
+
+예약 시점에 URL을 검증한 뒤 remote **이름**으로만 push하면, 그 사이 `git remote set-url`로 다른 repository를 가리키게 만들 수 있었습니다.
+
+push 직전에 URL을 다시 읽어 저장된 값과 정확히 비교하고 identity를 재검증한 뒤, **확인한 URL을 그대로 push 대상으로** 씁니다. 이름을 한 번 더 거치지 않으므로 확인과 사용 사이의 간격이 사라집니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 예약 후 다른 bare로 변경 | `publication_remote_changed`. **push 0** |
+| lookalike GitHub URL로 변경 | 차단. push 0 |
+| 다른 owner/repo로 변경 | 차단. push 0 |
+| 변경 없음 | 정상 게시 |
+| identity 재검증 호출 | push 직전에도 호출됨 |
+| reconciliation | 저장된 URL과 다르면 `publication_remote_changed` + `RecoveryRequired` |
+| 근거에 URL 자체 | 넣지 않음. credential이 박혀 있을 수 있음 |
+| credential이 박힌 URL | argv에 넣지 않고 remote 이름 사용 |
+
+#### 예약 이후 권한 상실
+
+예약 guard 통과 뒤에도 승인 회수·claim 해제·owner 변경·lease 만료가 commit과 push와 PR 생성 사이에 일어날 수 있었습니다.
+
+외부 side effect 직전마다 재확인하는 `authorization_checks`를 분리했습니다. 시작 gate와 달리 문맥 의존 항목(`not_already_published`, `run_succeeded` 등)을 넣지 않습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 예약 후 승인 회수 | `publication_authorization_lost`. **push 0, PR 0** |
+| 예약 후 claim 해제 | 차단. push 0 |
+| commit 후 lease 만료 | 차단. push 0 |
+| commit 후 owner 변경 | 차단. push 0 |
+| **push 성공 후 승인 회수** | **PR 0.** push된 branch는 되돌리지 않음. `side_effects_exist=true` 기록 |
+| 근거 기록 | `publication_authorization_lost` event |
+| 정상 경로 | 영향 없음 |
+| 검사 집합 | 문맥 의존 항목 미포함 확인 |
+
+이미 만든 side effect를 force push나 삭제로 정리하려 들지 않습니다. checkpoint를 남기고 사람이 판단합니다.
+
+#### Published 외부 증거 확인 (추가 점검)
+
+PR 본문이 "Published DB record but remote evidence missing"을 지원한다고 적었으므로 구현을 맞췄습니다. DB만 보고 게시됐다고 믿지 않고 remote branch와 PR을 실제로 확인합니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 정상 Published | finding 없음 |
+| remote branch 삭제됨 | `publication_remote_evidence_missing` |
+| remote branch가 다른 commit | `publication_remote_evidence_changed` |
+| PR이 더 이상 열려 있지 않음 | `publication_pr_no_longer_open`. **자동으로 고치지 않음** |
+| PR 번호 없음 | `publication_published_without_pr` |
+
+닫히거나 merge된 PR의 처리 정책이 정해지지 않았으므로 finding만 남깁니다.
+
+#### 검증 중 발견해 고친 것
+
+**한 번도 추적된 적 없는 파일이 삭제되면 staging이 통째로 실패했습니다.** `git add --all -- <paths>`에 매칭되는 것이 없는 경로가 섞이면 exit 128입니다. 실제 경로에서는 잘 생기지 않지만 방어가 필요합니다. stage할 것이 없는 경로를 조용히 빼고 나머지를 정상 처리하도록 고쳤습니다.
+
+#### 회귀 테스트가 실제로 잡는지 확인
+
+내용 검증 없이 metadata만으로 채택, push 직전 remote 재검증 제거, 예약 이후 authorization 재확인 제거, reconciler의 지문 비교 제거를 각각 되돌렸습니다. **12건이 실패**했고 복원하니 전부 통과했습니다.
+
+#### 재실행한 검증
+
+- 전체 테스트 통과
+- `compileall` (src, tests) 통과
+- bare remote smoke 재실행 통과 — 기본 정책의 로컬 remote 거부 포함
+- secret scan, `git diff --check` 통과
+
+#### 확인하지 못한 항목
+
+앞 절의 항목이 그대로 남습니다. 실제 GitHub push와 PR 생성은 여전히 미검증이고, 파일 mode는 내용 지문에 포함하지 않습니다.

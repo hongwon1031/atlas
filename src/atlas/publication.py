@@ -43,7 +43,7 @@ from .store import RunError, TaskStore, from_iso, to_iso, utcnow
 from .validation_models import ValidationOutcome, ValidationStatus
 from .workspace import PROTECTED_BRANCHES, GITHUB_HOSTS, parse_github_remote
 from .workspace_service import WorkspaceService
-from .worktree_changes import safe_fingerprint
+from .worktree_changes import ContentDigest, safe_content_digest, safe_fingerprint
 
 DEFAULT_REMOTE = "origin"
 DEFAULT_AUTHOR_NAME = "Atlas"
@@ -172,12 +172,89 @@ class PublicationService:
         self._pull_requests = pull_requests or GitHubPullRequestClient()
         # 기본값은 엄격한 GitHub 검증입니다. 환경변수로 끌 수 없습니다.
         self._remote_identity = remote_identity or GitHubRemoteIdentity()
+        self._worker_id = ""
 
     @property
     def config(self) -> PublicationConfig:
         return self._config
 
     # -- gate --------------------------------------------------------------
+
+    def authorization_checks(self, run, worker_id: str, now=None) -> dict[str, bool]:
+        """게시를 계속해도 되는 근거만 모읍니다.
+
+        시작 gate와 달리 **문맥에 의존하는 항목을 넣지 않습니다.** 진행 중에는
+        Run이 `Validating`이 아니고 publication도 이미 active이므로, 그런
+        항목까지 보면 정상 경로가 막힙니다.
+
+        여기 있는 것은 외부 side effect를 만들기 직전에 항상 참이어야 하는
+        것들입니다. 승인이 회수됐거나 claim을 잃었으면 GitHub에 무언가를
+        만들면 안 됩니다.
+        """
+
+        moment = now or utcnow()
+        checks = {
+            "task_approved": False,
+            "claim_active": False,
+            "claim_owner_matches": False,
+            "lease_valid": False,
+            "workspace_ready": False,
+            "branch_not_protected": bool(run.branch) and not _is_protected(run.branch),
+        }
+        checks["workspace_ready"] = (
+            run.workspace_status.value == "ready" and bool(run.worktree_path)
+        )
+
+        task = self._store.task_by_fingerprint(run.fingerprint)
+        checks["task_approved"] = bool(task and task["approved"] and task["is_current"])
+
+        claim = self._store.claim_for(run.claim_id)
+        if claim is not None and claim["released_at"] is None:
+            checks["claim_active"] = True
+            checks["claim_owner_matches"] = claim["lease_owner"] == worker_id
+            checks["lease_valid"] = from_iso(claim["lease_expires_at"]) > moment
+        return checks
+
+    def _require_authorization(
+        self,
+        publication_id: str,
+        run,
+        worker_id: str,
+        stage: str,
+        *,
+        side_effects_exist: bool,
+    ) -> None:
+        """외부 side effect 직전에 승인과 claim을 다시 확인합니다.
+
+        `side_effects_exist`가 참이면 이미 만든 것(push된 branch 등)이
+        있습니다. 그것을 되돌리지 않습니다. force push나 삭제로 정리하려 들면
+        더 큰 문제를 만듭니다. checkpoint를 남기고 recovery로 넘깁니다.
+        """
+
+        checks = self.authorization_checks(run, worker_id)
+        lost = [name for name, ok in checks.items() if not ok]
+        if not lost:
+            return
+
+        self._store.update_publication(
+            publication_id,
+            event="publication_authorization_lost",
+            detail={
+                "stage": stage,
+                "failed_checks": lost,
+                "side_effects_exist": side_effects_exist,
+                "detail": "이미 만든 side effect는 되돌리지 않습니다.",
+            },
+        )
+        raise PublicationError(
+            PublicationFailure.AUTHORIZATION_LOST,
+            f"{stage} 직전에 실행 근거를 잃었습니다: {', '.join(lost)}",
+            {
+                "stage": stage,
+                "failed_checks": lost,
+                "side_effects_exist": side_effects_exist,
+            },
+        )
 
     def gate(self, run_id: str, worker_id: str, now=None) -> GateResult:
         """게시해도 되는지 확인합니다."""
@@ -268,6 +345,52 @@ class PublicationService:
         self._remote_identity.verify(self._config.remote, url, expected)
         return self._config.remote, url
 
+    def _revalidate_remote(self, run, publication_id: str) -> str:
+        """push 직전에 remote URL을 다시 읽고 검증합니다.
+
+        예약 시점에 검증한 뒤 `git remote set-url`로 다른 repository를 가리키게
+        만들 수 있습니다. remote **이름**만 믿고 push하면 그 repository로
+        올라갑니다. 그래서 이름이 아니라 **매번 URL을 다시 확인합니다.**
+
+        확인한 URL을 그대로 push 대상으로 씁니다. 이름을 거치지 않으므로
+        확인과 사용 사이의 간격이 사라집니다.
+        """
+
+        row = self._store.publication(publication_id)
+        expected_url = (row["remote_url"] or "") if row else ""
+        expected_repository = row["github_repository"] if row else ""
+
+        git = GitRunner(run.worktree_path, timeout_seconds=self._config.git_timeout_seconds)
+        current = git.remote_url(self._config.remote) or ""
+        if not current:
+            raise PublicationError(
+                PublicationFailure.REMOTE_CHANGED,
+                f"remote {self._config.remote}가 사라졌습니다.",
+                {"expected_url_present": bool(expected_url)},
+            )
+        if expected_url and current != expected_url:
+            # URL 자체를 근거에 넣지 않습니다. credential이 박혀 있을 수 있습니다.
+            raise PublicationError(
+                PublicationFailure.REMOTE_CHANGED,
+                "예약 이후 remote URL이 바뀌었습니다. push하지 않습니다.",
+                {"remote": self._config.remote, "url_changed": True},
+            )
+        # 이름이 같아도 대상이 같다고 볼 수 없으므로 identity를 다시 봅니다.
+        self._remote_identity.verify(self._config.remote, current, expected_repository)
+        return current
+
+    @staticmethod
+    def _push_target(remote: str, url: str) -> str:
+        """push와 조회에 쓸 대상.
+
+        URL에 credential이 박혀 있으면 argv에 넣을 수 없으므로 remote 이름을
+        씁니다. 그 경우에도 직전에 URL을 검증했습니다.
+        """
+
+        if _has_userinfo(url):
+            return remote
+        return url
+
     # -- 실행 ---------------------------------------------------------------
 
     def publish(self, run_id: str, worker_id: str) -> PublicationReport:
@@ -289,6 +412,7 @@ class PublicationService:
         base_branch = run.base_branch or "main"
         repository = str(task.get("repository") or "")
 
+        self._worker_id = worker_id
         publication_id = self._store.start_publication(
             run_id,
             worker_id=worker_id,
@@ -339,15 +463,22 @@ class PublicationService:
         if reused:
             adopted.append("commit")
 
-        # E~G. remote 확인 후 필요할 때만 push
+        # E~G. push 직전에 근거와 remote를 모두 다시 확인합니다.
         self._store.update_publication(publication_id, status=PublicationStatus.PUSHING)
+        self._require_authorization(
+            publication_id, run, self._worker_id, "push", side_effects_exist=False
+        )
         pushed_new = self._push(publication_id, run, remote, commit_sha)
         if not pushed_new:
             adopted.append("remote_branch")
 
-        # H~J. 기존 PR 확인 후 없을 때만 생성
+        # H~J. PR 생성 직전에도 다시 확인합니다. 이미 push한 branch는
+        # 되돌리지 않고 recovery로 넘깁니다.
         self._store.update_publication(
             publication_id, status=PublicationStatus.CREATING_PR
+        )
+        self._require_authorization(
+            publication_id, run, self._worker_id, "pull_request", side_effects_exist=True
         )
         pull_request, created = self._pull_request(
             publication_id,
@@ -437,9 +568,16 @@ class PublicationService:
 
         # 재시도 경로입니다. 앞선 시도가 이미 commit을 만들었을 수 있습니다.
         # 그 경우 HEAD가 base보다 하나 앞서는 것이 정상입니다.
-        resumed = self._atlas_commit(git, run, head)
-        if resumed:
+        expected = self._recorded_digest(publication_id)
+        if self._atlas_commit(git, run, head, expected):
             return self._verify_committed(publication_id, run, git, head, task)
+        if expected is not None and head != run.base_revision:
+            # 지문은 있는데 HEAD 내용이 다릅니다. 다른 누군가의 commit입니다.
+            raise PublicationError(
+                PublicationFailure.CONTENT_MISMATCH,
+                "branch에 검증한 내용과 다른 commit이 있습니다. 채택하지 않습니다.",
+                {"head": head, "expected_digest": expected.digest},
+            )
 
         baseline = self._validation_baseline(run.run_id)
         current = safe_fingerprint(run.worktree_path, self._config.git_timeout_seconds)
@@ -476,43 +614,88 @@ class PublicationService:
                 PublicationFailure.NOTHING_TO_PUBLISH, "게시할 변경이 없습니다."
             )
 
+        # commit 채택이 metadata가 아니라 **내용**에 근거하도록, 지금 검증한
+        # 변경 내용의 지문을 남깁니다. commit 전후로 같은 값이 나옵니다.
+        digest = safe_content_digest(
+            run.worktree_path, run.base_revision, timeout_seconds=self._config.git_timeout_seconds
+        )
         self._store.update_publication(
             publication_id,
+            content_digest=digest.to_dict(),
             event="publication_integrity_verified",
             detail={
                 "head": head,
                 "branch": branch,
                 "changed_file_count": len(changes.changed_files),
                 "fingerprint": current.to_dict(),
+                "content_digest": digest.to_dict(),
                 "baseline_source": "validation" if baseline else "run_base_revision",
             },
         )
         return changes.changed_files
 
-    def _atlas_commit(self, git: GitRunner, run, head: str) -> bool:
-        """HEAD가 Atlas가 이번 Run에서 만든 commit인지 확인합니다.
+    def _atlas_commit(self, git: GitRunner, run, head: str, expected: ContentDigest | None) -> bool:
+        """HEAD를 이번 publication의 commit으로 채택해도 되는지 확인합니다.
 
-        네 가지가 모두 맞아야 합니다. 하나라도 어긋나면 사람이 만든 commit일
-        수 있으므로 채택하지 않습니다.
+        **metadata만으로는 증명되지 않습니다.** 사람이 같은 branch에서 base+1
+        commit을 만들고 subject까지 똑같이 맞출 수 있습니다. 그래서 commit의
+        **내용**이 검증한 내용과 같은지 확인합니다.
 
-        1. 기록된 publication의 commit_sha와 같거나, base보다 정확히 하나 앞선다
-        2. working tree가 깨끗하다
-        3. subject가 이 Task의 결정적 commit subject와 같다
-        4. branch가 기대한 atlas branch다
+        기록된 지문이 없으면 채택하지 않습니다(fail closed). 증명할 근거가
+        없는데 남의 commit을 우리 것으로 삼는 것보다 다시 판단하는 편이
+        안전합니다.
         """
 
         base = run.base_revision
-        if not base or head == base:
+        if not base or head == base or expected is None or not expected.computed:
             return False
         try:
             if git.run("rev-list", "--count", f"{base}..{head}").text != "1":
                 return False
             if git.is_dirty():
                 return False
-            subject = git.run("log", "-1", "--format=%s", head).text
+            if git.current_branch() != run.branch:
+                return False
+            if git.run("log", "-1", "--format=%s", head).text != commit_subject(run.task_id):
+                return False
         except (GitError, OSError):
             return False
-        return subject == commit_subject(run.task_id)
+
+        actual = safe_content_digest(
+            git.cwd, base, head, timeout_seconds=self._config.git_timeout_seconds
+        )
+        return expected.matches(actual)
+
+    def _recorded_digest(self, publication_id: str) -> ContentDigest | None:
+        """이 publication이 검증한 내용의 지문.
+
+        이번 attempt에 아직 없으면 **같은 Run의 이전 attempt**가 남긴 것을
+        찾습니다. 앞선 시도가 무결성 확인까지 마치고 commit한 뒤 실패했을 수
+        있고, 그 지문은 여전히 유효한 근거입니다.
+
+        어디에도 없으면 `None`입니다. 그 경우 채택하지 않습니다(fail closed).
+        """
+
+        row = self._store.publication(publication_id)
+        if row is None:
+            return None
+        candidates = [row]
+        candidates.extend(
+            other
+            for other in self._store.publications(row["run_id"])
+            if other["publication_id"] != publication_id
+        )
+        for candidate in candidates:
+            raw = candidate["content_digest"]
+            if not raw:
+                continue
+            try:
+                digest = ContentDigest.from_dict(json.loads(raw))
+            except (ValueError, TypeError):
+                continue
+            if digest is not None:
+                return digest
+        return None
 
     def _verify_committed(
         self, publication_id: str, run, git: GitRunner, head: str, task: dict[str, Any]
@@ -598,9 +781,10 @@ class PublicationService:
 
         head = git.head_revision()
         recorded = (row["commit_sha"] or "") if row else ""
+        expected = self._recorded_digest(publication_id)
         if recorded and head == recorded:
             return recorded, True
-        if self._atlas_commit(git, run, head):
+        if self._atlas_commit(git, run, head, expected):
             # 앞선 시도가 만든 commit입니다. 다시 만들지 않고 채택하고
             # checkpoint만 남깁니다.
             self._store.update_publication(
@@ -661,6 +845,22 @@ class PublicationService:
                 PublicationFailure.COMMIT_FAILED, "commit 후 branch가 바뀌었습니다."
             )
 
+        # 방금 만든 commit이 검증한 내용과 같은지 확인합니다. stage 과정에서
+        # 예상치 못한 변환(줄바꿈, filter)이 있었다면 여기서 드러납니다.
+        if expected is not None and expected.computed:
+            actual = safe_content_digest(
+                run.worktree_path,
+                run.base_revision,
+                commit_sha,
+                timeout_seconds=self._config.git_timeout_seconds,
+            )
+            if not expected.matches(actual):
+                raise PublicationError(
+                    PublicationFailure.CONTENT_MISMATCH,
+                    "만든 commit의 내용이 검증한 내용과 다릅니다.",
+                    {"expected_digest": expected.digest, "actual_digest": actual.digest},
+                )
+
         # D. checkpoint. 여기서 죽어도 재시작 시 HEAD를 보고 채택합니다.
         self._store.update_publication(
             publication_id,
@@ -685,8 +885,12 @@ class PublicationService:
                 PublicationFailure.PUSH_FAILED, f"보호 branch에는 push하지 않습니다: {run.branch}"
             )
 
+        # 이름이 아니라 **지금 다시 확인한 대상**으로 조회하고 push합니다.
+        url = self._revalidate_remote(run, publication_id)
+        target = self._push_target(remote, url)
+
         try:
-            remote_sha = git.remote_head(remote, run.branch)
+            remote_sha = git.remote_head(target, run.branch)
         except GitError as error:
             raise self._push_error(error, "remote 상태를 확인하지 못했습니다.") from None
 
@@ -709,7 +913,7 @@ class PublicationService:
             )
 
         try:
-            git.push_branch(remote, run.branch, commit_sha)
+            git.push_branch(target, run.branch, commit_sha)
         except GitError as error:
             raise self._push_error(error, "push에 실패했습니다.") from None
 
@@ -920,6 +1124,19 @@ class PublicationService:
             "run_status": run.status.value if run else None,
             "publications": rows,
         }
+
+
+def _has_userinfo(url: str) -> bool:
+    """URL에 credential이 박혀 있는지 확인합니다.
+
+    박혀 있으면 argv에 넣을 수 없습니다. token이 명령줄에 노출됩니다.
+    """
+
+    text = (url or "").strip()
+    if "://" not in text:
+        return "@" in text.split(":", 1)[0]
+    authority = text.split("://", 1)[1].split("/", 1)[0]
+    return "@" in authority
 
 
 def _is_protected(branch: str) -> bool:

@@ -218,6 +218,8 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 - PR 본문은 `Refs #N`만 씁니다. `Closes #N`을 쓰지 않습니다. PR merge가 곧 Task 종료인지 아직 정하지 않았습니다.
 - publication 실패가 Run을 `Succeeded`에서 되돌리지 않습니다. 구현과 검증의 성공은 사실로 남고 게시 실패는 별도로 기록합니다.
 - 실제 GitHub PR 생성은 network와 credential에 의존합니다. 이번 검증은 로컬 bare remote와 fake PR client로 수행했습니다.
+- crash 이후 기존 commit 채택은 **내용 지문**으로 증명합니다. 지문이 없으면 채택하지 않고 사람이 판단합니다.
+- 파일 mode는 내용 지문에 포함하지 않습니다. Windows에서 실행 비트를 신뢰할 수 없기 때문입니다.
 - process identity 확인 방법이 플랫폼마다 다릅니다. 얻지 못하면 `unverifiable`로 남기고 그 process는 종료하지 않습니다.
 - Windows에서는 parent가 먼저 종료하면 child를 tree로 추적할 수 없습니다. graceful 단계에서 parent를 즉시 죽이지 않는 방식으로 완화했지만 Job Object만큼 견고하지는 않습니다.
 - executor log는 자동 삭제하지 않습니다. retention 정책이 아직 없습니다.
