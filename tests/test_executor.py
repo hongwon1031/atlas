@@ -29,14 +29,25 @@ from atlas.executor import (
 from atlas.gitcmd import GitRunner
 from atlas.intake import build_idempotency_key
 from atlas.local_process import (
+    MAX_PENDING_CHARS,
+    MAX_RETAINED_CHARS,
     LocalProcessExecutor,
+    _Capture,
+    _RedactingSink,
     base_environment,
     read_log_tail,
 )
 from atlas.parser import parse_issue_body
 from atlas.process_identity import IdentityVerdict, ProcessIdentity, capture, process_exists, verify
 from atlas.reconciliation import RunReconciler
-from atlas.redaction import redact, redact_argv, redact_line, redact_values
+from atlas.redaction import (
+    overlap_window,
+    redact,
+    redact_argv,
+    redact_line,
+    redact_values,
+    safe_split_index,
+)
 from atlas.schema import RunStatus
 from atlas.store import ExecutionConflict, RunError, TaskStore
 from atlas.validation import validate_intake
@@ -461,6 +472,145 @@ class TerminationOutcomeTest(AdapterTestCase):
             self.assertTrue(process_exists(handle.pid), "identity 불일치 process를 죽이면 안 됩니다")
         finally:
             self.executor.cancel(handle, 1.0)
+
+
+class FlushBoundaryTest(unittest.TestCase):
+    """개행 없는 출력의 강제 flush 경계에서 secret이 쪼개지지 않아야 합니다.
+
+    보류 한도에 도달했다고 버퍼를 통째로 내보내면, 경계에 걸친 secret의 앞
+    조각이 raw로 기록됩니다. 어느 쪽에도 전체 pattern이 없어 redaction이
+    걸리지 않기 때문입니다.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="atlas-flush-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.index = 0
+
+    def sink(self, secrets=(), limit=64 * 1024 * 1024):
+        self.index += 1
+        capture = _Capture(
+            path=self.root / f"out-{self.index}.log", limit=limit, secrets=tuple(secrets)
+        )
+        return capture, _RedactingSink(capture)
+
+    def split_across_boundary(self, secret, secrets=(), lead=" value=", trail=" done"):
+        """secret이 MAX_PENDING_CHARS 경계를 정확히 가로지르게 흘려보냅니다."""
+
+        capture, sink = self.sink(secrets)
+        half = len(secret) // 2
+        filler = "a" * (MAX_PENDING_CHARS - len(lead) - half)
+        # 첫 chunk의 끝이 정확히 한도라서 강제 flush가 일어납니다.
+        first = filler + lead + secret[:half]
+        self.assertEqual(len(first), MAX_PENDING_CHARS)
+        sink.feed(first.encode("utf-8"))
+        sink.feed((secret[half:] + trail).encode("utf-8"))
+        sink.close()
+        return capture, capture.path.read_bytes()
+
+    def test_known_secret_across_the_flush_boundary(self):
+        secret = "kn0wn-" + ("S" * 40)
+        capture, raw = self.split_across_boundary(secret, secrets=(secret,))
+
+        self.assertNotIn(secret.encode(), raw)
+        # 앞 조각만 남는 것도 유출입니다.
+        self.assertNotIn(secret[: len(secret) // 2].encode(), raw)
+        self.assertIn(b"<redacted>", raw)
+
+    def test_provider_token_across_the_flush_boundary(self):
+        token = "gh" + "p_" + ("A" * 36)
+        capture, raw = self.split_across_boundary(token)
+
+        self.assertNotIn(token.encode(), raw)
+        self.assertNotIn(token[:20].encode(), raw)
+        self.assertIn(b"<redacted>", raw)
+
+    def test_bearer_token_across_the_flush_boundary(self):
+        capture, raw = self.split_across_boundary(
+            "Bearer qwertyuiop1234567890asdfgh", lead=" header="
+        )
+
+        self.assertNotIn(b"qwertyuiop1234567890asdfgh", raw)
+        self.assertIn(b"<redacted>", raw)
+
+    def test_repeated_forced_flushes_leak_nothing(self):
+        secret = "rot4t3d-" + ("Q" * 32)
+        token = "gh" + "p_" + ("B" * 36)
+        capture, sink = self.sink(secrets=(secret,))
+
+        for round_index in range(4):
+            payload = secret if round_index % 2 == 0 else token
+            half = len(payload) // 2
+            head = "b" * (MAX_PENDING_CHARS - half - 3)
+            sink.feed((head + " x " + payload[:half]).encode("utf-8"))
+            sink.feed(payload[half:].encode("utf-8"))
+        sink.close()
+
+        raw = capture.path.read_bytes()
+        self.assertNotIn(secret.encode(), raw)
+        self.assertNotIn(token.encode(), raw)
+        self.assertNotIn(secret[:20].encode(), raw)
+        self.assertNotIn(token[:20].encode(), raw)
+
+    def test_plain_output_is_neither_lost_nor_duplicated(self):
+        capture, sink = self.sink()
+        blocks = [f"[{i:04d}]" + ("c" * 40_000) for i in range(6)]
+        for block in blocks:
+            sink.feed(block.encode("utf-8"))
+        sink.close()
+
+        self.assertEqual(capture.path.read_text(encoding="utf-8"), "".join(blocks))
+        self.assertFalse(capture.truncated)
+
+    def test_newline_path_still_works(self):
+        capture, sink = self.sink()
+        sink.feed(("first line" + chr(10) + "second ").encode("utf-8"))
+        sink.feed(("line" + chr(10)).encode("utf-8"))
+        sink.close()
+
+        self.assertEqual(
+            capture.path.read_text(encoding="utf-8"),
+            "first line" + chr(10) + "second line" + chr(10),
+        )
+
+    def test_truncation_semantics_are_preserved(self):
+        capture, sink = self.sink(limit=2048)
+        for _ in range(4):
+            sink.feed(("d" * MAX_PENDING_CHARS).encode("utf-8"))
+        sink.close()
+
+        self.assertTrue(capture.truncated)
+        self.assertEqual(capture.written, 2048)
+        self.assertEqual(capture.path.stat().st_size, 2048)
+
+    def test_retained_buffer_stays_bounded(self):
+        """버퍼 전체가 secret 후보여도 메모리는 한도 안에 머물러야 합니다."""
+
+        capture, sink = self.sink()
+        sink.feed(b"Authorization: Bearer ")
+        for _ in range(6):
+            sink.feed(("E" * MAX_PENDING_CHARS).encode("utf-8"))
+            self.assertLessEqual(len(sink._pending), MAX_RETAINED_CHARS)
+        sink.close()
+
+        raw = capture.path.read_bytes()
+        self.assertNotIn(b"EEEEEEEEEE", raw)
+        self.assertIn(b"<redacted>", raw)
+
+    def test_overlap_window_covers_the_longest_known_secret(self):
+        long_secret = "L" * 4096
+        self.assertGreaterEqual(overlap_window((long_secret,)), len(long_secret))
+        # 너무 짧아 known secret으로 다루지 않는 값은 window를 늘리지 않습니다.
+        self.assertEqual(overlap_window(("abc",)), overlap_window(()))
+
+    def test_safe_split_index_backs_off_to_the_span_start(self):
+        token = "gh" + "p_" + ("C" * 20)
+        text = "prefix " + token + " suffix"
+        start = text.index(token)
+
+        self.assertEqual(safe_split_index(text, start + 5), start)
+        # 구간 밖이면 그대로 둡니다.
+        self.assertEqual(safe_split_index(text, 3), 3)
 
 
 class TimeoutAndCancelTest(AdapterTestCase):

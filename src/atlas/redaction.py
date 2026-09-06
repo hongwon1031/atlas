@@ -79,6 +79,68 @@ def redact(text: str, secrets: tuple[str, ...] | list[str] = ()) -> str:
     return redact_patterns(redact_values(text, secrets))
 
 
+# streaming redaction이 flush 경계를 정할 때 쓰는 pattern 여유 폭입니다.
+# 개행 없이 쏟아지는 출력에서 token/JWT/Bearer가 경계를 가로지르지 않도록
+# 이만큼은 다음 회차로 넘겨 다시 검사합니다.
+PATTERN_OVERLAP_WINDOW = 512
+
+
+def overlap_window(secrets: tuple[str, ...] | list[str] = ()) -> int:
+    """flush 경계에서 되돌려 둬야 할 최소 길이입니다.
+
+    known secret은 길이를 알 수 있으므로 그중 가장 긴 값을 기준으로 잡습니다.
+    pattern은 길이가 열려 있어 고정 window를 씁니다.
+    """
+
+    longest = max(
+        (len(v) for v in secrets or () if v and len(v) >= MIN_KNOWN_SECRET_LENGTH),
+        default=0,
+    )
+    return max(PATTERN_OVERLAP_WINDOW, longest)
+
+
+def redaction_spans(
+    text: str, secrets: tuple[str, ...] | list[str] = ()
+) -> list[tuple[int, int]]:
+    """`redact`가 지울 구간을 돌려줍니다.
+
+    streaming flush 지점이 secret 한가운데를 자르지 않게 하는 용도입니다.
+    치환 결과가 아니라 원본 문자열의 index로 돌려줍니다.
+    """
+
+    if not text:
+        return []
+    spans: list[tuple[int, int]] = []
+    for value in sorted({s for s in secrets or () if s}, key=len, reverse=True):
+        if len(value) < MIN_KNOWN_SECRET_LENGTH:
+            continue
+        start = text.find(value)
+        while start != -1:
+            spans.append((start, start + len(value)))
+            start = text.find(value, start + 1)
+    for pattern in (_CREDENTIAL_IN_URL, _AUTH_HEADER, _BEARER, *_TOKEN_PATTERNS):
+        for match in pattern.finditer(text):
+            spans.append(match.span())
+    return spans
+
+
+def safe_split_index(
+    text: str, index: int, secrets: tuple[str, ...] | list[str] = ()
+) -> int:
+    """`index`에서 자를 때 secret을 반으로 쪼개지 않는 지점을 돌려줍니다.
+
+    경계를 가로지르는 구간이 있으면 그 시작점까지 물러섭니다. 물러선 부분은
+    다음 회차로 넘어가 온전한 상태에서 지워집니다.
+    """
+
+    if index <= 0 or index >= len(text):
+        return index
+    for start, end in redaction_spans(text, secrets):
+        if start < index < end:
+            index = start
+    return max(index, 0)
+
+
 def redact_line(text: str, limit: int = 200, secrets: tuple[str, ...] = ()) -> str:
     """event에 넣을 한 줄 요약. 공백을 접고 길이를 제한합니다."""
 

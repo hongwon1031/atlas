@@ -37,7 +37,12 @@ from .executor import (
     TerminationOutcome,
 )
 from .process_identity import IdentityVerdict, ProcessIdentity, capture, verify
-from .redaction import redact
+from .redaction import (
+    overlap_window,
+    redact,
+    redaction_spans,
+    safe_split_index,
+)
 
 # 상속을 허용하는 OS 기본 환경변수. 이 목록 밖의 값은 child에 전달하지 않습니다.
 # Python 인터프리터와 DLL/라이브러리 탐색에 필요한 최소 집합입니다.
@@ -65,6 +70,10 @@ _POLL_INTERVAL_SECONDS = 0.05
 # 처리하면 chunk 경계에 걸친 token도 안전하게 지울 수 있습니다. 개행 없이
 # 계속 쏟아내는 process를 대비해 보류할 수 있는 최대 길이를 둡니다.
 MAX_PENDING_CHARS = 65_536
+
+# 경계를 가로지르는 secret 때문에 flush를 미룰 수 있는 한도입니다. 버퍼 전체가
+# 하나의 secret 후보인 병적인 출력에서도 메모리가 무한히 늘지 않게 막습니다.
+MAX_RETAINED_CHARS = MAX_PENDING_CHARS * 2
 
 
 def _utcnow_iso() -> str:
@@ -119,6 +128,9 @@ class _RedactingSink:
       나머지는 보류합니다.
     - **chunk 경계**: secret이 여러 chunk에 나뉘어 도착해도 줄이 완성될 때까지
       기다렸다가 redaction하므로 잘린 채로 기록되지 않습니다.
+    - **flush 경계**: 개행 없이 한도에 도달해 강제로 내보낼 때도 secret을 반으로
+      자르지 않습니다. 꼬리 일부를 남겨 다음 회차와 함께 다시 검사하고, 완결된
+      secret이 경계에 걸치면 그 시작점까지 물러섭니다.
     - **invalid UTF-8**: incremental decoder를 `errors="replace"`로 씁니다.
       multi-byte 문자가 chunk 경계에 걸려도 깨지지 않고, 잘못된 byte는 대체
       문자가 됩니다.
@@ -132,18 +144,58 @@ class _RedactingSink:
         self._capture = capture
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._pending = ""
+        self._overlap = overlap_window(capture.secrets)
+        self._suppressing = False
         self._sink = open(capture.path, "wb")
 
     def feed(self, chunk: bytes) -> None:
-        self._pending += self._decoder.decode(chunk)
+        text = self._decoder.decode(chunk)
+        if self._suppressing:
+            # 직전에 내보낸 구간이 버퍼 끝까지 이어졌습니다. 같은 secret이
+            # 계속되는 중이므로, 구간이 끝나는 줄바꿈까지 버립니다. 여기서
+            # 흘려보내면 token의 뒷부분이 raw로 남습니다.
+            _, separator, rest = text.partition(chr(10))
+            if not separator:
+                return
+            self._suppressing = False
+            text = chr(10) + rest
+        self._pending += text
         if "\n" in self._pending:
             head, _, self._pending = self._pending.rpartition("\n")
             self._write(head + "\n")
         elif len(self._pending) >= MAX_PENDING_CHARS:
-            # 개행 없이 계속 출력하는 process입니다. 무한정 보류할 수 없으므로
-            # 지금까지 받은 만큼 redaction해서 내보냅니다.
-            self._write(self._pending)
+            self._flush_forced()
+
+    def _flush_forced(self) -> None:
+        """개행 없이 계속 출력하는 process를 위한 강제 flush입니다.
+
+        무한정 보류할 수는 없지만, 통째로 내보내면 secret이 경계에 걸쳐 앞
+        조각이 raw로 기록됩니다. 꼬리를 남겨 다음 회차로 넘깁니다.
+        """
+
+        text = self._pending
+        keep = self._overlap
+        if len(text) <= keep:
+            return
+
+        cut = safe_split_index(text, len(text) - keep, self._capture.secrets)
+        if cut <= 0:
+            if len(text) < MAX_RETAINED_CHARS:
+                # 버퍼 전체가 아직 판정 중인 secret 후보입니다. 조금 더 봅니다.
+                return
+            # 버퍼 전체가 하나의 구간입니다. redaction하면 통째로 사라지므로
+            # 내보내도 raw 값이 남지 않습니다.
+            self._write(text)
             self._pending = ""
+            # 구간이 버퍼 끝까지 이어졌다면 secret이 아직 안 끝났습니다.
+            self._suppressing = any(
+                end >= len(text)
+                for _, end in redaction_spans(text, self._capture.secrets)
+            )
+            return
+
+        self._write(text[:cut])
+        self._pending = text[cut:]
 
     def close(self) -> None:
         try:

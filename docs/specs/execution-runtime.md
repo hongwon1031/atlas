@@ -321,10 +321,23 @@ process spawn을 database transaction 안에서 잡지 않습니다.
 - 파일에 쓰기 **전에** redaction을 적용합니다. 저장된 파일에 raw secret이 남지 않습니다.
 - 각각 크기 상한이 있습니다. 상한은 redaction을 마친 byte 기준입니다. 상한을 넘으면 기록을 멈추되 pipe는 계속 비웁니다. 읽기를 멈추면 child가 블록되기 때문입니다.
 - 메모리에 전체 출력을 쌓지 않습니다. 완성된 줄만 처리하고 나머지는 보류합니다.
-- **chunk 경계**: secret이 여러 chunk에 나뉘어 도착해도 줄이 완성될 때까지 기다렸다가 redaction하므로 잘린 채 기록되지 않습니다. 개행 없이 계속 출력하는 process를 대비해 보류 한도를 두고, 넘으면 지금까지 받은 만큼 redaction해 내보냅니다.
+- **chunk 경계**: secret이 여러 chunk에 나뉘어 도착해도 줄이 완성될 때까지 기다렸다가 redaction하므로 잘린 채 기록되지 않습니다.
 - log 경로는 worktree 밖의 log root 아래이며 경계를 벗어나면 거부합니다.
 - event에는 raw 출력을 저장하지 않고 크기와 분류만 남깁니다.
 - redaction 대상은 token 형태, URL에 박힌 credential, `Authorization`/`Bearer` 헤더, 주입한 known secret 값입니다.
+
+#### flush 경계
+
+개행 없이 계속 출력하는 process를 위해 보류 한도를 둡니다. 한도에 도달했다고 버퍼를 **통째로 내보내면 안 됩니다.** secret이 그 경계에 걸치면 앞 조각은 이미 나간 뒤이고, 어느 쪽에도 전체 pattern이 없어 redaction이 걸리지 않습니다.
+
+그래서 강제 flush는 이렇게 합니다.
+
+1. **overlap 보존** — 마지막 일부를 남겨 다음 회차와 함께 다시 검사합니다. 남기는 길이는 known secret 중 가장 긴 값과 pattern용 고정 window 중 큰 쪽입니다. known secret은 길이를 알 수 있고, pattern은 길이가 열려 있어 window로 잡습니다.
+2. **구간을 쪼개지 않음** — 자를 지점이 완결된 secret 한가운데면 그 구간의 시작점까지 물러섭니다. 물러선 부분은 온전한 상태로 다음 회차에 지워집니다.
+3. **메모리 한도** — 버퍼 전체가 하나의 secret 후보여도 무한히 보류하지 않습니다. 한도를 넘으면 redaction해서 내보냅니다. 이때는 구간 전체가 치환되므로 raw 값이 남지 않습니다.
+4. **구간 연속 억제** — 3의 경우 구간이 버퍼 끝까지 이어졌다면 secret이 아직 끝나지 않은 것입니다. 줄바꿈이 나올 때까지 이어지는 입력을 버립니다. 그냥 흘려보내면 token의 뒷부분이 raw로 남습니다.
+
+pipe는 이 과정 내내 계속 비웁니다. 개행 기반 정상 경로와 크기 상한·truncation 의미는 그대로입니다.
 
 #### binary 출력 정책
 
