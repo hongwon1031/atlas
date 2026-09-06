@@ -32,6 +32,60 @@ PROTECTED_BRANCHES = frozenset({"main", "master", "HEAD", "trunk", "develop"})
 
 _RUN_ID_SHORT_LENGTH = 12
 
+# GitHub remote만 Task repository로 인정합니다. host를 정확히 확인하고
+# owner/repo를 canonical 형태로 뽑아 exact equality로 비교합니다.
+GITHUB_HOSTS = frozenset({"github.com", "www.github.com"})
+
+_SCP_LIKE = re.compile(r"^(?P<user>[^@/]+@)?(?P<host>[^:/]+):(?P<path>.+)$")
+
+
+def parse_github_remote(url: str) -> tuple[str, str] | None:
+    """remote URL에서 `(host, "owner/repo")`를 뽑습니다.
+
+    GitHub remote가 아니거나 형태가 모호하면 `None`을 돌려줍니다. suffix 비교는
+    `https://github.com/evil/owner/repo.git` 같은 URL을 통과시키므로 쓰지 않고,
+    경로 조각이 정확히 두 개인지 확인합니다.
+    """
+
+    raw = (url or "").strip()
+    if not raw:
+        return None
+
+    host = ""
+    path = ""
+
+    if "://" in raw:
+        scheme, _, rest = raw.partition("://")
+        if scheme.lower() not in ("https", "http", "ssh", "git"):
+            return None
+        authority, _, path = rest.partition("/")
+        # credential이 박힌 URL(https://user:token@host/...)에서 host만 취합니다.
+        host = authority.rpartition("@")[2]
+    else:
+        match = _SCP_LIKE.match(raw)
+        if match is None:
+            return None
+        host = match.group("host")
+        path = match.group("path")
+
+    # port를 떼어냅니다. IPv6 표기는 GitHub remote가 아니므로 다루지 않습니다.
+    host = host.split(":", 1)[0].strip().lower()
+    if not host:
+        return None
+
+    segments = [segment for segment in path.strip("/").split("/") if segment]
+    if len(segments) != 2:
+        # owner/repo가 아닌 경로는 모호하므로 거부합니다.
+        return None
+
+    owner, repo = segments
+    repo = repo.removesuffix(".git")
+    if not owner or not repo or owner.startswith(".") or repo.startswith("."):
+        return None
+    return host, f"{owner}/{repo}"
+
+
+
 
 class WorkspaceError(Exception):
     """workspace 경계 또는 lifecycle 위반."""
@@ -40,6 +94,29 @@ class WorkspaceError(Exception):
         super().__init__(message)
         self.category = category
         self.message = message
+
+
+class WorkspaceRecoveryRequired(WorkspaceError):
+    """기록된 workspace가 실제 상태와 달라 사람 확인이 필요합니다.
+
+    자동 복구나 재생성을 하지 않습니다. 어떤 invariant가 깨졌는지 boolean으로만
+    들고 있어 event에 그대로 남겨도 경로가 노출되지 않습니다.
+    """
+
+    def __init__(self, message: str, checks: dict[str, bool], branch: str | None = None) -> None:
+        super().__init__("workspace_recovery_required", message)
+        self.checks = checks
+        self.branch = branch
+
+    def evidence(self) -> dict[str, Any]:
+        """event log에 넣어도 되는 형태. 절대 경로를 담지 않습니다."""
+
+        return {
+            "category": self.category,
+            "branch": self.branch,
+            "checks": self.checks,
+            "failed_checks": sorted(name for name, ok in self.checks.items() if not ok),
+        }
 
 
 @dataclass(frozen=True)
@@ -165,10 +242,13 @@ class WorkspacePlanner:
         return toplevel
 
     def verify_remote(self) -> str | None:
-        """origin remote가 Task repository와 맞는지 확인합니다.
+        """origin remote가 Task repository와 정확히 일치하는지 확인합니다.
 
         network를 쓰지 않고 로컬에 설정된 URL만 봅니다. remote가 없으면 확인하지
         않고 `None`을 돌려줍니다. 로컬 전용 repository를 막지 않기 위해서입니다.
+
+        비교는 suffix가 아니라 canonical `owner/repo` 정확 일치입니다. host도
+        GitHub인지 확인합니다.
         """
 
         if self._repository is None:
@@ -176,11 +256,25 @@ class WorkspacePlanner:
         url = self._git.remote_url()
         if url is None:
             return None
-        normalized = url.removesuffix(".git").replace(":", "/").rstrip("/").lower()
-        if not normalized.endswith(self._repository.lower()):
+
+        parsed = parse_github_remote(url)
+        if parsed is None:
+            raise WorkspaceError(
+                "remote_not_github",
+                "origin remote를 GitHub owner/repo로 해석하지 못했습니다. "
+                f"기대: {self._repository}",
+            )
+        host, slug = parsed
+        if host not in GITHUB_HOSTS:
+            raise WorkspaceError(
+                "remote_not_github",
+                f"origin remote host가 GitHub가 아닙니다: {host}",
+            )
+        if slug.lower() != self._repository.lower():
             raise WorkspaceError(
                 "repository_mismatch",
-                f"origin remote가 Task repository와 다릅니다. 기대: {self._repository}",
+                f"origin remote가 Task repository와 다릅니다. "
+                f"기대: {self._repository}, 실제: {slug}",
             )
         return url
 
@@ -280,6 +374,63 @@ class WorkspacePlanner:
             "head": head,
             "checks": checks,
         }
+
+
+    def validate_existing(self, branch: str, worktree_path: str) -> dict[str, Any]:
+        """이미 있는 workspace가 여전히 쓸 수 있는 상태인지 확인합니다.
+
+        `validate()`와 달리 HEAD가 base revision과 같은지는 보지 않습니다. 이미
+        작업이 진행돼 commit이 쌓였을 수 있고, 그것은 정상입니다. 대신 executor가
+        이 경로를 cwd로 신뢰할 수 있는지에 필요한 invariant만 확인합니다.
+
+        불일치를 발견하면 자동으로 복구하거나 다시 만들지 않고 거부합니다.
+        """
+
+        path = Path(worktree_path)
+        checks: dict[str, bool] = {
+            "path_exists": path.exists(),
+            "path_within_root": False,
+            "registered_worktree": False,
+            "branch_matches": False,
+            "toplevel_matches": False,
+            "repository_matches": False,
+        }
+
+        if checks["path_exists"]:
+            try:
+                resolved = path.resolve()
+                checks["path_within_root"] = resolved.is_relative_to(
+                    self._workspaces_root.resolve()
+                )
+            except OSError:
+                resolved = path
+            registered = {
+                Path(entry["worktree"]).resolve(): entry
+                for entry in self._git.worktrees()
+                if "worktree" in entry
+            }
+            entry = registered.get(resolved)
+            checks["registered_worktree"] = entry is not None
+
+            runner = GitRunner(path, timeout_seconds=self._git.timeout_seconds)
+            try:
+                checks["toplevel_matches"] = runner.toplevel().resolve() == resolved
+                checks["branch_matches"] = runner.current_branch() == branch
+                checks["repository_matches"] = (
+                    runner.common_dir().resolve() == self._git.common_dir().resolve()
+                )
+            except GitError:
+                # 읽을 수 없으면 나머지 검사는 실패로 둡니다.
+                pass
+
+        failed = [name for name, ok in checks.items() if not ok]
+        if failed:
+            raise WorkspaceRecoveryRequired(
+                f"기록된 workspace가 실제 상태와 다릅니다: {', '.join(failed)}",
+                checks=checks,
+                branch=branch,
+            )
+        return {"branch": branch, "checks": checks}
 
     def inspect(self, branch: str, worktree_path: str) -> dict[str, Any]:
         """현재 디스크 상태를 확인합니다. 상태를 바꾸지 않습니다."""

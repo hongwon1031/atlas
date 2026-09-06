@@ -32,7 +32,13 @@ from .schema import (
     WorkspaceStatus,
 )
 from .store import Claim, Registration, RunError, TaskStore, WorkspaceConflict
-from .workspace import WorkspaceError, WorkspacePlanner, branch_name
+from .workspace import (
+    WorkspaceError,
+    WorkspacePlanner,
+    WorkspaceRecoveryRequired,
+    branch_name,
+    parse_github_remote,
+)
 from .workspace_service import CleanupResult, WorkspaceResult, WorkspaceService
 from .validation import validate_intake
 
@@ -75,10 +81,12 @@ __all__ = [
     "WorkspaceConflict",
     "WorkspaceError",
     "WorkspacePlanner",
+    "WorkspaceRecoveryRequired",
     "WorkspaceResult",
     "WorkspaceService",
     "WorkspaceStatus",
     "branch_name",
+    "parse_github_remote",
     "candidate_rejection",
     "is_task_candidate",
     "parse_issue_body",

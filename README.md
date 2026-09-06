@@ -167,6 +167,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 
 - webhook ingestion이 없습니다. polling만 있으며 지연은 interval에 좌우됩니다.
 - Run별 branch와 worktree는 준비되지만 그 안에서 아무 process도 실행하지 않습니다. executor invocation, timeout, cancellation은 아직 없습니다.
+- 기존 workspace를 재사용할 때는 DB 기록만 믿지 않고 실제 git 상태를 다시 확인합니다. 불일치는 자동 복구하지 않고 `workspace_recovery_required`로 거부하므로 사람이 판단해야 합니다.
 - worktree는 `<repository-root>/.atlas/worktrees` 아래에 만듭니다. 대상 repository에서 이 경로를 ignore해야 합니다.
 - 승인이 회수되거나 claim이 해제돼도 실행 중인 executor를 멈추는 기능은 없습니다. 지금은 executor 자체가 없어 문제가 되지 않지만, executor를 도입하는 slice에서 cancellation을 함께 구현해야 합니다.
 - reconciliation은 heartbeat 경과와 claim/lease 상태로만 판단합니다. executor process가 없어 PID identity 확인을 수행하지 못하며, 판정 event에 `process_identity_checked: false`로 기록합니다.

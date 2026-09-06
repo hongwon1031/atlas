@@ -176,6 +176,7 @@ Run마다 전용 branch와 git worktree를 준비합니다. [ADR-010](../adr/001
 - 대상 repository의 local root를 명시적으로 받습니다. 현재 작업 디렉터리를 추측하지 않습니다.
 - root가 실제 git repository이고 그 repository의 toplevel인지 확인합니다.
 - `origin` remote가 있으면 Task repository와 일치하는지 확인합니다. remote가 없으면 network를 쓰지 않고 통과시킵니다.
+- remote 비교는 suffix가 아니라 canonical `owner/repo` 정확 일치입니다. HTTPS와 SSH 형식을 모두 parsing하고 `.git`을 제거하며 host가 GitHub인지 확인합니다. `https://github.com/evil/owner/repo.git`처럼 경로 조각이 두 개가 아닌 URL과 해석할 수 없는 remote는 거부합니다.
 - worktree는 Project별 worker root 아래에만 만듭니다. 기본값은 `<repository-root>/.atlas/worktrees`이며 operator가 바꿀 수 있습니다. 이 경로는 대상 repository에서 ignore돼야 합니다.
 - 모든 경로는 `resolve()` 후 worker root 아래인지 확인합니다. `resolve()`가 symlink를 따라가므로 symlink escape도 함께 걸립니다.
 
@@ -203,9 +204,24 @@ worktree를 만든 뒤 다음을 모두 확인하고, 하나라도 어긋나면 
 - resolved 경로가 worker root 아래입니다.
 - `git rev-parse --git-common-dir`가 대상 repository와 같습니다.
 
-### Idempotency
+### Idempotency와 재사용 시 재검증
 
 같은 Run에 workspace 생성을 두 번 호출해도 중복 branch나 worktree를 만들지 않고 기존 workspace를 돌려줍니다. 판정 근거는 operational store의 `workspace_status`이므로 프로세스를 재시작해도 같은 Run의 workspace를 재식별합니다.
+
+**`ready` 기록만 믿고 돌려주지 않습니다.** executor는 이 경로를 process working directory로 신뢰할 예정이므로, stale하거나 손상된 workspace를 정상으로 반환하면 안 됩니다. 재사용 전에 저장된 `branch`와 `worktree_path`로 실제 상태를 다시 확인합니다.
+
+| 확인 항목 | 의미 |
+| --- | --- |
+| `path_exists` | 기록된 경로가 실제로 있습니다 |
+| `path_within_root` | worker root 경계 안입니다 |
+| `registered_worktree` | 이 repository에 등록된 worktree입니다 |
+| `branch_matches` | 현재 branch가 기록된 branch와 같습니다 |
+| `toplevel_matches` | `rev-parse --show-toplevel`이 기록된 경로와 같습니다 |
+| `repository_matches` | `git-common-dir`가 대상 repository와 같습니다 |
+
+생성 직후 검증과 달리 **HEAD가 base revision과 같은지는 보지 않습니다.** 이미 작업이 진행돼 commit이 쌓였을 수 있고 그것은 정상입니다.
+
+하나라도 어긋나면 **자동으로 복구하거나 다시 만들지 않고** `workspace_recovery_required`로 거부합니다. 어떤 항목이 깨졌는지는 boolean으로만 event에 남기므로 절대 경로가 노출되지 않습니다.
 
 ### Ownership
 

@@ -22,8 +22,10 @@ from atlas.workspace import (
     PROTECTED_BRANCHES,
     WorkspaceError,
     WorkspacePlanner,
+    WorkspaceRecoveryRequired,
     branch_name,
     is_atlas_branch,
+    parse_github_remote,
     sanitize_segment,
 )
 from atlas.workspace_service import WorkspaceService
@@ -101,6 +103,66 @@ class PureNamingTest(unittest.TestCase):
 
     def test_redact_truncates(self):
         self.assertLessEqual(len(redact("x" * 5000)), 200)
+
+
+class RemoteIdentityTest(unittest.TestCase):
+    """remote는 suffix가 아니라 canonical owner/repo 정확 일치로 비교합니다."""
+
+    def test_https_remote_is_parsed(self):
+        self.assertEqual(
+            parse_github_remote("https://github.com/hongwon1031/atlas.git"),
+            ("github.com", "hongwon1031/atlas"),
+        )
+
+    def test_ssh_scp_remote_is_parsed(self):
+        self.assertEqual(
+            parse_github_remote("git@github.com:hongwon1031/atlas.git"),
+            ("github.com", "hongwon1031/atlas"),
+        )
+
+    def test_ssh_url_remote_is_parsed(self):
+        self.assertEqual(
+            parse_github_remote("ssh://git@github.com/hongwon1031/atlas.git"),
+            ("github.com", "hongwon1031/atlas"),
+        )
+
+    def test_git_suffix_is_optional(self):
+        self.assertEqual(
+            parse_github_remote("https://github.com/hongwon1031/atlas"),
+            ("github.com", "hongwon1031/atlas"),
+        )
+
+    def test_credentials_in_url_do_not_confuse_the_host(self):
+        self.assertEqual(
+            parse_github_remote("https://user:token@github.com/hongwon1031/atlas.git"),
+            ("github.com", "hongwon1031/atlas"),
+        )
+
+    def test_port_is_stripped(self):
+        self.assertEqual(
+            parse_github_remote("ssh://git@github.com:22/hongwon1031/atlas.git"),
+            ("github.com", "hongwon1031/atlas"),
+        )
+
+    def test_extra_path_segments_are_refused(self):
+        """suffix 비교였다면 통과했을 URL입니다."""
+
+        self.assertIsNone(
+            parse_github_remote("https://github.com/evil/hongwon1031/atlas.git")
+        )
+
+    def test_missing_repo_segment_is_refused(self):
+        self.assertIsNone(parse_github_remote("https://github.com/hongwon1031"))
+
+    def test_local_path_is_refused(self):
+        self.assertIsNone(parse_github_remote("/local/path/repo"))
+        self.assertIsNone(parse_github_remote(""))
+
+    def test_other_host_is_parsed_but_not_github(self):
+        host, slug = parse_github_remote("https://gitlab.com/hongwon1031/atlas.git")
+
+        self.assertEqual(slug, "hongwon1031/atlas")
+        self.assertNotIn(host, ("github.com", "www.github.com"))
 
 
 class WorkspaceConfigTest(unittest.TestCase):
@@ -217,6 +279,60 @@ class RepositoryResolutionTest(GitBackedTestCase):
             planner.verify_remote()
 
         self.assertEqual(caught.exception.category, "repository_mismatch")
+
+
+    def test_https_remote_matching_task_repository_is_accepted(self):
+        git("remote", "add", "origin", "https://github.com/hongwon1031/atlas.git", cwd=self.repo)
+        planner = WorkspacePlanner(self.repo, self.workspaces, repository="hongwon1031/atlas")
+
+        self.assertIsNotNone(planner.verify_remote())
+
+    def test_ssh_remote_matching_task_repository_is_accepted(self):
+        git("remote", "add", "origin", "git@github.com:hongwon1031/atlas.git", cwd=self.repo)
+        planner = WorkspacePlanner(self.repo, self.workspaces, repository="hongwon1031/atlas")
+
+        self.assertIsNotNone(planner.verify_remote())
+
+    def test_different_repository_is_refused(self):
+        git("remote", "add", "origin", "https://github.com/someone/other.git", cwd=self.repo)
+        planner = WorkspacePlanner(self.repo, self.workspaces, repository="hongwon1031/atlas")
+
+        with self.assertRaises(WorkspaceError) as caught:
+            planner.verify_remote()
+
+        self.assertEqual(caught.exception.category, "repository_mismatch")
+
+    def test_suffix_lookalike_remote_is_refused(self):
+        """endswith 비교였다면 통과했을 URL입니다."""
+
+        git(
+            "remote", "add", "origin",
+            "https://github.com/evil/hongwon1031/atlas.git", cwd=self.repo,
+        )
+        planner = WorkspacePlanner(self.repo, self.workspaces, repository="hongwon1031/atlas")
+
+        with self.assertRaises(WorkspaceError) as caught:
+            planner.verify_remote()
+
+        self.assertEqual(caught.exception.category, "remote_not_github")
+
+    def test_non_github_host_is_refused(self):
+        git("remote", "add", "origin", "https://gitlab.com/hongwon1031/atlas.git", cwd=self.repo)
+        planner = WorkspacePlanner(self.repo, self.workspaces, repository="hongwon1031/atlas")
+
+        with self.assertRaises(WorkspaceError) as caught:
+            planner.verify_remote()
+
+        self.assertEqual(caught.exception.category, "remote_not_github")
+
+    def test_malformed_remote_is_refused(self):
+        git("remote", "add", "origin", "not-a-url", cwd=self.repo)
+        planner = WorkspacePlanner(self.repo, self.workspaces, repository="hongwon1031/atlas")
+
+        with self.assertRaises(WorkspaceError) as caught:
+            planner.verify_remote()
+
+        self.assertEqual(caught.exception.category, "remote_not_github")
 
 
 class WorkspaceCreationTest(GitBackedTestCase):
@@ -456,6 +572,136 @@ class IdempotencyTest(GitBackedTestCase):
         self.assertFalse(result.created)
         self.assertEqual(result.run.branch, created.run.branch)
         self.assertEqual(result.run.worktree_path, created.run.worktree_path)
+
+
+class ReadyRevalidationTest(GitBackedTestCase):
+    """READY 기록만 믿고 stale/corrupted workspace를 정상으로 돌려주면 안 됩니다.
+
+    다음 executor slice가 이 결과를 process cwd로 신뢰할 예정입니다.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.run = self.new_run()
+        self.service.create(self.run.run_id)
+        self.stored = self.store.run(self.run.run_id)
+
+    def reopened_service(self):
+        """restart 후 상태를 재현합니다."""
+
+        self.store.close()
+        store = TaskStore(self.db)
+        self.addCleanup(store.close)
+        self.store = store
+        return WorkspaceService(store, self.planner), store
+
+    def test_healthy_workspace_is_reidentified_after_restart(self):
+        service, _ = self.reopened_service()
+
+        result = service.create(self.run.run_id)
+
+        self.assertFalse(result.created)
+        self.assertEqual(result.run.branch, self.stored.branch)
+        self.assertEqual(result.run.worktree_path, self.stored.worktree_path)
+        self.assertTrue(result.validation["checks"]["branch_matches"])
+
+    def test_missing_worktree_is_not_returned_as_success(self):
+        shutil.rmtree(self.stored.worktree_path)
+        service, _ = self.reopened_service()
+
+        with self.assertRaises(WorkspaceRecoveryRequired) as caught:
+            service.create(self.run.run_id)
+
+        self.assertEqual(caught.exception.category, "workspace_recovery_required")
+        self.assertIn("path_exists", caught.exception.evidence()["failed_checks"])
+
+    def test_wrong_branch_is_not_returned_as_success(self):
+        git("checkout", "-b", "someone-else", cwd=self.stored.worktree_path)
+        service, _ = self.reopened_service()
+
+        with self.assertRaises(WorkspaceRecoveryRequired) as caught:
+            service.create(self.run.run_id)
+
+        self.assertIn("branch_matches", caught.exception.evidence()["failed_checks"])
+
+    def test_wrong_repository_is_not_returned_as_success(self):
+        """기록된 경로가 다른 repository의 worktree면 거부해야 합니다."""
+
+        other_repo = self.root / "other"
+        make_repo(other_repo)
+        hijacked = self.workspaces / "hijacked"
+        git("worktree", "add", "-b", "atlas/x/y", str(hijacked), "main", cwd=other_repo)
+        self.store._connection.execute(
+            "UPDATE runs SET worktree_path = ?, branch = ? WHERE run_id = ?",
+            (str(hijacked.resolve()), "atlas/x/y", self.run.run_id),
+        )
+        self.store._connection.commit()
+        service, _ = self.reopened_service()
+
+        with self.assertRaises(WorkspaceRecoveryRequired) as caught:
+            service.create(self.run.run_id)
+
+        failed = caught.exception.evidence()["failed_checks"]
+        self.assertTrue({"repository_matches", "registered_worktree"} & set(failed))
+
+    def test_unregistered_directory_is_not_returned_as_success(self):
+        """경로만 존재하고 git worktree가 아닌 경우입니다."""
+
+        shutil.rmtree(self.stored.worktree_path)
+        Path(self.stored.worktree_path).mkdir(parents=True)
+        service, _ = self.reopened_service()
+
+        with self.assertRaises(WorkspaceRecoveryRequired):
+            service.create(self.run.run_id)
+
+    def test_mismatch_is_not_auto_repaired(self):
+        shutil.rmtree(self.stored.worktree_path)
+        service, store = self.reopened_service()
+
+        with self.assertRaises(WorkspaceRecoveryRequired):
+            service.create(self.run.run_id)
+
+        after = store.run(self.run.run_id)
+        self.assertEqual(after.workspace_status, WorkspaceStatus.READY)
+        self.assertEqual(after.branch, self.stored.branch)
+        self.assertFalse(Path(self.stored.worktree_path).exists())
+        self.assertTrue(GitRunner(self.repo).branch_exists(self.stored.branch))
+
+    def test_mismatch_records_redacted_evidence(self):
+        shutil.rmtree(self.stored.worktree_path)
+        service, store = self.reopened_service()
+
+        with self.assertRaises(WorkspaceRecoveryRequired):
+            service.create(self.run.run_id)
+
+        rows = [r for r in store.events() if r["kind"] == "workspace_recovery_required"]
+        self.assertEqual(len(rows), 1)
+        detail = rows[0]["detail"]
+        self.assertIn("failed_checks", detail)
+        # 절대 경로가 event에 남지 않아야 합니다.
+        self.assertNotIn(str(self.root), detail)
+
+    def test_progressed_work_does_not_fail_revalidation(self):
+        """작업이 진행돼 HEAD가 base에서 움직여도 정상입니다."""
+
+        worktree = Path(self.stored.worktree_path)
+        (worktree / "work.txt").write_text("작업\n", encoding="utf-8")
+        git("add", "work.txt", cwd=worktree)
+        git("-c", "user.email=t@e.com", "-c", "user.name=T", "commit", "-m", "wip", cwd=worktree)
+        service, _ = self.reopened_service()
+
+        result = service.create(self.run.run_id)
+
+        self.assertFalse(result.created)
+        self.assertTrue(result.validation["checks"]["branch_matches"])
+
+    def test_revalidation_does_not_create_a_second_worktree(self):
+        before = len(GitRunner(self.repo).worktrees())
+        service, _ = self.reopened_service()
+
+        service.create(self.run.run_id)
+
+        self.assertEqual(len(GitRunner(self.repo).worktrees()), before)
 
 
 class CleanupTest(GitBackedTestCase):

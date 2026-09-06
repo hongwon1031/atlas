@@ -149,3 +149,12 @@ heartbeat를 남기고 프로세스가 사라진 상황을 재현했습니다.
 - 여러 Project를 동시에 다룰 때 worker root 분리.
 - push, PR 생성 등 remote를 건드리는 동작. 전부 non-goal입니다.
 - Windows 외 플랫폼에서의 symlink escape 동작. 이 검증은 Windows에서 수행했습니다.
+
+### 2026-09-06 추가 — READY workspace 재검증과 remote identity
+
+PR #9 리뷰에서 지적된 두 건을 수정하고 다시 검증했습니다.
+
+- **READY 재검증**: `workspace_status`가 `ready`여도 실제 git 상태를 다시 확인합니다. restart 후 worktree 삭제, branch 변경, 다른 repository의 worktree로 경로 교체, git worktree가 아닌 빈 디렉터리 네 가지 상황에서 `create()`가 성공을 반환하지 않는 것을 확인했습니다. 불일치 시 상태를 바꾸거나 리소스를 지우지 않고 `workspace_recovery_required` event에 boolean 근거만 남깁니다. 작업이 진행돼 HEAD가 base에서 움직인 경우는 정상으로 통과합니다.
+- **remote identity**: canonical `owner/repo` 정확 일치로 바꿨습니다. `https://github.com/evil/hongwon1031/atlas.git`처럼 suffix 비교였다면 통과했을 URL이 거부되는 것을 확인했습니다. HTTPS, SSH(scp 형식과 ssh:// 형식), credential 포함 URL, port 포함 URL을 모두 parsing합니다.
+
+두 수정을 일시 제거하면 회귀 테스트 11건이 실패하고 복원하면 통과하는 것을 확인했습니다.

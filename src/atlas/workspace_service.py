@@ -22,7 +22,12 @@ from typing import Any
 from .gitcmd import GitError
 from .schema import Run, RunStatus, WorkspaceStatus
 from .store import RunError, TaskStore, WorkspaceConflict
-from .workspace import WorkspaceError, WorkspacePlanner, is_atlas_branch
+from .workspace import (
+    WorkspaceError,
+    WorkspacePlanner,
+    WorkspaceRecoveryRequired,
+    is_atlas_branch,
+)
 
 # Cleanup Matrix: 어떤 종료 상태에서 branch를 남길지.
 # 작업 내용이 남아 있을 수 있으므로 기본은 보수적으로 보존입니다.
@@ -87,13 +92,17 @@ class WorkspaceService:
             raise RunError("run_not_found", f"{run_id}를 찾을 수 없습니다.")
 
         if run.workspace_status is WorkspaceStatus.READY:
-            # process 재시작 후에도 DB 기록으로 기존 workspace를 재식별합니다.
-            return WorkspaceResult(run=run, created=False)
+            # DB 기록만 믿지 않습니다. executor가 이 경로를 cwd로 신뢰할
+            # 예정이므로 stale하거나 손상된 workspace를 정상으로 돌려주면
+            # 안 됩니다. 실제 git 상태를 다시 확인합니다.
+            return WorkspaceResult(
+                run=run, created=False, validation=self._revalidate(run)
+            )
 
         plan = self._planner.plan(run_id, run.task_id, base_branch=run.base_branch)
 
         try:
-            prepared = self._store.begin_workspace(
+            self._store.begin_workspace(
                 run_id,
                 branch=plan.branch,
                 worktree_path=plan.worktree_path,
@@ -101,8 +110,14 @@ class WorkspaceService:
                 base_revision=plan.base_revision,
             )
         except WorkspaceConflict as conflict:
+            # 경쟁적으로 다른 호출이 먼저 READY로 만들었을 수 있습니다. 이
+            # 경로에서도 DB 기록만 믿지 않고 실제 상태를 재검증합니다.
             if conflict.run is not None and conflict.run.workspace_status is WorkspaceStatus.READY:
-                return WorkspaceResult(run=conflict.run, created=False)
+                return WorkspaceResult(
+                    run=conflict.run,
+                    created=False,
+                    validation=self._revalidate(conflict.run),
+                )
             raise
 
         try:
@@ -124,6 +139,29 @@ class WorkspaceService:
 
         attached = self._store.attach_workspace(run_id, evidence={"head": validation["head"]})
         return WorkspaceResult(run=attached, created=True, validation=validation)
+
+    def _revalidate(self, run: Run) -> dict[str, Any]:
+        """READY workspace를 재사용하기 전에 실제 상태를 확인합니다.
+
+        불일치는 자동 복구하지 않고 근거를 남긴 뒤 거부합니다.
+        """
+
+        if not run.branch or not run.worktree_path:
+            evidence = {"category": "workspace_recovery_required", "checks": {"record": False}}
+            self._store.record_workspace_event(
+                run.run_id, "workspace_recovery_required", evidence
+            )
+            raise WorkspaceRecoveryRequired(
+                "READY로 기록됐지만 branch나 경로가 없습니다.", {"record": False}
+            )
+
+        try:
+            return self._planner.validate_existing(run.branch, run.worktree_path)
+        except WorkspaceRecoveryRequired as error:
+            self._store.record_workspace_event(
+                run.run_id, "workspace_recovery_required", error.evidence()
+            )
+            raise
 
     def show(self, run_id: str) -> dict[str, Any]:
         """DB 기록과 실제 디스크 상태를 함께 돌려줍니다."""
