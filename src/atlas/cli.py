@@ -257,6 +257,12 @@ def build_parser() -> argparse.ArgumentParser:
     validation_start.add_argument(
         "--step-timeout", type=_positive_float, default=None, help="step 하나의 초 단위 timeout"
     )
+    validation_start.add_argument(
+        "--trust",
+        choices=("untrusted", "trusted"),
+        default=None,
+        help="repository 코드 실행 허용 여부. 기본값은 ATLAS_VALIDATION_TRUST",
+    )
     subparsers.add_parser(
         "validation-show",
         parents=[common, executor_common],
@@ -746,6 +752,8 @@ def _validation_pipeline(store: TaskStore, config: WorkerConfig) -> "ValidationP
         logs_root,
         config.run,
         git_timeout_seconds=config.workspace.git_timeout_seconds,
+        trusted_repositories=config.validation.trusted_repositories,
+        trust_policy=config.validation.trust_policy,
     )
 
 
@@ -757,6 +765,8 @@ def _run_validation_start(args: argparse.Namespace, config: WorkerConfig) -> int
 
     from .validation_pipeline import ValidationGateFailed
 
+    if trust := _option(args, "trust", None):
+        config = replace(config, validation=replace(config.validation, trust_policy=trust))
     worker_id = args.worker_id or _default_worker_id()
     with TaskStore(config.database_path) as store:
         pipeline = _validation_pipeline(store, config)
@@ -764,7 +774,8 @@ def _run_validation_start(args: argparse.Namespace, config: WorkerConfig) -> int
             report = pipeline.validate(
                 args.run_id,
                 worker_id,
-                timeout_seconds=_option(args, "step_timeout", None),
+                timeout_seconds=_option(args, "step_timeout", None)
+                or config.validation.step_timeout_seconds,
                 max_output_bytes=config.executor.max_output_bytes,
             )
         except ValidationGateFailed as error:

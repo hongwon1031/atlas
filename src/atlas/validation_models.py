@@ -28,6 +28,9 @@ class ValidationStatus(str, Enum):
     # 시작하거나 진행하다 실패했습니다. 남은 process가 있을 수 있어
     # reconciliation 대상입니다.
     FAILED = "Failed"
+    # process가 아직 살아 있을 수 있어 결과를 확정할 수 없습니다. terminal이
+    # 아니며 reconciliation이 계속 봅니다. 자동으로 닫지 않습니다.
+    RECOVERY_REQUIRED = "RecoveryRequired"
 
     @property
     def is_terminal(self) -> bool:
@@ -35,7 +38,13 @@ class ValidationStatus(str, Enum):
 
     @property
     def is_active(self) -> bool:
-        return self in (ValidationStatus.STARTING, ValidationStatus.RUNNING)
+        """reconciliation이 계속 봐야 하는 상태."""
+
+        return self in (
+            ValidationStatus.STARTING,
+            ValidationStatus.RUNNING,
+            ValidationStatus.RECOVERY_REQUIRED,
+        )
 
 
 ACTIVE_VALIDATION_STATUSES: tuple[str, ...] = tuple(
@@ -74,10 +83,17 @@ class StepStatus(str, Enum):
     SKIPPED = "skipped"
     # 실행하려 했지만 수행하지 못했습니다. 통과로 볼 수 없습니다.
     ERROR = "error"
+    # 종료를 시도했지만 process가 사라졌다고 증명하지 못했습니다. 평범한
+    # error로 닫으면 살아 있는 process가 감사에서 사라집니다.
+    UNCONFIRMED = "unconfirmed"
 
     @property
     def blocks_success(self) -> bool:
-        return self in (StepStatus.FAILED, StepStatus.ERROR)
+        return self in (StepStatus.FAILED, StepStatus.ERROR, StepStatus.UNCONFIRMED)
+
+    @property
+    def process_may_be_alive(self) -> bool:
+        return self in (StepStatus.RUNNING, StepStatus.UNCONFIRMED)
 
 
 class ValidationOutcome(str, Enum):
@@ -107,6 +123,12 @@ class ValidationFailure(str, Enum):
     # 결과를 저장하기 전에 중단돼 상태를 확정할 수 없습니다.
     STATE_AMBIGUOUS = "validation_state_ambiguous"
     GATE_FAILED = "validation_gate_failed"
+    # 종료를 확인하지 못했습니다. 결과를 확정하지 않습니다.
+    TERMINATION_UNVERIFIED = "validation_termination_unverified"
+    # 실행 근거는 있으나 신뢰 정책이 없어 repository 코드를 돌리지 않았습니다.
+    TRUST_REQUIRED = "validation_trust_required"
+    # test runner가 대상 파일을 하나도 찾지 못했습니다.
+    NO_TESTS_EXECUTED = "validation_no_tests_executed"
 
 
 # docs/specs/task-state-machine.md의 Failure Taxonomy 어휘로만 옮깁니다.
@@ -123,6 +145,9 @@ VALIDATION_TO_RUN_CATEGORY: dict[ValidationFailure, str] = {
     ValidationFailure.PROCESS_FAILED: "transient_executor",
     ValidationFailure.STATE_AMBIGUOUS: "unknown",
     ValidationFailure.GATE_FAILED: "policy_violation",
+    ValidationFailure.TERMINATION_UNVERIFIED: "unknown",
+    ValidationFailure.TRUST_REQUIRED: "policy_violation",
+    ValidationFailure.NO_TESTS_EXECUTED: "validation_failed",
 }
 
 # step 종류별로 실패했을 때 쓸 분류.
@@ -148,6 +173,10 @@ class ValidationStep:
     name: str
     kind: StepKind
     required: bool
+    # 이 step이 **repository의 코드를 실행하는가**. shell을 쓰지 않는 것과
+    # repository 코드를 실행하지 않는 것은 전혀 다릅니다. 테스트는 import만으로
+    # 임의 코드를 돌리고, package script는 본문 자체가 임의 shell입니다.
+    executes_repository_code: bool = False
     # 왜 이 step을 선택했는지. 추측이 아니라 발견한 파일과 근거를 남깁니다.
     evidence: dict[str, Any] = field(default_factory=dict)
     argv: tuple[str, ...] = ()
@@ -168,6 +197,7 @@ class ValidationStep:
             "name": self.name,
             "kind": self.kind.value,
             "required": self.required,
+            "executes_repository_code": self.executes_repository_code,
             "argv": redact_argv(self.argv),
             "timeout_seconds": self.timeout_seconds,
             "evidence": self.evidence,
@@ -188,6 +218,8 @@ class ValidationPlan:
     ecosystem: str = "unknown"
     # 검증 근거로 발견한 파일과 설정.
     discovery: dict[str, Any] = field(default_factory=dict)
+    # repository 코드를 실행해도 되는가. 근거와 함께 남깁니다.
+    trust: dict[str, Any] = field(default_factory=dict)
 
     @property
     def required_steps(self) -> tuple[ValidationStep, ...]:
@@ -199,10 +231,25 @@ class ValidationPlan:
             step.kind is StepKind.TESTS and not step.skip_reason for step in self.steps
         )
 
+    @property
+    def active_steps(self) -> tuple[ValidationStep, ...]:
+        """repository 코드를 실행하는 step."""
+
+        return tuple(step for step in self.steps if step.executes_repository_code)
+
+    @property
+    def runs_repository_code(self) -> bool:
+        return any(
+            step.executes_repository_code and not (step.skip_reason or step.error_reason)
+            for step in self.steps
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "ecosystem": self.ecosystem,
             "discovery": self.discovery,
+            "trust": self.trust,
+            "runs_repository_code": self.runs_repository_code,
             "steps": [step.to_dict() for step in self.steps],
         }
 
@@ -297,6 +344,16 @@ def decide(
     results = tuple(results)
     warnings: list[str] = []
 
+    # 종료를 확인하지 못한 step이 하나라도 있으면 결과를 확정하지 않습니다.
+    # 실패로 닫아도 살아 있는 process가 감사에서 사라집니다.
+    unconfirmed = [r for r in results if r.status is StepStatus.UNCONFIRMED]
+    if unconfirmed:
+        return (
+            ValidationOutcome.AMBIGUOUS,
+            ValidationFailure.TERMINATION_UNVERIFIED,
+            tuple(warnings + [f"termination_unverified:{unconfirmed[0].name}"]),
+        )
+
     blocking = [result for result in results if result.blocks_success]
     if blocking:
         first = blocking[0]
@@ -305,6 +362,10 @@ def decide(
             failure = ValidationFailure.COMMAND_MISSING
         if first.reason == "timeout":
             failure = ValidationFailure.TIMEOUT
+        if first.reason == "no_tests_executed":
+            failure = ValidationFailure.NO_TESTS_EXECUTED
+        if first.reason == "test_runner_mismatch":
+            failure = ValidationFailure.NO_TESTS_EXECUTED
         return ValidationOutcome.FAILED, failure, tuple(warnings)
 
     for result in results:
@@ -316,5 +377,17 @@ def decide(
         # 않았다는 사실을 반드시 남깁니다.
         warnings.append("no_tests_discovered")
         warnings.append("validation_passed_with_no_tests")
+
+    skipped_active = [
+        result.name
+        for result in results
+        if result.status is StepStatus.SKIPPED
+        and result.reason == "active_validation_requires_trust"
+    ]
+    if skipped_active:
+        # repository 코드를 실행하지 않았습니다. "검증했다"가 아니라
+        # "정적 검사만 했다"는 뜻이고, 통과 근거로 착각하면 안 됩니다.
+        warnings.append("active_validation_skipped_untrusted")
+        warnings.append("validation_passed_static_only")
 
     return ValidationOutcome.PASSED, None, tuple(warnings)

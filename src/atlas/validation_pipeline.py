@@ -14,6 +14,7 @@ provider를 모릅니다. Claude가 만든 변경이든 사람이 만든 변경�
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -40,10 +41,16 @@ from .validation_models import (
     ValidationStepResult,
     decide,
 )
-from .validation_plan import build_plan
+from .validation_plan import TRUST_TRUSTED, TRUST_UNTRUSTED, build_plan
 from .workspace import WorkspaceRecoveryRequired
 from .workspace_service import WorkspaceService
-from .worktree_changes import WorktreeState, compare, safe_capture
+from .worktree_changes import (
+    WorktreeFingerprint,
+    WorktreeState,
+    compare,
+    safe_capture,
+    safe_fingerprint,
+)
 
 # validation process의 executor 이름. AI executor와 구분해야 감사 기록에서
 # "누가 무엇을 했는지"가 섞이지 않습니다.
@@ -96,7 +103,11 @@ class ValidationPipeline:
         config: RunConfig | None = None,
         runtime: LocalProcessExecutor | None = None,
         git_timeout_seconds: float = 30.0,
+        trusted_repositories: tuple[str, ...] = (),
+        trust_policy: str = TRUST_UNTRUSTED,
     ) -> None:
+        self._trusted_repositories = tuple(trusted_repositories)
+        self._trust_policy = trust_policy
         self._store = store
         self._workspaces = workspaces
         self._logs_root = Path(logs_root)
@@ -156,6 +167,23 @@ class ValidationPipeline:
 
         return GateResult(checks)
 
+    # -- 신뢰 정책 --------------------------------------------------------
+
+    def trust_for(self, run) -> tuple[bool, str]:
+        """이 Run의 repository 코드를 실행해도 되는지 판정합니다.
+
+        기본값은 신뢰하지 않는 쪽입니다. 실제 sandbox가 없으므로, 실행하면
+        repository 코드가 host에서 그대로 돕니다.
+        """
+
+        task = self._task_for(run)
+        repository = str(task.get("repository") or "")
+        if self._trust_policy == TRUST_TRUSTED:
+            return True, "trust_policy=trusted"
+        if repository and repository in self._trusted_repositories:
+            return True, f"trusted_repository:{repository}"
+        return False, f"untrusted_repository:{repository or 'unknown'}"
+
     # -- 실행 ------------------------------------------------------------
 
     def log_dir(self, run_id: str, validation_id: str) -> Path:
@@ -165,9 +193,12 @@ class ValidationPipeline:
         run = self._store.run(run_id)
         if run is None or not run.worktree_path:
             raise RunError("run_not_found", f"{run_id}의 worktree를 찾을 수 없습니다.")
+        trusted, reason = self.trust_for(run)
         return build_plan(
             run.worktree_path,
             timeout_seconds=timeout_seconds or DEFAULT_STEP_TIMEOUT_SECONDS,
+            trusted=trusted,
+            trust_reason=reason,
         )
 
     def validate(
@@ -191,8 +222,12 @@ class ValidationPipeline:
             )
 
         run = self._store.run(run_id)
+        trusted, trust_reason = self.trust_for(run)
         plan = build_plan(
-            run.worktree_path, timeout_seconds=timeout_seconds or DEFAULT_STEP_TIMEOUT_SECONDS
+            run.worktree_path,
+            timeout_seconds=timeout_seconds or DEFAULT_STEP_TIMEOUT_SECONDS,
+            trusted=trusted,
+            trust_reason=trust_reason,
         )
 
         validation_id = self._store.start_validation(
@@ -211,13 +246,30 @@ class ValidationPipeline:
             )
         except BaseException:
             # 결과를 저장하기 전에 중단됐습니다. 자동으로 성공 처리하지
-            # 않습니다. ambiguous로 남겨 사람이 판단합니다.
+            # 않습니다. 남은 process가 있을 수 있으면 terminal로 닫지 않고
+            # recovery 대상으로 남깁니다. Failed로 닫으면 살아 있는 process가
+            # reconciliation 범위에서 사라집니다.
+            live = self._store.running_validation_step(validation_id)
             self._store.finish_validation(
                 validation_id,
-                status=ValidationStatus.FAILED,
+                status=(
+                    ValidationStatus.RECOVERY_REQUIRED
+                    if live is not None
+                    else ValidationStatus.FAILED
+                ),
                 outcome=ValidationOutcome.AMBIGUOUS.value,
                 summary="결과를 저장하기 전에 중단됐습니다.",
                 failure_category=ValidationFailure.STATE_AMBIGUOUS.value,
+            )
+            self._store.record_validation_event(
+                validation_id,
+                run_id,
+                "validation_interrupted",
+                {
+                    "process_may_be_alive": live is not None,
+                    "step": live["name"] if live is not None else None,
+                    "process_id": live["process_id"] if live is not None else None,
+                },
             )
             raise
         finally:
@@ -235,6 +287,10 @@ class ValidationPipeline:
         self._persist(validation_id, report)
         self._apply_to_run(run_id, worker_id, report)
         return report
+
+    @staticmethod
+    def _has_live_process(report: ValidationReport) -> bool:
+        return any(result.status.process_may_be_alive for result in report.results)
 
     def _execute_plan(
         self,
@@ -409,14 +465,15 @@ class ValidationPipeline:
         )
         changes = compare(baseline_state, state, task, process_succeeded=True)
         baseline = self._implementation_baseline(run.run_id)
+        current = safe_fingerprint(run.worktree_path, self._git_timeout)
+        drift = self._detect_drift(baseline, changes, current)
 
-        drift = self._detect_drift(baseline, changes)
         status = StepStatus.PASSED
         reason = ""
         if changes.violations:
             status = StepStatus.FAILED
             reason = ",".join(changes.violations)
-        elif drift:
+        elif drift["changed"]:
             # 구현 이후 누군가 worktree를 바꿨습니다. 조용히 통과시키지
             # 않습니다.
             status = StepStatus.FAILED
@@ -437,21 +494,58 @@ class ValidationPipeline:
                 "changes": changes.to_dict(),
                 "implementation_baseline": baseline.get("changed_files") if baseline else None,
                 "drift": drift,
+                "fingerprint": current.to_dict(),
             },
         )
 
-    def _detect_drift(self, baseline: dict[str, Any] | None, changes) -> list[str]:
-        """구현 시점 evidence와 지금 변경 목록이 다른지 봅니다."""
+    def _detect_drift(
+        self,
+        baseline: dict[str, Any] | None,
+        changes,
+        current: WorktreeFingerprint,
+    ) -> dict[str, Any]:
+        """구현 시점 상태와 지금 상태가 같은지 봅니다.
+
+        **파일 이름 집합 비교로는 부족합니다.** 같은 파일의 내용만 바뀌면
+        이름 집합은 그대로라 변경을 놓칩니다. 그래서 내용 지문을 먼저 봅니다.
+
+        지문이 없는 예전 Run은 이름 비교로 물러서되, 그 사실을 근거에 남깁니다.
+        보장 수준이 다르기 때문입니다.
+        """
 
         if not baseline:
-            return []
-        recorded = set(baseline.get("changed_files") or ())
-        if not recorded:
-            return []
-        current = set(changes.changed_files)
-        added = sorted(current - recorded)
-        removed = sorted(recorded - current)
-        return [f"+{path}" for path in added] + [f"-{path}" for path in removed]
+            return {"changed": False, "method": "no_baseline", "paths": []}
+
+        recorded = WorktreeFingerprint.from_dict(baseline.get("fingerprint"))
+        if recorded is not None and current.computed:
+            same = current.matches(recorded)
+            return {
+                "changed": not same,
+                "method": "fingerprint",
+                "expected_digest": recorded.digest,
+                "actual_digest": current.digest,
+                "expected_head": recorded.head,
+                "actual_head": current.head,
+            }
+
+        # 지문을 쓸 수 없습니다. 이름 비교는 같은 파일의 내용 변경을 잡지
+        # 못하므로 보장이 약하다는 사실을 남깁니다.
+        names = set(baseline.get("changed_files") or ())
+        if not names:
+            return {
+                "changed": False,
+                "method": "unavailable",
+                "detail": current.reason or "fingerprint_missing",
+            }
+        now = set(changes.changed_files)
+        added = sorted(now - names)
+        removed = sorted(names - now)
+        return {
+            "changed": bool(added or removed),
+            "method": "filename_set",
+            "weaker_guarantee": True,
+            "paths": [f"+{p}" for p in added] + [f"-{p}" for p in removed],
+        }
 
     def _implementation_baseline(self, run_id: str) -> dict[str, Any] | None:
         """PR #11이 남긴 implementation evidence를 읽습니다."""
@@ -468,6 +562,7 @@ class ValidationPipeline:
                 "changed_files": changes.get("changed_files"),
                 "before": (changes.get("before") or {}),
                 "after": (changes.get("after") or {}),
+                "fingerprint": detail.get("fingerprint"),
             }
         return None
 
@@ -544,27 +639,52 @@ class ValidationPipeline:
                 ),
             )
 
-        self._store.record_validation_step(
-            validation_id,
-            run.run_id,
-            position=position,
-            name=step.name,
-            kind=step.kind.value,
-            required=step.required,
-            status=StepStatus.RUNNING.value,
-            command=redact_argv(step.argv),
-            evidence=step.evidence,
-            process_id=handle.pid,
-            process_identity=handle.identity.to_dict(),
-            process_started_at=handle.started_at,
-            started_at=to_iso(started),
-        )
+        try:
+            self._store.record_validation_step(
+                validation_id,
+                run.run_id,
+                position=position,
+                name=step.name,
+                kind=step.kind.value,
+                required=step.required,
+                status=StepStatus.RUNNING.value,
+                command=redact_argv(step.argv),
+                evidence=step.evidence,
+                process_id=handle.pid,
+                process_identity=handle.identity.to_dict(),
+                process_started_at=handle.started_at,
+                started_at=to_iso(started),
+            )
+        except Exception:  # noqa: BLE001
+            # process는 떴는데 identity를 저장하지 못했습니다. 이대로 두면
+            # 주인 없는 process가 됩니다. 최소한 근거를 남기고 실패시킵니다.
+            try:
+                self._store.record_validation_event(
+                    validation_id,
+                    run.run_id,
+                    "validation_process_attach_failed",
+                    {
+                        "step": step.name,
+                        "process_id": handle.pid,
+                        "detail": "process를 띄웠지만 identity를 저장하지 못했습니다.",
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            raise
 
         began = time.monotonic()
         result = self._runtime.wait(handle, request)
         duration = time.monotonic() - began
 
         status, reason = _classify(result)
+        if status is StepStatus.PASSED and step.kind is StepKind.TESTS:
+            # `unittest discover`는 대상 파일을 하나도 찾지 못해도 exit 0을
+            # 냅니다. 0건 실행을 통과로 취급하면 검증되지 않은 변경을
+            # 통과시킵니다.
+            executed = _tests_executed(result)
+            if executed is False:
+                status, reason = StepStatus.ERROR, "no_tests_executed"
         return self._record_result(
             validation_id,
             run.run_id,
@@ -625,14 +745,37 @@ class ValidationPipeline:
         return result
 
     def _persist(self, validation_id: str, report: ValidationReport) -> None:
+        """결과를 저장합니다.
+
+        종료를 확인하지 못한 step이 있으면 terminal로 닫지 않습니다. 살아 있을
+        수 있는 process가 감사와 reconciliation에서 사라지면 안 됩니다.
+        """
+
+        unconfirmed = self._has_live_process(report)
         self._store.finish_validation(
             validation_id,
-            status=ValidationStatus.FINISHED,
+            status=(
+                ValidationStatus.RECOVERY_REQUIRED
+                if unconfirmed
+                else ValidationStatus.FINISHED
+            ),
             outcome=report.outcome.value,
             summary=report.summary,
             warnings=report.warnings,
             failure_category=report.failure.value if report.failure else None,
         )
+        if unconfirmed:
+            self._store.record_validation_event(
+                validation_id,
+                report.run_id,
+                "validation_termination_unverified",
+                {
+                    "steps": [
+                        r.name for r in report.results if r.status.process_may_be_alive
+                    ],
+                    "detail": "종료를 확인하지 못했습니다. reconciliation 대상으로 남깁니다.",
+                },
+            )
 
     def _apply_to_run(self, run_id: str, worker_id: str, report: ValidationReport) -> None:
         """검증 결과로 Run을 확정합니다.
@@ -643,6 +786,20 @@ class ValidationPipeline:
 
         run = self._store.run(run_id)
         if run is None or run.status.is_terminal:
+            return
+
+        if report.outcome is ValidationOutcome.AMBIGUOUS:
+            # 결과를 확정할 수 없습니다. Run도 확정하지 않습니다. `Validating`은
+            # heartbeat 대상이라 stale 판정으로도 드러납니다.
+            self._store.record_validation_event(
+                report.validation_id,
+                run_id,
+                "validation_result_ambiguous",
+                {
+                    "failure": report.failure.value if report.failure else None,
+                    "summary": redact_line(report.summary),
+                },
+            )
             return
 
         if report.passed:
@@ -730,8 +887,14 @@ class ValidationPipeline:
 
 
 def _classify(result) -> tuple[StepStatus, str]:
-    """process 결과를 step 상태로 옮깁니다."""
+    """process 결과를 step 상태로 옮깁니다.
 
+    **종료 확인이 먼저입니다.** timeout이든 cancel이든 process가 사라졌다고
+    증명하지 못했으면 평범한 error로 닫지 않습니다.
+    """
+
+    if result.process_may_be_alive:
+        return StepStatus.UNCONFIRMED, f"termination_unverified:{result.termination.value}"
     if result.failure is ExecutorFailure.TIMEOUT:
         return StepStatus.ERROR, "timeout"
     if result.failure is ExecutorFailure.CANCELLED:
@@ -741,6 +904,23 @@ def _classify(result) -> tuple[StepStatus, str]:
     if result.exit_code == 0:
         return StepStatus.PASSED, ""
     return StepStatus.FAILED, f"exit_code={result.exit_code}"
+
+
+def _tests_executed(result) -> bool | None:
+    """테스트가 실제로 하나라도 실행됐는지 판단합니다.
+
+    stdlib `unittest`는 "Ran N tests"를 stderr에 씁니다. 판단할 근거가 없으면
+    `None`을 돌려주고 아무 것도 단정하지 않습니다.
+    """
+
+    text = ""
+    for stream in (result.stderr, result.stdout):
+        if stream is not None:
+            text += read_log_tail(stream.path, max_bytes=8192)
+    match = re.search(r"Ran (\d+) tests?", text)
+    if match is None:
+        return None
+    return int(match.group(1)) > 0
 
 
 def _output_summary(result) -> str:

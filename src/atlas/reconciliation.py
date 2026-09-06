@@ -253,7 +253,40 @@ class RunReconciler:
                     moment,
                 )
             )
+
+        # validation status만으로는 부족합니다. 결과를 terminal로 닫은 뒤에도
+        # 종료를 확인하지 못한 process가 남아 있을 수 있습니다.
+        seen = {f.get("validation_id") for f in findings}
+        for step in self._store.validation_steps_with_live_process():
+            if step["validation_id"] in seen:
+                continue
+            findings.append(self._live_step_finding(step, moment))
         return findings
+
+    def _live_step_finding(self, step: Any, moment: datetime) -> dict[str, Any]:
+        """terminal validation record에 남은 process를 판정합니다."""
+
+        identity = self._validation_identity(step)
+        verdict = verify(identity) if identity else IdentityVerdict.UNVERIFIABLE
+        detail = {
+            "validation_id": step["validation_id"],
+            "run_id": step["run_id"],
+            "kind": "validation_orphan_process",
+            "reason": "validation record는 닫혔는데 process가 남아 있을 수 있습니다.",
+            "validation_status": step["validation_status"],
+            "step": step["name"],
+            "step_status": step["status"],
+            "process_id": step["process_id"],
+            "identity_verdict": verdict.value,
+            # 증명하지 못한 process는 종료하지 않습니다.
+            "may_terminate": verdict.may_terminate,
+            "severity": "high" if verdict is IdentityVerdict.MATCH else "medium",
+        }
+        self._store.record_validation_event(
+            step["validation_id"], step["run_id"], "validation_orphan_process", detail,
+            now=moment,
+        )
+        return detail
 
     def _validation_finding(self, row: Any, moment: datetime) -> dict[str, Any]:
         step = self._store.running_validation_step(row["validation_id"])

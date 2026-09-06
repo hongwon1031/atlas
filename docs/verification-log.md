@@ -616,3 +616,104 @@ Atlas가 자기 자신의 전체 테스트를 격리된 worktree에서 실제로
 - step 단위 resume. ambiguous 상태 식별까지만 구현했습니다.
 - 매우 큰 repository에서의 소요 시간과 log 누적량.
 - 여러 validation을 동시에 수행했을 때의 자원 경쟁.
+
+### 2026-09-06 추가 — 코드 실행 신뢰 정책, 내용 지문, 종료 확인
+
+merge-blocking review 네 건을 고치고 다시 검증했습니다.
+
+#### validation이 임의 코드 실행 경로였던 문제
+
+`shell=False`는 Atlas가 shell wrapper를 거치지 않는다는 뜻일 뿐, **실행된 repository 코드를 격리하지 않습니다.** 환경변수를 줄이는 것도 sandbox가 아닙니다. executor에게 shell 도구를 주지 않았어도, executor가 test나 `package.json`을 고친 뒤 validation이 그것을 실행하면 그 제한이 무의미해집니다.
+
+이번 범위에서 실제 sandbox를 만들지 않았습니다. 대신 **명시적 신뢰 정책 뒤에** 두고, 문서가 실제 보장보다 강하게 주장하던 부분("network 사용 금지")을 정정했습니다.
+
+실제 Atlas repository로 확인했습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 기본 정책 | `untrusted` (fail closed) |
+| 코드 실행 step 식별 | `unittest`, `mypy` 2개 |
+| 기본 정책에서 차단 | 전부 `active_validation_requires_trust` |
+| argv 제거 | 확인. 계획에 명령이 남지 않음 |
+| required 여부 | 전부 optional로 내려감 |
+| 정적 step | `compileall` required 유지, `workspace-integrity`·`git-policy` 유지 |
+| 정적 step의 코드 실행 | 없음 |
+| sandbox 주장 | `sandboxed: false`, `network_denied: false` 명시 |
+| 신뢰 부여 후 | 테스트가 required로 실행 대상이 됨 |
+| dependency 설치 명령 | 양쪽 정책 모두 없음 |
+
+임시 repository 테스트에서 확인한 것입니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 악성 `package.json` test script (`powershell ... && curl ...`) | 기본 정책에서 실행되지 않음. argv에 `powershell`·`curl` 없음 |
+| Python 테스트 분류 | `executes_repository_code=True` |
+| 정적 검사만 통과한 결과 | `active_validation_skipped_untrusted`, `validation_passed_static_only` 경고 |
+| 신뢰 목록에 있는 repository | 실행 허용 |
+| 목록에 없는 repository | 기본 거부 |
+
+**Node package script는 신뢰 없이 실행하지 않습니다.** script 본문이 임의 shell 문자열이라 이름 allowlist로는 통제되지 않습니다.
+
+#### 같은 파일 내용만 바뀌면 drift를 놓치던 문제
+
+이전 구현은 `implementation_completed` event의 변경 파일 **이름 집합**만 비교했습니다. Claude가 `src/a.py`를 고치고 사람이 같은 파일을 다시 고치면 양쪽 다 `{"src/a.py"}`라 drift가 없었습니다. PR 본문이 주장하던 "구현 이후 수정 시 실패" 보장과 달랐습니다.
+
+내용 지문(SHA-256)으로 바꿨습니다. HEAD, branch, `git diff HEAD --binary`, untracked 파일의 경로와 내용을 모두 넣습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 같은 파일 내용만 변경 | 탐지 |
+| untracked 파일 내용만 변경 | 탐지 |
+| 파일 추가 | 탐지 |
+| 파일 삭제 | 탐지 |
+| 변경 없음 | 동일 지문 |
+| 되돌리면 | 원래 지문과 일치 |
+| 저장 내용 | digest와 개수만. raw source 없음 |
+| 지문 없는 예전 Run | 이름 비교로 물러서되 `weaker_guarantee: true` 기록 |
+
+#### 종료 미확인 process를 terminal로 숨기던 문제
+
+executor runtime의 invariant가 validation에 적용되지 않고 있었습니다. `_classify()`가 termination 확인 없이 timeout을 `error`로 바꿨고, validation record가 `Finished`/`Failed`로 닫히면 `active_validations()`(당시 `Starting`/`Running`만 조회)에서 사라졌습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 종료 미확인 timeout | step `unconfirmed`. 평범한 error로 닫지 않음 |
+| validation status | `RecoveryRequired`. terminal 아님 |
+| outcome | `ambiguous`, `validation_termination_unverified` |
+| Run 상태 | 확정하지 않음. `Validating` 유지 |
+| reconciliation | 계속 보임 |
+| 확인된 정상 timeout | 기존대로 `Finished` + Run `Failed` |
+| identity 불일치 | 종료하지 않음. process 생존 확인 |
+| spawn 후 attach 실패 | `validation_process_attach_failed` + `validation_interrupted` 기록, `RecoveryRequired` 유지 |
+| terminal validation record + 생존 process | `validation_orphan_process`로 탐지. 종료하지 않음 |
+
+**validation status만으로 reconciliation 범위를 정하지 않습니다.** process identity가 기록된 step 자체를 기준으로도 훑습니다.
+
+#### unittest 0건 실행 문제
+
+`unittest discover`는 기본 pattern(`test*.py`)에 맞는 파일이 없어도 "Ran 0 tests"로 exit 0을 냅니다. pytest 형식(`*_test.py`)만 있는 repository가 조용히 통과할 수 있었습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 계획 시점 pattern 불일치 | `test_runner_mismatch`로 required error |
+| 실행 후 0건 | `no_tests_executed`로 되돌림 |
+| Run 결과 | `Failed(validation_no_tests_executed)` |
+| 파일이 아예 없는 경우 | 기존대로 `no_tests_discovered` skip |
+
+#### 회귀 테스트가 실제로 잡는지 확인
+
+네 수정을 각각 되돌리고 다시 돌렸습니다. **11건이 실패**했고 복원하니 전부 통과했습니다.
+
+#### 재실행한 검증
+
+- 전체 테스트 통과
+- `compileall` (src, tests) 통과
+- **real Atlas validation smoke 재실행 통과** — 신뢰를 부여한 상태에서 Atlas 자체 테스트 372초 exit 0, `Succeeded` 확정, main 무오염, commit 없음, credential 흔적 없음
+- 실제 Atlas repository로 신뢰 정책·지문 smoke 통과
+- secret scan, `git diff --check` 통과
+
+#### 확인하지 못한 항목
+
+- **실제 sandbox는 만들지 않았습니다.** filesystem 경계, process spawn 제한, network deny를 강제하지 않습니다. 신뢰 정책이 유일한 통제입니다.
+- 신뢰를 부여한 repository에서 악성 코드가 실제로 host에 미치는 영향은 검증 대상이 아닙니다. 그 경우 통제 수단이 없습니다.
+- 앞 절의 미확인 항목(POSIX, Node 실제 실행, pytest·ruff·mypy·pyright 실행 경로)이 그대로 남습니다.

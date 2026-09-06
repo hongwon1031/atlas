@@ -100,6 +100,8 @@ python -m atlas reconcile
 | `ATLAS_CLAUDE_MODEL` | (CLI 기본값) | Claude 모델 |
 | `ATLAS_CLAUDE_PERMISSION_MODE` | `acceptEdits` | Claude 권한 모드. allowlist 밖 값은 거부됩니다 |
 | `ATLAS_CLAUDE_TOOLS` | `Read,Edit,Write,Glob,Grep` | Claude에 허용할 도구. safe set의 subset만 허용하고 shell 계열은 거부됩니다 |
+| `ATLAS_VALIDATION_TRUST` | `untrusted` | validation이 repository 코드를 실행해도 되는지 |
+| `ATLAS_TRUSTED_REPOSITORIES` | (없음) | 신뢰하는 `owner/name` 목록 |
 | `ATLAS_EXECUTOR_GRACE_SECONDS` | `5` | graceful 종료 후 강제 종료까지 |
 | `ATLAS_EXECUTOR_MAX_OUTPUT_BYTES` | `1048576` | stdout/stderr 각각의 최대 저장 크기 |
 | `ATLAS_DISABLE_QUEUE_LABEL` | 미설정 | approval gate 해제. 신뢰된 repository에서만 사용 |
@@ -196,6 +198,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 - 구현이 끝나면 Run은 `AwaitingValidation`으로 가고, `validation-start`가 `Validating`을 거쳐 `Succeeded` 또는 `Failed`로 확정합니다.
 - **validation은 repository에서 발견한 근거로만 명령을 고릅니다.** 테스트가 없는 repository는 `no_tests_discovered` 경고와 함께 통과할 수 있습니다. "검증했다"가 아니라 "검증할 것이 없었다"는 뜻입니다.
 - validation은 dependency를 설치하지 않습니다. 필요한 도구가 없으면 계획 근거의 강도에 따라 `skipped` 또는 `error`로 보고합니다.
+- **validation은 repository 코드를 sandbox 없이 실행합니다.** 기본 정책은 `untrusted`이며 이 경우 정적 검사만 수행합니다. 테스트와 package script를 실행하려면 `ATLAS_VALIDATION_TRUST=trusted` 또는 `ATLAS_TRUSTED_REPOSITORIES`로 명시적으로 신뢰를 부여해야 합니다. network 차단이나 filesystem 격리는 **하지 않습니다.**
 - lint와 typecheck는 repository contract가 있을 때만 required입니다. `pyproject.toml`의 `[tool.X]` table만 있는 경우는 약한 근거로 보고 도구가 없으면 건너뜁니다.
 - allowed path 위반은 **탐지하고 기록만** 합니다. 자동으로 되돌리지 않습니다.
 - executor log는 redaction을 거쳐 저장되므로 원본과 byte 단위로 같지 않습니다. binary 출력은 UTF-8 대체 문자가 됩니다.

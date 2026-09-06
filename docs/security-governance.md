@@ -93,11 +93,32 @@ provider의 구조화된 출력을 해석해야 할 때는 **저장본이 아니
 
 ### Validation process
 
-- 검증 명령은 repository에서 발견한 근거로만 선택합니다. 사용자 입력이나 임의 텍스트가 명령에 들어가지 않습니다.
-- `shell=True`를 쓰지 않고 argv list로만 실행합니다. `package.json`의 script 본문을 직접 실행하지 않고 package manager에 맡깁니다.
-- **dependency를 설치하지 않습니다.** 도구가 없으면 없다고 보고합니다.
-- 검증 process에는 executor에 주었던 credential 환경을 넘기지 않습니다. OS 기본 allowlist만 씁니다.
-- 검증 출력도 기존 redaction boundary를 그대로 거칩니다. event에는 전체 출력을 저장하지 않고 요약만 남깁니다.
+**검증은 repository의 코드를 실제로 실행합니다. 격리하지 않습니다.**
+
+`shell=True`를 쓰지 않는 것은 Atlas가 shell wrapper를 거치지 않는다는 뜻일 뿐이고, 환경변수를 줄이는 것도 sandbox가 아닙니다. 실행된 코드는 subprocess를 띄우고 network에 접속하고 host filesystem에 접근할 수 있습니다. Python 테스트는 import만으로, `npm run`은 script 본문으로, mypy는 plugin으로 임의 코드를 실행합니다.
+
+executor에게 shell 도구를 주지 않았더라도, executor가 test나 `package.json`을 고친 뒤 validation이 그것을 실행하면 그 제한을 우회하는 경로가 됩니다.
+
+그래서 **명시적 신뢰 정책 뒤에** 둡니다.
+
+- 기본값은 `untrusted`이고 fail closed입니다.
+- `untrusted`에서는 repository 코드를 실행하지 않는 step만 수행합니다. Node package script는 신뢰 없이 실행하지 않습니다.
+- 신뢰는 `ATLAS_VALIDATION_TRUST=trusted` 또는 명시적 repository 목록으로만 부여합니다.
+- 정적 검사만 수행한 결과에는 그 사실을 경고 evidence로 남깁니다.
+
+Atlas가 지키는 것과 지키지 않는 것을 나눠 적습니다.
+
+| 항목 | 보장 |
+| --- | --- |
+| shell wrapper 미사용, argv list | 예 |
+| 명령 선택이 repository 근거 기반 | 예 |
+| 사용자 텍스트가 명령에 들어가지 않음 | 예 |
+| dependency 설치 안 함 | 예 |
+| provider credential 환경 미전달 | 예 |
+| 출력 redaction | 예 |
+| **실행된 코드의 network 차단** | **아니오** |
+| **실행된 코드의 filesystem 경계** | **아니오** |
+| **실행된 코드의 subprocess 제한** | **아니오** |
 
 ### Provider credential
 

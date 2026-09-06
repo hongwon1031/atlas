@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import posixpath
 from dataclasses import dataclass, field
 from enum import Enum
@@ -225,6 +226,157 @@ def compare(
         before=before,
         after=after,
     )
+
+
+@dataclass(frozen=True)
+class WorktreeFingerprint:
+    """worktree 내용의 지문.
+
+    **파일 이름 목록만으로는 부족합니다.** 같은 파일의 내용만 바뀌면 이름
+    집합은 그대로라 변경을 놓칩니다. 그래서 tracked 변경은 patch 바이트로,
+    untracked 파일은 내용 해시로 요약합니다.
+
+    raw source를 저장하지 않습니다. 남는 것은 digest와 개수뿐입니다.
+    """
+
+    head: str
+    branch: str
+    digest: str
+    tracked_bytes: int = 0
+    untracked_files: int = 0
+    computed: bool = True
+    reason: str = ""
+
+    def matches(self, other: "WorktreeFingerprint | None") -> bool:
+        if other is None or not (self.computed and other.computed):
+            return False
+        return (
+            self.head == other.head
+            and self.branch == other.branch
+            and self.digest == other.digest
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "head": self.head,
+            "branch": self.branch,
+            "digest": self.digest,
+            "tracked_bytes": self.tracked_bytes,
+            "untracked_files": self.untracked_files,
+            "computed": self.computed,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "WorktreeFingerprint | None":
+        if not isinstance(payload, dict) or not payload.get("digest"):
+            return None
+        return cls(
+            head=str(payload.get("head") or ""),
+            branch=str(payload.get("branch") or ""),
+            digest=str(payload["digest"]),
+            tracked_bytes=int(payload.get("tracked_bytes") or 0),
+            untracked_files=int(payload.get("untracked_files") or 0),
+            computed=bool(payload.get("computed", True)),
+            reason=str(payload.get("reason") or ""),
+        )
+
+
+def fingerprint(
+    worktree: Path | str, timeout_seconds: float = 30.0
+) -> WorktreeFingerprint:
+    """worktree 내용을 SHA-256 지문으로 요약합니다.
+
+    포함하는 것입니다.
+
+    - HEAD revision과 branch
+    - `git diff HEAD --binary` 결과. tracked 파일의 추가·수정·삭제·mode 변경이
+      모두 들어갑니다.
+    - untracked 파일의 경로와 내용 해시
+
+    포함하지 않는 것은 raw source입니다. 지문만 남깁니다.
+    """
+
+    git = GitRunner(worktree, timeout_seconds=timeout_seconds)
+    digest = hashlib.sha256()
+    try:
+        head = git.head_revision()
+        branch = git.current_branch()
+    except (GitError, OSError) as error:
+        return WorktreeFingerprint(
+            head="", branch="", digest="", computed=False,
+            reason=f"git_unreadable:{type(error).__name__}",
+        )
+
+    digest.update(head.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(branch.encode("utf-8"))
+    digest.update(b"\x00")
+
+    tracked_bytes = 0
+    try:
+        # patch 표현을 그대로 씁니다. 같은 파일의 내용 변경도 여기서 드러납니다.
+        patch = git.run(
+            "diff", "HEAD", "--binary", "--no-color", "--no-ext-diff"
+        ).stdout
+        raw = patch.encode("utf-8", errors="replace") if isinstance(patch, str) else patch
+        tracked_bytes = len(raw)
+        digest.update(raw)
+    except (GitError, OSError) as error:
+        return WorktreeFingerprint(
+            head=head, branch=branch, digest="", computed=False,
+            reason=f"diff_unreadable:{type(error).__name__}",
+        )
+
+    untracked = 0
+    try:
+        listed = git.run(
+            "ls-files", "--others", "--exclude-standard"
+        ).lines()
+    except (GitError, OSError) as error:
+        return WorktreeFingerprint(
+            head=head, branch=branch, digest="", computed=False,
+            reason=f"untracked_unreadable:{type(error).__name__}",
+        )
+
+    base = Path(worktree)
+    for relative in sorted(listed):
+        cleaned = relative.strip().strip('"')
+        if not cleaned:
+            continue
+        untracked += 1
+        digest.update(b"\x01")
+        digest.update(cleaned.encode("utf-8"))
+        digest.update(b"\x00")
+        try:
+            with open(base / cleaned, "rb") as handle:
+                for chunk in iter(lambda: handle.read(65_536), b""):
+                    digest.update(chunk)
+        except OSError:
+            # 읽지 못한 파일도 사실입니다. 무시하지 않고 지문에 반영합니다.
+            digest.update(b"<unreadable>")
+
+    return WorktreeFingerprint(
+        head=head,
+        branch=branch,
+        digest=digest.hexdigest(),
+        tracked_bytes=tracked_bytes,
+        untracked_files=untracked,
+    )
+
+
+def safe_fingerprint(
+    worktree: Path | str, timeout_seconds: float = 30.0
+) -> WorktreeFingerprint:
+    """지문을 계산하지 못해도 실행을 중단시키지 않습니다."""
+
+    try:
+        return fingerprint(worktree, timeout_seconds=timeout_seconds)
+    except (GitError, OSError) as error:
+        return WorktreeFingerprint(
+            head="", branch="", digest="", computed=False,
+            reason=f"unexpected:{type(error).__name__}",
+        )
 
 
 def safe_capture(worktree: Path | str, timeout_seconds: float = 30.0) -> WorktreeState | None:

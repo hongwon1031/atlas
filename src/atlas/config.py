@@ -20,6 +20,8 @@ DEFAULT_LOGS_DIRNAME = ".atlas/logs"
 # docs/specs/issue-command-contract.md의 queue 의도 label.
 QUEUE_LABEL = "atlas:queued"
 
+from .validation_plan import TRUST_POLICIES, TRUST_UNTRUSTED
+
 # 선택 가능한 executor adapter. provider 옵션은 여기 두지 않고 adapter
 # 경계(`claude_code.py`)에 둡니다.
 EXECUTOR_KINDS = frozenset({"mock", "claude"})
@@ -170,6 +172,30 @@ class ExecutorConfig:
 
 
 @dataclass(frozen=True)
+class ValidationConfig:
+    """검증 실행 정책.
+
+    검증은 repository의 코드를 실제로 실행합니다. `shell=False`는 sandbox가
+    아니고 환경변수를 줄이는 것도 sandbox가 아닙니다. 그래서 기본값은
+    신뢰하지 않는 쪽입니다.
+    """
+
+    # `untrusted`면 repository 코드를 실행하는 step을 계획에서 제거합니다.
+    trust_policy: str = TRUST_UNTRUSTED
+    # 명시적으로 신뢰하는 repository. `owner/name` 형식입니다.
+    trusted_repositories: tuple[str, ...] = ()
+    step_timeout_seconds: float = 900.0
+
+    def __post_init__(self) -> None:
+        if self.trust_policy not in TRUST_POLICIES:
+            raise ValueError(
+                f"알 수 없는 validation trust policy: {self.trust_policy!r}. "
+                f"가능한 값: {', '.join(sorted(TRUST_POLICIES))}"
+            )
+        _require_positive("step_timeout_seconds", self.step_timeout_seconds)
+
+
+@dataclass(frozen=True)
 class WorkerConfig:
     database_path: str = DEFAULT_DATABASE_PATH
     polling: PollingConfig = field(default_factory=PollingConfig)
@@ -177,6 +203,7 @@ class WorkerConfig:
     run: RunConfig = field(default_factory=RunConfig)
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     executor: ExecutorConfig = field(default_factory=ExecutorConfig)
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> WorkerConfig:
@@ -222,6 +249,19 @@ class WorkerConfig:
         if limit := _read_float(env, "ATLAS_EXECUTOR_MAX_OUTPUT_BYTES"):
             executor = replace(executor, max_output_bytes=int(limit))
 
+        validation = config.validation
+        if policy := env.get("ATLAS_VALIDATION_TRUST", "").strip().lower():
+            validation = replace(validation, trust_policy=policy)
+        if repos := env.get("ATLAS_TRUSTED_REPOSITORIES", "").strip():
+            validation = replace(
+                validation,
+                trusted_repositories=tuple(
+                    name.strip() for name in repos.split(",") if name.strip()
+                ),
+            )
+        if step_timeout := _read_float(env, "ATLAS_VALIDATION_STEP_TIMEOUT_SECONDS"):
+            validation = replace(validation, step_timeout_seconds=step_timeout)
+
         return replace(
             config,
             polling=polling,
@@ -229,6 +269,7 @@ class WorkerConfig:
             run=run,
             workspace=workspace,
             executor=executor,
+            validation=validation,
         )
 
 

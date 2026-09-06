@@ -69,6 +69,7 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 - Target MVP의 worker가 구현되기 전에는 `/atlas` command나 `atlas:*` label이 작업을 자동 시작한다고 가정하지 않습니다.
 - `python -m atlas <issue-number>`는 단건 validation 결과만 출력하며 저장하지 않습니다. `poll`은 valid Task를 저장하고, `claim`은 lease를 잡고, `run-start`는 Run record를, `workspace-create`는 격리된 branch/worktree를 만듭니다. `executor-start --executor claude`는 실제 Claude Code CLI로 worktree 안의 코드를 수정하고, `--mock-mode`는 개발·테스트용 mock executor를 씁니다. `validation-start`는 `AwaitingValidation` Run을 검증해 `Succeeded` 또는 `Failed`로 확정합니다.
 - usage detection, routing, mobile notification이 구현됐다고 가정하지 않습니다. validation은 repository에서 발견한 근거로만 검증하며, 테스트가 없는 repository는 `no_tests_discovered` 경고와 함께 통과할 수 있습니다.
+- validation은 repository 코드를 sandbox 없이 실행합니다. 기본 정책은 `untrusted`이고 이때는 정적 검사만 수행합니다. 신뢰를 부여하기 전에는 테스트와 package script가 실행되지 않는다고 가정합니다.
 
 ## 브랜치와 커밋 규칙
 

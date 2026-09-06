@@ -13,6 +13,50 @@ Issue → Task → claim → Run → isolated worktree → 구현
 
 이 문서는 `AwaitingValidation` 이후를 다룹니다. `Succeeded` 이후의 commit, push, PR 생성은 아직 구현되지 않았습니다.
 
+## 실행되는 것은 repository의 코드입니다
+
+**이 문서는 검증이 sandbox 안에서 돈다고 주장하지 않습니다. 그렇지 않기 때문입니다.**
+
+`shell=True`를 쓰지 않는 것은 Atlas가 shell wrapper를 거치지 않는다는 뜻일 뿐입니다. 실행된 repository 코드는 스스로 subprocess를 띄우고 network에 접속하고 host filesystem을 읽고 쓸 수 있습니다. **환경변수를 줄이는 것도 sandbox가 아닙니다.**
+
+구체적으로 다음은 임의 코드 실행 경로입니다.
+
+- Python 테스트 — import만으로 module 최상위 코드가 실행되고 `conftest.py`도 실행됩니다.
+- `npm run <script>` — script 본문이 임의 shell 문자열입니다. 이름을 allowlist로 막아도 본문은 무엇이든 될 수 있습니다.
+- mypy — config에 선언된 plugin을 import합니다.
+
+executor에게 shell 도구를 주지 않았더라도, executor가 test나 `package.json`을 고친 뒤 validation이 그것을 실행하면 **그 제한을 우회하는 경로**가 됩니다.
+
+### 신뢰 정책 (MVP)
+
+실제 sandbox를 만들지 않았습니다. 대신 명시적 신뢰 정책 뒤에 둡니다.
+
+| 정책 | 기본값 | 동작 |
+| --- | --- | --- |
+| `untrusted` | **예 (fail closed)** | repository 코드를 실행하는 step을 계획에서 제거합니다. 정적 검사만 수행합니다. |
+| `trusted` | 아니오 | 계획한 step을 모두 수행합니다. |
+
+신뢰는 `ATLAS_VALIDATION_TRUST=trusted` 또는 `ATLAS_TRUSTED_REPOSITORIES`의 명시적 목록으로만 부여합니다.
+
+| step | repository 코드 실행 |
+| --- | --- |
+| workspace integrity | 아니오 |
+| git policy | 아니오 |
+| `compileall` | 아니오 (컴파일만 합니다) |
+| ruff | 아니오 |
+| pyright | 아니오 |
+| tests (pytest / unittest) | **예** |
+| mypy | **예** (plugin import) |
+| node scripts | **예** (본문이 임의 shell) |
+
+`untrusted`에서 제거된 step은 `active_validation_requires_trust`로 남고 required에서 내려갑니다. 결과에는 `active_validation_skipped_untrusted`와 `validation_passed_static_only` 경고가 붙습니다. **"검증했다"가 아니라 "정적 검사만 했다"는 뜻입니다.**
+
+계획의 `trust` 근거에는 `sandboxed: false`, `network_denied: false`를 명시적으로 남깁니다. 보장하지 않는 것을 보장한다고 적지 않습니다.
+
+### 앞으로 필요한 것
+
+제대로 하려면 validation child process에 filesystem 경계, process spawn 제한, network deny를 실제로 강제해야 합니다. 이번 범위가 아니고, 그때까지 신뢰 정책이 유일한 통제입니다.
+
 ## Run 상태 전이
 
 | 전이 | 조건 |
@@ -43,7 +87,8 @@ executor runtime과 같은 단계 구조를 씁니다.
 | `Starting` | DB에 예약했고 첫 step은 아직 시작하지 않음 |
 | `Running` | step을 수행 중 |
 | `Finished` | 판정까지 끝남 |
-| `Failed` | 시작하거나 진행하다 실패. 남은 process가 있을 수 있어 reconciliation 대상 |
+| `Failed` | 시작하거나 진행하다 실패 |
+| `RecoveryRequired` | process가 살아 있을 수 있어 결과를 확정할 수 없음. **terminal 아님** |
 
 Run 하나에 active validation은 최대 하나입니다. **database의 partial unique index가 최종적으로 막습니다.** 중복 시작을 코드 조건만으로 막지 않습니다.
 
@@ -95,6 +140,11 @@ repository에서 **발견한 근거로만** 명령을 고릅니다. 추측으로
 
 pytest contract가 없으면 표준 라이브러리 `unittest`를 씁니다. dependency를 요구하지 않는 쪽을 먼저 고릅니다.
 
+**0건 실행을 통과로 취급하지 않습니다.** `unittest discover`는 기본 pattern(`test*.py`)에 맞는 파일이 하나도 없어도 "Ran 0 tests"로 exit 0을 냅니다. 그래서 두 겹으로 막습니다.
+
+1. 계획 시점 — `tests/`에 python 파일은 있는데 pattern에 맞는 것이 없으면 `test_runner_mismatch`로 `error` 처리합니다. pytest 형식(`*_test.py`)만 있는 repository가 조용히 통과하지 않습니다.
+2. 실행 후 — 출력에서 실행 건수를 확인해 0건이면 `no_tests_executed`로 되돌립니다.
+
 `compileall`은 stdlib이고 결정적이라 source 디렉터리가 있으면 **required**입니다. 대상은 `src`와 `tests`로 한정합니다. repository 전체를 무작정 훑지 않습니다.
 
 ### Node
@@ -113,12 +163,14 @@ pytest contract가 없으면 표준 라이브러리 `unittest`를 씁니다. dep
 - package manager 실행 파일이 없으면 `error`입니다.
 - `node_modules`가 없으면 **설치하지 않고** `dependencies_not_installed`로 보고합니다.
 
-### 금지
+### Atlas가 하지 않는 일
 
 - dependency 설치. `npm install`, `pip install`, `poetry install`, `uv sync`를 자동 실행하지 않습니다.
-- network 사용.
 - allowlist 밖 script 실행.
 - 사용자 Issue 본문이나 임의 텍스트를 명령에 넣는 일.
+- shell wrapper 사용.
+
+**"network를 쓰지 않는다"고 적지 않습니다.** Atlas의 계획 단계는 network를 쓰지 않지만, 실행된 repository 코드는 자유롭게 접속할 수 있습니다. 위 "실행되는 것은 repository의 코드입니다" 절을 따릅니다.
 
 ## Command safety
 
@@ -146,6 +198,20 @@ pytest contract가 없으면 표준 라이브러리 `unittest`를 씁니다. dep
 | `failed` | 검사했고 실패했습니다 |
 | `skipped` | **검사할 근거가 없었습니다.** 실패가 아닙니다 |
 | `error` | 검사하려 했지만 수행하지 못했습니다. 통과로 볼 수 없습니다 |
+| `unconfirmed` | 종료를 시도했지만 **process가 사라졌다고 증명하지 못했습니다** |
+
+### 종료 확인과 결과 확정
+
+executor runtime과 같은 invariant입니다. **"종료를 요청했다"와 "종료를 확인했다"는 다릅니다.**
+
+timeout이든 cancel이든 process가 사라졌다고 증명하지 못하면 step을 평범한 `error`로 닫지 않습니다. `unconfirmed`로 남기고, validation 전체를 다음과 같이 처리합니다.
+
+- validation status는 `RecoveryRequired`입니다. **terminal이 아닙니다.**
+- outcome은 `ambiguous`이고 failure는 `validation_termination_unverified`입니다.
+- **Run을 확정하지 않습니다.** `Validating`으로 남아 heartbeat 대상이자 stale 판정 대상입니다.
+- reconciliation이 계속 봅니다.
+
+정상 timeout·cancel은 process 부재를 확인한 뒤에만 terminal이 됩니다.
 
 `skipped`와 `passed`를 구분합니다. "검사했고 통과했다"와 "검사할 근거가 없었다"는 전혀 다른 사실이고, 뭉뚱그리면 검증되지 않은 변경을 통과시킵니다.
 
@@ -177,7 +243,21 @@ step 결과에는 명령(redacted), exit code, 시작·종료 시각, 소요 시
 - allowed scope를 벗어난 변경이 없는가
 - `.git` 내부가 수정되지 않았는가
 
-구현 시점의 `implementation_completed` evidence와 지금 변경 목록을 비교합니다. 다르면 **누군가 중간에 worktree를 건드린 것**이므로 `workspace_changed_after_implementation`으로 실패시킵니다. 조용히 통과시키지 않습니다.
+### 구현 이후 변경 감지
+
+구현 시점과 검증 시점의 worktree가 같은지 봅니다. 다르면 **누군가 중간에 worktree를 건드린 것**이므로 `workspace_changed_after_implementation`으로 실패시킵니다.
+
+**파일 이름 집합 비교로는 부족합니다.** 같은 파일의 내용만 바뀌면 이름 집합은 그대로라 변경을 놓칩니다. 그래서 내용 지문(SHA-256)을 씁니다.
+
+지문에 들어가는 것입니다.
+
+- HEAD revision과 branch
+- `git diff HEAD --binary` 결과 — tracked 파일의 추가·수정·삭제·mode 변경
+- untracked 파일의 경로와 내용
+
+지문에 들어가지 않는 것은 **raw source**입니다. digest와 개수만 저장합니다.
+
+구현 단계가 `implementation_completed` event에 지문을 남기고, 검증이 같은 방식으로 다시 계산해 비교합니다. 지문이 없는 예전 Run은 이름 비교로 물러서되 `weaker_guarantee: true`를 근거에 남깁니다. 보장 수준이 다르기 때문입니다.
 
 ## Success policy
 
@@ -228,6 +308,9 @@ provider 어휘를 쓰지 않습니다.
 | `validation_process_failed` | `transient_executor` |
 | `validation_state_ambiguous` | `unknown` |
 | `validation_gate_failed` | `policy_violation` |
+| `validation_termination_unverified` | `unknown` |
+| `validation_trust_required` | `policy_violation` |
+| `validation_no_tests_executed` | `validation_failed` |
 
 ## 저장
 
@@ -250,6 +333,10 @@ event에는 전체 stdout/stderr를 저장하지 않습니다. 짧은 요약만 
 | step은 있는데 process를 붙이지 못함 | `validation_process_never_attached` | 해당 없음 |
 | `Running`인데 실행 중 step이 없음 | `validation_state_ambiguous` (high) | 해당 없음 |
 | terminal Run인데 validation 생존 | `validation_surviving_terminal_run` (high) | **ownership 확인 전 금지** |
+| validation record는 닫혔는데 step process 생존 | `validation_orphan_process` | **금지** |
+| spawn 성공 후 identity 저장 실패 | `validation_process_attach_failed` | 해당 없음 |
+
+**validation status만으로 판단하지 않습니다.** 결과를 terminal로 닫은 뒤에도 종료를 확인하지 못한 process가 남아 있을 수 있으므로, process identity가 기록된 step 자체를 기준으로도 훑습니다.
 
 **자동으로 재검증하지 않습니다.** 판정과 기록만 하고 다시 실행할지는 사람이나 상위 정책이 결정합니다.
 
@@ -265,6 +352,14 @@ python -m atlas validation-reconcile
 
 `validation-start`는 `AwaitingValidation` 외의 상태에서 거부합니다.
 
+| 환경변수 | 기본값 | 의미 |
+| --- | --- | --- |
+| `ATLAS_VALIDATION_TRUST` | `untrusted` | repository 코드 실행 허용 여부 |
+| `ATLAS_TRUSTED_REPOSITORIES` | (없음) | 신뢰하는 `owner/name` 목록 |
+| `ATLAS_VALIDATION_STEP_TIMEOUT_SECONDS` | `900` | step 하나의 timeout |
+
+`--trust trusted`로 한 번만 열 수도 있습니다.
+
 ## 이번 범위 밖
 
 - git commit, push, GitHub PR 생성
@@ -273,3 +368,4 @@ python -m atlas validation-reconcile
 - AI reviewer, 코드 품질 자동 수정
 - 자동 재검증
 - step 단위 resume (ambiguous 상태 식별까지만 구현)
+- **실제 sandbox** — filesystem 경계, process spawn 제한, network deny를 강제하지 않습니다

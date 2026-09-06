@@ -3,13 +3,38 @@
 **추측으로 명령을 만들지 않습니다.** 모든 step은 repository에서 발견한 파일이나
 설정을 근거로 선택하고, 그 근거를 계획에 함께 남깁니다.
 
-금지 사항입니다.
+Atlas가 하지 않는 일입니다.
 
 - dependency 설치. `npm install`, `pip install`, `poetry install`, `uv sync`를
   자동으로 실행하지 않습니다. 없으면 없다고 보고합니다.
-- network 사용.
 - package.json에 정의되지 않은 임의 script 실행.
 - 사용자 Issue 본문이나 임의 텍스트를 명령에 넣는 일.
+- shell wrapper 사용. 모든 명령은 argv list입니다.
+
+## repository 코드 실행과 신뢰 정책
+
+**`shell=False`는 sandbox가 아닙니다.** Atlas가 shell을 거치지 않을 뿐,
+실행된 repository 코드는 스스로 subprocess를 띄우고 network에 접속하고 host
+filesystem을 읽고 쓸 수 있습니다. 환경변수를 줄이는 것도 sandbox가 아닙니다.
+
+구체적으로 다음은 임의 코드 실행 경로입니다.
+
+- Python 테스트: import만으로 module 최상위 코드가 실행되고, `conftest.py`도
+  실행됩니다.
+- `npm run <script>`: script 본문이 임의 shell 문자열입니다. 이름만 allowlist에
+  넣어도 본문은 무엇이든 될 수 있습니다.
+- mypy: config에 선언된 plugin을 import합니다.
+
+executor에게 shell 도구를 주지 않았더라도, executor가 test나 `package.json`을
+고친 뒤 validation이 그것을 실행하면 **그 제한을 우회하는 경로**가 됩니다.
+
+MVP에서는 실제 sandbox를 만들지 않습니다. 대신 **명시적 신뢰 정책 뒤에** 둡니다.
+
+- 기본값은 `untrusted`입니다(fail closed).
+- `untrusted`에서는 repository 코드를 실행하지 않는 step만 수행합니다.
+- repository 코드를 실행하는 step은 `trusted`에서만 수행합니다.
+- 신뢰 여부와 무관하게 실행된 코드는 격리되지 않습니다. 이 문서와 코드는
+  "network가 차단된다"고 주장하지 않습니다. 차단하지 않기 때문입니다.
 
 ## contract 강도
 
@@ -34,7 +59,8 @@ import json
 import shutil
 import sys
 import tomllib
-from dataclasses import dataclass, field
+from fnmatch import fnmatch
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -57,6 +83,18 @@ SOURCE_DIRS: tuple[str, ...] = ("src",)
 TEST_DIRS: tuple[str, ...] = ("tests", "test")
 
 DEFAULT_STEP_TIMEOUT_SECONDS = 900.0
+
+# repository 코드를 실행하지 않는 step만 남기는 기본 정책입니다.
+TRUST_UNTRUSTED = "untrusted"
+TRUST_TRUSTED = "trusted"
+TRUST_POLICIES: frozenset[str] = frozenset({TRUST_UNTRUSTED, TRUST_TRUSTED})
+
+# 신뢰 정책이 없을 때 repository 코드 실행 step에 남기는 사유.
+UNTRUSTED_SKIP_REASON = "active_validation_requires_trust"
+
+# stdlib unittest discover가 찾는 기본 pattern입니다. 이 pattern에 맞지 않으면
+# "Ran 0 tests"로 조용히 통과합니다.
+UNITTEST_PATTERN = "test*.py"
 
 
 @dataclass(frozen=True)
@@ -281,6 +319,22 @@ def _python_tool_contract(
     return contract
 
 
+def _unittest_targets(root: Path, test_dir: str) -> tuple[int, int]:
+    """test 디렉터리의 python 파일 수와 unittest pattern에 맞는 파일 수.
+
+    `unittest discover`는 pattern에 맞는 파일이 하나도 없어도 "Ran 0 tests"로
+    exit 0을 냅니다. 그것을 통과로 취급하면 검증하지 않은 변경을 통과시킵니다.
+    """
+
+    base = root / test_dir
+    try:
+        python_files = [p for p in base.rglob("*.py") if p.name != "__init__.py"]
+    except OSError:
+        return (0, 0)
+    matching = [p for p in python_files if fnmatch(p.name, UNITTEST_PATTERN)]
+    return (len(python_files), len(matching))
+
+
 def _pytest_contract(facts: RepositoryFacts) -> ToolContract:
     contract = ToolContract()
     if "pytest.ini" in facts.files:
@@ -309,6 +363,7 @@ def _tool_step(
     argv: tuple[str, ...],
     available: bool,
     timeout: float,
+    executes_repository_code: bool = False,
 ) -> ValidationStep:
     """contract 강도와 도구 가용성을 합쳐 step을 만듭니다."""
 
@@ -318,6 +373,7 @@ def _tool_step(
             name=name,
             kind=kind,
             required=False,
+            executes_repository_code=executes_repository_code,
             evidence=evidence,
             skip_reason="no_contract",
         )
@@ -329,6 +385,7 @@ def _tool_step(
                 name=name,
                 kind=kind,
                 required=True,
+                executes_repository_code=executes_repository_code,
                 evidence=evidence,
                 error_reason="command_missing",
             )
@@ -336,6 +393,7 @@ def _tool_step(
             name=name,
             kind=kind,
             required=False,
+            executes_repository_code=executes_repository_code,
             evidence=evidence,
             skip_reason="command_missing_weak_contract",
         )
@@ -343,6 +401,7 @@ def _tool_step(
         name=name,
         kind=kind,
         required=True,
+        executes_repository_code=executes_repository_code,
         evidence=evidence,
         argv=argv,
         timeout_seconds=timeout,
@@ -369,28 +428,58 @@ def _python_steps(
                 argv=(python, "-m", "pytest", "-q"),
                 available=pytest_available,
                 timeout=timeout,
+                executes_repository_code=True,
             )
         )
     elif facts.test_dirs:
         # 표준 라이브러리만으로 실행합니다. dependency를 요구하지 않습니다.
         target = facts.test_dirs[0]
-        steps.append(
-            ValidationStep(
-                name="unittest",
-                kind=StepKind.TESTS,
-                required=True,
-                evidence={
-                    "contract": {
-                        "present": True,
-                        "strength": "strong",
-                        "evidence": [f"{target}/"],
-                    },
-                    "runner": "stdlib unittest",
-                },
-                argv=(python, "-m", "unittest", "discover", "-s", target, "-t", "."),
-                timeout_seconds=timeout,
+        total, matching = _unittest_targets(facts.root, target)
+        evidence = {
+            "contract": {
+                "present": True,
+                "strength": "strong",
+                "evidence": [f"{target}/"],
+            },
+            "runner": "stdlib unittest",
+            "python_files": total,
+            "unittest_pattern": UNITTEST_PATTERN,
+            "matching_files": matching,
+        }
+        if total and not matching:
+            # pytest 형식(`*_test.py` 등)만 있습니다. unittest discover는
+            # 아무것도 찾지 못하고 exit 0을 냅니다. 통과로 볼 수 없습니다.
+            steps.append(
+                ValidationStep(
+                    name="unittest",
+                    kind=StepKind.TESTS,
+                    required=True,
+                    evidence=evidence,
+                    error_reason="test_runner_mismatch",
+                )
             )
-        )
+        elif not total:
+            steps.append(
+                ValidationStep(
+                    name="tests",
+                    kind=StepKind.TESTS,
+                    required=False,
+                    evidence=evidence,
+                    skip_reason="no_tests_discovered",
+                )
+            )
+        else:
+            steps.append(
+                ValidationStep(
+                    name="unittest",
+                    kind=StepKind.TESTS,
+                    required=True,
+                    executes_repository_code=True,
+                    evidence=evidence,
+                    argv=(python, "-m", "unittest", "discover", "-s", target, "-t", "."),
+                    timeout_seconds=timeout,
+                )
+            )
     else:
         steps.append(
             ValidationStep(
@@ -451,6 +540,9 @@ def _python_steps(
             argv=(python, "-m", "mypy", "."),
             available=mypy_available,
             timeout=timeout,
+            # mypy는 config에 선언된 plugin을 import합니다. repository가
+            # 제어하는 코드가 실행됩니다.
+            executes_repository_code=True,
         )
     )
 
@@ -518,6 +610,9 @@ def _node_steps(
                     name=f"{manager}-{script}",
                     kind=kind,
                     required=not optional,
+                    # 정의된 script는 실행 대상입니다. 지금 실행하지 못하더라도
+                    # 신뢰 정책이 먼저 판단할 수 있게 표시해 둡니다.
+                    executes_repository_code=True,
                     evidence=evidence,
                     error_reason="command_missing",
                 )
@@ -530,6 +625,7 @@ def _node_steps(
                     name=f"{manager}-{script}",
                     kind=kind,
                     required=not optional,
+                    executes_repository_code=True,
                     evidence=evidence,
                     error_reason="dependencies_not_installed",
                 )
@@ -541,14 +637,51 @@ def _node_steps(
                 name=f"{manager}-{script}",
                 kind=kind,
                 required=not optional,
+                # script 본문은 임의 shell 문자열입니다. 이름을 allowlist로
+                # 막아도 본문이 무엇을 하는지는 통제하지 못합니다.
+                executes_repository_code=True,
                 evidence=evidence,
-                # script 이름은 allowlist에서만 옵니다. script 본문은 실행에
-                # 쓰지 않습니다. package manager가 자기 정의를 실행합니다.
                 argv=(manager_path, "run", script),
                 timeout_seconds=timeout,
             )
         )
     return steps
+
+
+def apply_trust_policy(
+    steps: list[ValidationStep], trusted: bool
+) -> list[ValidationStep]:
+    """신뢰 정책이 없으면 repository 코드를 실행하는 step을 제거합니다.
+
+    실행하지 않은 것을 실패로 만들지 않습니다. 대신 required에서 내려 두고
+    사유를 남깁니다. 판정은 "검증했다"가 아니라 "정적 검사만 했다"로 기록됩니다.
+    """
+
+    if trusted:
+        return steps
+    adjusted: list[ValidationStep] = []
+    for step in steps:
+        if not step.executes_repository_code:
+            adjusted.append(step)
+            continue
+        # 이미 다른 사유가 붙어 있어도 신뢰 정책이 이깁니다. 어차피 실행하지
+        # 않을 step 때문에 Run을 실패시키면 안 됩니다. 예를 들어
+        # `dependencies_not_installed`는 실행할 때만 의미가 있습니다.
+        adjusted.append(
+            replace(
+                step,
+                required=False,
+                argv=(),
+                error_reason="",
+                skip_reason=UNTRUSTED_SKIP_REASON,
+                evidence={
+                    **step.evidence,
+                    "planned_argv_removed": True,
+                    "superseded_reason": step.error_reason or step.skip_reason or None,
+                },
+            )
+        )
+    return adjusted
 
 
 def build_plan(
@@ -557,8 +690,14 @@ def build_plan(
     python: str | None = None,
     which: Callable[[str], str | None] | None = None,
     timeout_seconds: float = DEFAULT_STEP_TIMEOUT_SECONDS,
+    trusted: bool = False,
+    trust_reason: str = "",
 ) -> ValidationPlan:
-    """repository에서 발견한 근거만으로 검증 계획을 만듭니다."""
+    """repository에서 발견한 근거만으로 검증 계획을 만듭니다.
+
+    `trusted`가 아니면 repository 코드를 실행하는 step을 계획에서 제거합니다.
+    기본값은 신뢰하지 않는 쪽입니다.
+    """
 
     facts = inspect_repository(root)
     python = python or sys.executable
@@ -598,8 +737,16 @@ def build_plan(
             )
         )
 
+    steps = apply_trust_policy(steps, trusted)
     return ValidationPlan(
         steps=tuple(steps),
         ecosystem="+".join(ecosystems) if ecosystems else "unknown",
         discovery=facts.to_dict(),
+        trust={
+            "policy": TRUST_TRUSTED if trusted else TRUST_UNTRUSTED,
+            "reason": trust_reason,
+            # 실행된 repository 코드는 격리되지 않습니다. 정확히 적습니다.
+            "sandboxed": False,
+            "network_denied": False,
+        },
     )

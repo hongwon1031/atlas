@@ -1784,7 +1784,8 @@ class TaskStore:
                 )
 
             existing = connection.execute(
-                "SELECT * FROM validations WHERE run_id = ? AND status IN ('Starting','Running')",
+                "SELECT * FROM validations WHERE run_id = ? AND status IN "
+                "('Starting','Running','RecoveryRequired')",
                 (run_id,),
             ).fetchone()
             if existing is not None:
@@ -2040,7 +2041,8 @@ class TaskStore:
 
     def active_validation(self, run_id: str) -> sqlite3.Row | None:
         return self._connection.execute(
-            "SELECT * FROM validations WHERE run_id = ? AND status IN ('Starting','Running')",
+            "SELECT * FROM validations WHERE run_id = ? AND status IN "
+            "('Starting','Running','RecoveryRequired')",
             (run_id,),
         ).fetchone()
 
@@ -2056,8 +2058,23 @@ class TaskStore:
 
     def active_validations(self) -> list[sqlite3.Row]:
         return self._connection.execute(
-            "SELECT * FROM validations WHERE status IN ('Starting','Running') "
-            "ORDER BY created_at ASC"
+            "SELECT * FROM validations WHERE status IN "
+            "('Starting','Running','RecoveryRequired') ORDER BY created_at ASC"
+        ).fetchall()
+
+    def validation_steps_with_live_process(self) -> list[sqlite3.Row]:
+        """process가 아직 살아 있을 수 있는 step 전부.
+
+        **validation status만 보면 놓칩니다.** 결과를 terminal로 닫은 뒤에도
+        종료를 확인하지 못한 process가 남아 있을 수 있습니다. step 자체를
+        기준으로 훑어야 감사에서 사라지지 않습니다.
+        """
+
+        return self._connection.execute(
+            "SELECT s.*, v.status AS validation_status FROM validation_steps s "
+            "JOIN validations v ON v.validation_id = s.validation_id "
+            "WHERE s.process_id IS NOT NULL AND s.status IN ('running','unconfirmed') "
+            "ORDER BY s.updated_at ASC"
         ).fetchall()
 
     def validations_for_terminal_runs(self) -> list[sqlite3.Row]:
@@ -2065,7 +2082,7 @@ class TaskStore:
 
         return self._connection.execute(
             "SELECT v.* FROM validations v JOIN runs r ON r.run_id = v.run_id "
-            "WHERE v.status IN ('Starting','Running') AND r.status IN "
+            "WHERE v.status IN ('Starting','Running','RecoveryRequired') AND r.status IN "
             "('Succeeded','Failed','Cancelled','Orphaned') ORDER BY v.created_at ASC"
         ).fetchall()
 
@@ -2076,11 +2093,11 @@ class TaskStore:
         ).fetchall()
 
     def running_validation_step(self, validation_id: str) -> sqlite3.Row | None:
-        """지금 실행 중으로 기록된 step. reconciliation이 이 process를 봅니다."""
+        """process가 살아 있을 수 있는 step. reconciliation이 이것을 봅니다."""
 
         return self._connection.execute(
-            "SELECT * FROM validation_steps WHERE validation_id = ? AND status = 'running' "
-            "ORDER BY position ASC LIMIT 1",
+            "SELECT * FROM validation_steps WHERE validation_id = ? AND status IN "
+            "('running','unconfirmed') ORDER BY position ASC LIMIT 1",
             (validation_id,),
         ).fetchone()
 
