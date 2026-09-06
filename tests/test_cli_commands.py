@@ -28,6 +28,7 @@ class LegacyInvocationTest(unittest.TestCase):
             ["show", "12"], ["poll"], ["claim"], ["tasks"], ["release", "claim-1"],
             ["runs"], ["run-start", "ATLAS-0042"], ["run-heartbeat", "run-1"],
             ["run-finish", "run-1"], ["reconcile"],
+            ["workspace-create"], ["workspace-show"], ["workspace-cleanup"],
         ):
             self.assertEqual(_normalize(list(argv)), argv)
 
@@ -117,6 +118,54 @@ class RunCommandParserTest(unittest.TestCase):
     def test_runs_limit_must_be_positive(self):
         with self.assertRaises(SystemExit):
             self.parse(["runs", "--limit", "0"])
+
+
+class WorkspaceCommandParserTest(unittest.TestCase):
+    def parse(self, argv):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return build_parser().parse_args(argv)
+
+    def test_workspace_create_requires_run_id(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["workspace-create"])
+
+    def test_workspace_create_accepts_roots(self):
+        args = self.parse(
+            ["workspace-create", "--run-id", "run-1",
+             "--repository-root", "/tmp/repo", "--workspaces-root", "/tmp/ws"]
+        )
+
+        config = _config(args)
+        self.assertEqual(args.run_id, "run-1")
+        self.assertEqual(config.workspace.repository_root, "/tmp/repo")
+        self.assertEqual(config.workspace.resolved_workspaces_root(), "/tmp/ws")
+
+    def test_workspace_cleanup_flags(self):
+        args = self.parse(
+            ["workspace-cleanup", "--run-id", "run-1", "--allow-dirty", "--delete-branch"]
+        )
+
+        self.assertTrue(args.allow_dirty)
+        self.assertTrue(args.delete_branch)
+
+    def test_cleanup_defaults_are_conservative(self):
+        args = self.parse(["workspace-cleanup", "--run-id", "run-1"])
+
+        self.assertFalse(args.allow_dirty)
+        self.assertFalse(args.delete_branch)
+
+    def test_workspace_show_parses(self):
+        args = self.parse(["workspace-show", "--run-id", "run-1"])
+
+        self.assertEqual(args.command, "workspace-show")
+
+    def test_repository_root_from_env(self):
+        config = WorkerConfig.from_env(
+            {"ATLAS_REPOSITORY_ROOT": "/tmp/r", "ATLAS_GIT_TIMEOUT_SECONDS": "5"}
+        )
+
+        self.assertEqual(config.workspace.repository_root, "/tmp/r")
+        self.assertEqual(config.workspace.git_timeout_seconds, 5.0)
 
 
 class CommonOptionTest(unittest.TestCase):

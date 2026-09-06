@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 DEFAULT_REPOSITORY = "hongwon1031/atlas"
 DEFAULT_DATABASE_PATH = "atlas.db"
+# repository 안에 두되 git이 추적하지 않도록 operator가 ignore해야 하는 경로입니다.
+DEFAULT_WORKSPACES_DIRNAME = ".atlas/worktrees"
 
 # docs/specs/issue-command-contract.md의 queue 의도 label.
 QUEUE_LABEL = "atlas:queued"
@@ -98,11 +101,40 @@ class RunConfig:
 
 
 @dataclass(frozen=True)
+class WorkspaceConfig:
+    """Run별 git worktree 경계.
+
+    docs/security-governance.md는 worktree의 resolved path가 Project별 worker
+    root 아래인지 확인하라고 요구합니다. 임의 cwd에 의존하지 않도록 repository
+    root를 명시적으로 받습니다.
+    """
+
+    # 작업 대상 repository의 canonical local root. 지정하지 않으면 workspace
+    # 기능을 쓸 수 없습니다. cwd로 추측하지 않습니다.
+    repository_root: str | None = None
+    # worktree를 만들 worker root. 기본값은 repository_root 아래의 전용 디렉터리로,
+    # 이 경로 밖으로 나가는 worktree는 거부합니다.
+    workspaces_root: str | None = None
+    git_timeout_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        _require_positive("git_timeout_seconds", self.git_timeout_seconds)
+
+    def resolved_workspaces_root(self) -> str | None:
+        if self.workspaces_root:
+            return self.workspaces_root
+        if self.repository_root:
+            return str(Path(self.repository_root) / DEFAULT_WORKSPACES_DIRNAME)
+        return None
+
+
+@dataclass(frozen=True)
 class WorkerConfig:
     database_path: str = DEFAULT_DATABASE_PATH
     polling: PollingConfig = field(default_factory=PollingConfig)
     claim: ClaimConfig = field(default_factory=ClaimConfig)
     run: RunConfig = field(default_factory=RunConfig)
+    workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> WorkerConfig:
@@ -128,7 +160,15 @@ class WorkerConfig:
         if stale := _read_float(env, "ATLAS_RUN_STALE_AFTER_SECONDS"):
             run = replace(run, stale_after_seconds=stale)
 
-        return replace(config, polling=polling, claim=claim, run=run)
+        workspace = config.workspace
+        if root := env.get("ATLAS_REPOSITORY_ROOT", "").strip():
+            workspace = replace(workspace, repository_root=root)
+        if ws_root := env.get("ATLAS_WORKSPACES_ROOT", "").strip():
+            workspace = replace(workspace, workspaces_root=ws_root)
+        if timeout := _read_float(env, "ATLAS_GIT_TIMEOUT_SECONDS"):
+            workspace = replace(workspace, git_timeout_seconds=timeout)
+
+        return replace(config, polling=polling, claim=claim, run=run, workspace=workspace)
 
 
 def _read_float(environ: dict[str, str], name: str) -> float | None:

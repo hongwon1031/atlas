@@ -102,5 +102,50 @@ heartbeat를 남기고 프로세스가 사라진 상황을 재현했습니다.
 - 승인 회수 또는 claim 해제 이후 실행 중인 executor를 실제로 멈추는 동작. executor가 없어 취소할 대상이 없습니다. [Execution Runtime](specs/execution-runtime.md)에 executor slice 요구사항으로 기록했습니다.
 - process identity(PID, start time) 기반 판정. executor process가 없어 수행할 수 없으며 판정 event에 `process_identity_checked: false`로 명시합니다
 - 실제 worker가 장시간 heartbeat를 보내는 상황의 안정성
-- orphan process와 stale worktree 정리. worktree가 아직 없습니다
+- orphan process 정리. executor process가 아직 없습니다
 - Run 완료를 Task 상태 전이로 연결하는 흐름. Planner와 Validator가 없어 Task는 계속 `Draft`입니다
+
+## 2026-09-06 — Run별 branch·worktree 격리
+
+- 대상 구현: `src/atlas/gitcmd.py`, `src/atlas/workspace.py`, `src/atlas/workspace_service.py`, `src/atlas/store.py`(runs workspace 컬럼), `src/atlas/reconciliation.py`
+- 검증 방법: 실제 임시 git repository. network를 쓰지 않았습니다.
+- 관련 결정: [ADR-010](adr/0010-task-execution-isolation.md)의 Accepted 범위
+
+### 확인된 항목
+
+| 단계 | 확인 내용 | 결과 |
+| --- | --- | --- |
+| repo 준비 | `git init` + base commit | base revision 고정 |
+| workspace 생성 | 두 Run에 각각 branch/worktree | `atlas/ATLAS-0042/...`, `atlas/ATLAS-0077/...` 서로 다름 |
+| 파일 수정 | run1 worktree에서 README 수정과 파일 추가 | worktree 안에만 반영 |
+| main 오염 | main worktree의 README, branch, HEAD, dirty 상태 | 모두 변화 없음. `dirty=False`, HEAD가 base와 동일 |
+| Run 간 격리 | run1이 만든 파일이 run2 worktree에 보이는지 | 보이지 않음 |
+| idempotency | 같은 Run에 create 재호출 | `created=False`, worktree 총 개수 3개 유지(main 포함) |
+| restart | store를 닫고 다시 열어 create 호출 | 기존 workspace 재식별, 새로 만들지 않음 |
+| dirty cleanup | 저장되지 않은 변경이 있는 worktree 정리 시도 | 거부(`worktree_dirty`), worktree 보존 |
+| 정상 cleanup | 깨끗한 worktree 정리 | worktree 제거, branch 보존 |
+| workspace reconciliation | worktree 디렉터리를 삭제한 뒤 판정 | `workspace_recovery_required` / `worktree_missing` 기록. 상태를 바꾸거나 branch를 지우지 않음 |
+
+### 별도로 확인한 경계
+
+단위 테스트로 확인한 거부 경로입니다.
+
+- git repository가 아닌 경로, repository root가 아닌 하위 디렉터리
+- `origin` remote가 Task repository와 다른 경우 (remote가 없으면 network 없이 통과)
+- worker root 밖 경로, `..` traversal, symlink를 통한 escape
+- Atlas namespace 밖 branch 삭제 시도
+- branch 이름 충돌
+- DB provenance가 없는 리소스 정리 시도
+- 실행 중인 Run의 workspace 정리 시도
+
+### schema migration (v3 → v4)
+
+`runs`에서 workspace 컬럼 8개를 삭제하고 `schema_version`을 `3`으로 되돌린 뒤 store를 다시 열어 자동 migration을 확인했습니다. Run record 자체는 보존되고 workspace 상태는 `none`으로 시작합니다.
+
+### 확인하지 못한 항목
+
+- executor process 실행과 그로 인한 worktree 변경. 이번 범위가 아닙니다.
+- worktree가 많아졌을 때의 disk 사용량과 retention 정책.
+- 여러 Project를 동시에 다룰 때 worker root 분리.
+- push, PR 생성 등 remote를 건드리는 동작. 전부 non-goal입니다.
+- Windows 외 플랫폼에서의 symlink escape 동작. 이 검증은 Windows에서 수행했습니다.

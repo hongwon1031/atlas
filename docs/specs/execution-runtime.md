@@ -1,6 +1,6 @@
 # Execution Runtime Specification v0.1
 
-이 문서는 Atlas worker가 한 Task를 하나의 Run으로 실행할 때 따라야 할 runtime, isolation, recovery 계약을 정의합니다. Run record, heartbeat, restart reconciliation은 구현됐습니다. [ADR-009](../adr/0009-worker-process-supervision.md)와 [ADR-010](../adr/0010-task-execution-isolation.md)은 아직 `Proposed`이며 worktree, branch, executor process invocation은 구현되지 않았습니다.
+이 문서는 Atlas worker가 한 Task를 하나의 Run으로 실행할 때 따라야 할 runtime, isolation, recovery 계약을 정의합니다. Run record, heartbeat, restart reconciliation, branch/worktree isolation은 구현됐습니다. [ADR-010](../adr/0010-task-execution-isolation.md)의 filesystem/branch 격리는 `Accepted`이고 executor process 격리는 `Proposed`입니다. [ADR-009](../adr/0009-worker-process-supervision.md)는 `Proposed`이며 executor process invocation은 구현되지 않았습니다.
 
 ## Current and Target Status
 
@@ -9,7 +9,8 @@
 | 사람이 Executor에 Task 전달 | Proven Manually | 사람이 prompt를 전달하고 Executor가 branch와 PR을 생성 |
 | Atlas worker polling·claim·lease | Complete | Issue polling, Task persistence, atomic claim, lease TTL, 승인 회수 구현. live E2E는 [Verification Log](../verification-log.md) 참조 |
 | Run record와 heartbeat | Complete | Run lifecycle, heartbeat, restart reconciliation 구현. [Verification Log](../verification-log.md) 참조 |
-| worktree, branch, executor process | Not Implemented | Run은 실행 단위 record이며 아직 process를 띄우지 않음 |
+| branch와 worktree 격리 | Complete | Run별 전용 branch/worktree, 경계 검증, cleanup, reconciliation 구현 |
+| executor process | Not Implemented | worktree는 준비되지만 아직 아무 process도 실행하지 않음 |
 | self-hosted Claude Code invocation | Planned | Target MVP primary automated executor |
 | tmux worker PoC | Planned | process persistence 용도; service manager가 아님 |
 | systemd 또는 Docker supervision | Planned | stable operation에서 별도 결정 |
@@ -30,8 +31,8 @@
 | --- | --- | --- |
 | `task_id` | 원본 Task의 안정적인 ID | 구현됨 |
 | `run_id` | 시도마다 새로 발급되는 unique ID | 구현됨 |
-| branch | Run이 단독 수정하는 Task 전용 branch | 미구현 |
-| worktree/clone | 허용된 Project root 아래의 전용 mutable workspace | 미구현 |
+| branch | Run이 단독 수정하는 Task 전용 branch | 구현됨 |
+| worktree/clone | 허용된 Project root 아래의 전용 mutable workspace | worktree 구현됨, clone 미채택 |
 | executor process | Task마다 새로 시작하며 이전 conversation이나 shell state를 상속하지 않음 | 미구현 |
 | log scope | stdout, stderr, event, validation evidence를 Run별로 분리 | event만 구현됨 |
 | timeout | 시작 전에 고정하고 만료 시 cancellation과 cleanup 수행 | 미구현 |
@@ -125,6 +126,8 @@ worker 시작 시 또는 `reconcile` command로 다음 순서를 수행합니다
 
 1, 4, 5, 7번은 구현됐습니다. active Run을 조회하고, heartbeat가 stale threshold를 넘으면 `Orphaned`로 기록하며, 판단 근거를 event로 남기고, 재시도는 `previous_run_id`로 연결합니다.
 
+6번의 stale worktree 탐지도 구현됐습니다. 기록된 worktree 경로의 존재 여부, git worktree 등록 여부, 기대한 branch와의 일치, worker root 안에 있는지를 확인합니다. **불일치를 발견해도 임의로 복구하거나 삭제하지 않고** `workspace_recovery_required` event로 근거만 남깁니다. orphan process 탐지는 executor process가 없어 해당하지 않습니다.
+
 **stale Run을 자동으로 재실행하지 않습니다.** 판정과 기록만 하고 새 Run 생성은 사람이나 상위 정책이 명시적으로 요청해야 합니다.
 
 2, 3, 6번은 executor process와 worktree가 없어 수행할 수 없습니다. 판정 근거 event에 `process_identity_checked: false`를 남겨 이 한계를 감사 기록에 명시합니다. process identity 확인이 없는 동안 판정은 heartbeat 경과와 claim/lease 상태만으로 이루어집니다.
@@ -154,6 +157,65 @@ heartbeat interval과 stale threshold는 `RunConfig`로 설정합니다. 아래 
 
 즉 **기록은 되지만 실행은 멈추지 않습니다.** 이 간극을 executor slice 전에 닫아야 합니다.
 
+## Run Workspace
+
+Run마다 전용 branch와 git worktree를 준비합니다. [ADR-010](../adr/0010-task-execution-isolation.md)의 Accepted 범위입니다.
+
+### Branch naming
+
+`atlas/<task-id>/<run-id-short>` 형식입니다.
+
+- `atlas/` namespace가 Atlas 소유임을 나타냅니다. 이 namespace 밖의 branch는 만들지도 삭제하지도 않습니다.
+- Task ID와 Run ID는 `[A-Za-z0-9._-]` 밖의 문자를 치환해 sanitize합니다. Issue에서 온 값을 ref에 그대로 넣지 않습니다.
+- `run_id`가 Run마다 고유하므로 같은 Task의 retry Run도 서로 다른 branch를 씁니다.
+- `git check-ref-format`으로 유효성을 확인하고 이미 있는 branch면 거부합니다.
+- `main`, `master`, `HEAD`, `trunk`, `develop`은 어떤 경우에도 Run branch로 쓰지 않습니다.
+
+### Repository와 경로 경계
+
+- 대상 repository의 local root를 명시적으로 받습니다. 현재 작업 디렉터리를 추측하지 않습니다.
+- root가 실제 git repository이고 그 repository의 toplevel인지 확인합니다.
+- `origin` remote가 있으면 Task repository와 일치하는지 확인합니다. remote가 없으면 network를 쓰지 않고 통과시킵니다.
+- worktree는 Project별 worker root 아래에만 만듭니다. 기본값은 `<repository-root>/.atlas/worktrees`이며 operator가 바꿀 수 있습니다. 이 경로는 대상 repository에서 ignore돼야 합니다.
+- 모든 경로는 `resolve()` 후 worker root 아래인지 확인합니다. `resolve()`가 symlink를 따라가므로 symlink escape도 함께 걸립니다.
+
+### 단계별 lifecycle
+
+git side effect를 database transaction 안에서 잡지 않습니다. 대신 단계를 나눠 부분 실패를 식별합니다.
+
+| 단계 | 의미 |
+| --- | --- |
+| `none` | 아직 workspace가 없음 |
+| `preparing` | branch와 경로를 확정해 기록함. git 작업은 이 뒤에 수행 |
+| `ready` | git 작업과 검증이 모두 끝남 |
+| `failed` | git 작업 중 실패. 기록된 branch/경로가 정리 대상 |
+| `removed` | worktree를 제거함 |
+
+`preparing` 기록이 git보다 먼저 남으므로, 중간에 프로세스가 죽어도 어떤 branch와 경로를 정리해야 하는지 database만 보고 알 수 있습니다. 이것이 orphan 리소스 식별의 근거입니다.
+
+### 생성 후 검증
+
+worktree를 만든 뒤 다음을 모두 확인하고, 하나라도 어긋나면 `ready`로 올리지 않습니다.
+
+- `git rev-parse --show-toplevel`이 기대한 worktree 경로와 같습니다.
+- 현재 branch가 계획한 branch와 같습니다.
+- HEAD가 생성 시점에 고정한 base revision과 같습니다.
+- resolved 경로가 worker root 아래입니다.
+- `git rev-parse --git-common-dir`가 대상 repository와 같습니다.
+
+### Idempotency
+
+같은 Run에 workspace 생성을 두 번 호출해도 중복 branch나 worktree를 만들지 않고 기존 workspace를 돌려줍니다. 판정 근거는 operational store의 `workspace_status`이므로 프로세스를 재시작해도 같은 Run의 workspace를 재식별합니다.
+
+### Ownership
+
+Atlas가 만들었다고 **증명할 수 있는** 리소스만 정리합니다. 증명은 다음 두 가지가 함께 성립할 때만 인정합니다.
+
+1. branch가 `atlas/` namespace에 있습니다.
+2. operational store에 이 Run이 그 branch와 경로를 만들었다는 기록이 있습니다.
+
+둘 중 하나라도 어긋나면 삭제하지 않고 거부합니다. 사용자가 만든 branch는 어떤 경우에도 삭제하지 않습니다.
+
 ## Cleanup Matrix
 
 | 종료 유형 | process | worktree/clone | branch | logs/artifacts |
@@ -164,6 +226,24 @@ heartbeat interval과 stale threshold는 `RunConfig`로 설정합니다. 아래 
 | worker crash | startup reconciliation | 자동 삭제 전 ownership 확인 | concurrent Run 금지 | heartbeat 중단을 기록 |
 
 cleanup 실패는 성공으로 숨기지 않으며 별도 상태와 operator action을 남깁니다.
+
+### 구현된 cleanup 정책
+
+Run 상태별 branch 보존 여부입니다. 작업 내용이 남아 있을 수 있으므로 **기본은 모두 보존**입니다.
+
+| Run 상태 | worktree | branch | 근거 |
+| --- | --- | --- | --- |
+| `Succeeded` | 제거 | 보존 | PR lifecycle 동안 필요 |
+| `Failed` | 제거 | 보존 | retry 판단까지 필요 |
+| `Cancelled` | 제거 | 보존 | push되지 않은 작업이 남아 있을 수 있음 |
+| `Orphaned` | 제거 | 보존 | 사람 확인 전까지 판단 근거 |
+
+추가 규칙입니다.
+
+- 저장되지 않은 변경이 있는 worktree는 제거하지 않습니다. operator가 명시적으로 허용해야 제거합니다.
+- branch 삭제는 기본적으로 하지 않습니다. operator가 명시적으로 요청해야 하며 그때도 Atlas namespace 안에서만 삭제합니다.
+- 실행 중인 Run의 workspace는 정리하지 않습니다. terminal 상태여야 합니다.
+- cleanup 실패는 성공으로 처리하지 않고 event로 남긴 뒤 실패를 그대로 보고합니다.
 
 ## Open Questions
 

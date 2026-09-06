@@ -51,7 +51,7 @@ Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge*
 - [ ] provider-neutral Executor Adapter 최소 interface
 - [x] 최소 Task, claim lease persistence
 - [x] Run record, heartbeat, restart reconciliation
-- [ ] Task별 worktree/clone, branch, process, Run ID, log scope
+- [x] Task별 worktree, branch, Run ID, log scope (process는 후속)
 - [ ] mock executor invocation
 - [ ] timeout, cancel, retry, process/worktree cleanup
 - [ ] 승인 회수·claim 해제 시 실행 중인 executor cancellation (executor slice 필수)
@@ -168,7 +168,8 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 - [ ] 공개 저장소에 노출하면 안 되는 개인 정보 제거
 - [x] GitHub Markdown canonical / Notion optional mirror 결정
 - [x] ADR-008 polling-first 승인
-- [ ] ADR-009 tmux PoC, ADR-010 isolation 제안 검토
+- [x] ADR-010의 branch/worktree 격리 승인
+- [ ] ADR-009 tmux PoC, ADR-010의 executor process 격리 검토
 - [ ] server hosting, stable supervisor, network egress, rate-limit budget 결정
 - [ ] 첫 Atlas Task Issue 세트 생성
 - [ ] mock executor 문서 Task PR 실험 수행
@@ -181,7 +182,8 @@ AI Trading은 long-running [Project lifecycle](specs/project-lifecycle.md)을 �
 3. ~~한 Task를 idempotent하게 claim합니다.~~ (완료 — `store.py`)
 4. ~~valid Atlas Task Issue의 live E2E를 확인합니다.~~ (완료 — Issue #7)
 5. ~~Run record와 heartbeat, restart reconciliation을 추가합니다.~~ (완료)
-6. 격리된 worktree와 branch를 생성합니다.
+6. ~~격리된 worktree와 branch를 생성합니다.~~ (완료)
+7. mock executor를 새 process로 호출합니다.
 6. Task별 새 process에서 mock executor를 호출합니다.
 7. 결과를 validate하고 draft PR을 생성합니다.
 8. self-hosted Claude Code invocation은 별도 후속 PR에서 추가합니다.

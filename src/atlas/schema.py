@@ -267,8 +267,43 @@ class Run:
     failure_category: str | None = None
     failure_message: str | None = None
     previous_run_id: str | None = None
+    # workspace(branch + worktree). 자세한 계약은 docs/specs/execution-runtime.md.
+    workspace_status: "WorkspaceStatus" = None  # type: ignore[assignment]
+    branch: str | None = None
+    worktree_path: str | None = None
+    base_branch: str | None = None
+    base_revision: str | None = None
+    workspace_created_at: str | None = None
+    workspace_removed_at: str | None = None
+    workspace_error: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.workspace_status is None:
+            object.__setattr__(self, "workspace_status", WorkspaceStatus.NONE)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["status"] = self.status.value
+        payload["workspace_status"] = self.workspace_status.value
         return payload
+
+
+class WorkspaceStatus(str, Enum):
+    """Run workspace(branch + worktree)의 단계.
+
+    git side effect를 DB transaction 안에서 잡지 않으려고 단계를 나눕니다.
+    `PREPARING` 기록이 git 작업보다 먼저 남으므로, 중간에 실패해도 어떤 branch와
+    경로를 정리해야 하는지 식별할 수 있습니다.
+    """
+
+    NONE = "none"
+    PREPARING = "preparing"
+    READY = "ready"
+    FAILED = "failed"
+    REMOVED = "removed"
+
+    @property
+    def has_resources(self) -> bool:
+        """디스크에 branch나 worktree가 남아 있을 수 있는 단계인지."""
+
+        return self in (WorkspaceStatus.PREPARING, WorkspaceStatus.READY, WorkspaceStatus.FAILED)

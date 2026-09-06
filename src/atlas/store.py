@@ -29,9 +29,10 @@ from .schema import (
     RunFailure,
     RunStatus,
     TaskStatus,
+    WorkspaceStatus,
 )
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 _PRIORITY_RANK = {
     Priority.LOW: 0,
@@ -119,7 +120,18 @@ CREATE TABLE IF NOT EXISTS runs (
     finished_at      TEXT,
     failure_category TEXT,
     failure_message  TEXT,
-    previous_run_id  TEXT
+    previous_run_id  TEXT,
+    -- workspace lifecycle. git side effect를 DB transaction 안에서 오래 잡지
+    -- 않으려고 상태를 단계로 나눕니다(none -> preparing -> ready -> removed).
+    -- preparing에서 실패해도 branch/worktree_path가 남아 orphan을 식별합니다.
+    workspace_status     TEXT NOT NULL DEFAULT 'none',
+    branch               TEXT,
+    worktree_path        TEXT,
+    base_branch          TEXT,
+    base_revision        TEXT,
+    workspace_created_at TEXT,
+    workspace_removed_at TEXT,
+    workspace_error      TEXT
 );
 
 -- Task 하나에 active Run은 최대 하나입니다(execution-runtime.md의 Run Boundary).
@@ -155,6 +167,17 @@ class RunError(Exception):
         super().__init__(message)
         self.category = category
         self.message = message
+
+
+class WorkspaceConflict(RunError):
+    """이미 workspace가 있거나 기대한 단계가 아닙니다.
+
+    호출자가 idempotent하게 처리할 수 있도록 현재 Run을 함께 전달합니다.
+    """
+
+    def __init__(self, category: str, message: str, run: "Run | None" = None) -> None:
+        super().__init__(category, message)
+        self.run = run
 
 
 @dataclass(frozen=True)
@@ -231,6 +254,23 @@ class TaskStore:
         ):
             if column not in existing:
                 self._connection.execute(f"ALTER TABLE tasks ADD COLUMN {ddl}")
+
+        # schema v3 database의 runs에는 workspace 컬럼이 없습니다.
+        run_columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(runs)")
+        }
+        for column, ddl in (
+            ("workspace_status", "workspace_status TEXT NOT NULL DEFAULT 'none'"),
+            ("branch", "branch TEXT"),
+            ("worktree_path", "worktree_path TEXT"),
+            ("base_branch", "base_branch TEXT"),
+            ("base_revision", "base_revision TEXT"),
+            ("workspace_created_at", "workspace_created_at TEXT"),
+            ("workspace_removed_at", "workspace_removed_at TEXT"),
+            ("workspace_error", "workspace_error TEXT"),
+        ):
+            if column not in run_columns:
+                self._connection.execute(f"ALTER TABLE runs ADD COLUMN {ddl}")
 
         # schema v2 database의 events에는 run_id가 없습니다.
         event_columns = {
@@ -930,7 +970,214 @@ class TaskStore:
                 connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             )
 
+
+    # -- workspace lifecycle ---------------------------------------------
+
+    def begin_workspace(
+        self,
+        run_id: str,
+        *,
+        branch: str,
+        worktree_path: str,
+        base_branch: str,
+        base_revision: str,
+        now: datetime | None = None,
+    ) -> Run:
+        """git을 건드리기 전에 의도를 먼저 기록합니다.
+
+        git side effect를 DB transaction 안에서 잡지 않으려고 lifecycle을
+        나눕니다. `preparing` 기록이 먼저 남으므로 git 도중 실패해도 어떤
+        branch와 경로를 정리해야 하는지 알 수 있습니다.
+
+        이미 `ready`이거나 `preparing`이면 `WorkspaceConflict`를 냅니다.
+        """
+
+        moment = to_iso(now or utcnow())
+        with self._write() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunError("run_not_found", f"{run_id}를 찾을 수 없습니다.")
+            if RunStatus(row["status"]).is_terminal:
+                raise RunError(
+                    "run_terminal", f"{run_id}는 이미 종료돼 workspace를 만들 수 없습니다."
+                )
+
+            status = WorkspaceStatus(row["workspace_status"])
+            if status in (WorkspaceStatus.PREPARING, WorkspaceStatus.READY):
+                raise WorkspaceConflict(
+                    "workspace_already_exists",
+                    f"{run_id}에 이미 workspace가 있습니다 ({status.value}).",
+                    self._run_from_row(row),
+                )
+
+            connection.execute(
+                "UPDATE runs SET workspace_status = ?, branch = ?, worktree_path = ?, "
+                "base_branch = ?, base_revision = ?, workspace_error = NULL, "
+                "workspace_removed_at = NULL WHERE run_id = ?",
+                (
+                    WorkspaceStatus.PREPARING.value,
+                    branch,
+                    worktree_path,
+                    base_branch,
+                    base_revision,
+                    run_id,
+                ),
+            )
+            self._record(
+                connection,
+                kind="workspace_preparing",
+                moment=moment,
+                task_id=row["task_id"],
+                run_id=run_id,
+                detail={"branch": branch, "base_branch": base_branch, "base_revision": base_revision},
+            )
+            return self._run_from_row(
+                connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            )
+
+    def attach_workspace(
+        self, run_id: str, evidence: dict[str, Any] | None = None, now: datetime | None = None
+    ) -> Run:
+        """git 작업이 끝나고 검증까지 통과한 workspace를 `ready`로 확정합니다."""
+
+        moment = to_iso(now or utcnow())
+        with self._write() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunError("run_not_found", f"{run_id}를 찾을 수 없습니다.")
+            if WorkspaceStatus(row["workspace_status"]) is not WorkspaceStatus.PREPARING:
+                raise WorkspaceConflict(
+                    "workspace_not_preparing",
+                    f"{run_id}의 workspace가 preparing 상태가 아닙니다.",
+                    self._run_from_row(row),
+                )
+            connection.execute(
+                "UPDATE runs SET workspace_status = ?, workspace_created_at = ? WHERE run_id = ?",
+                (WorkspaceStatus.READY.value, moment, run_id),
+            )
+            self._record(
+                connection,
+                kind="workspace_ready",
+                moment=moment,
+                task_id=row["task_id"],
+                run_id=run_id,
+                detail={"branch": row["branch"], **(evidence or {})},
+            )
+            return self._run_from_row(
+                connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            )
+
+    def fail_workspace(
+        self, run_id: str, error: dict[str, Any], now: datetime | None = None
+    ) -> Run | None:
+        """workspace 준비 실패를 기록합니다.
+
+        `preparing` 기록과 branch/경로를 남겨 두어 orphan cleanup이 대상을
+        식별할 수 있게 합니다. `error`는 이미 redaction된 값이어야 합니다.
+        """
+
+        moment = to_iso(now or utcnow())
+        with self._write() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE runs SET workspace_status = ?, workspace_error = ? WHERE run_id = ?",
+                (
+                    WorkspaceStatus.FAILED.value,
+                    json.dumps(error, ensure_ascii=False, default=str),
+                    run_id,
+                ),
+            )
+            self._record(
+                connection,
+                kind="workspace_failed",
+                moment=moment,
+                task_id=row["task_id"],
+                run_id=run_id,
+                detail=error,
+            )
+            return self._run_from_row(
+                connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            )
+
+    def release_workspace(
+        self,
+        run_id: str,
+        *,
+        branch_kept: bool,
+        reason: str,
+        now: datetime | None = None,
+    ) -> Run:
+        """worktree 제거를 기록합니다. branch 보존 여부를 함께 남깁니다."""
+
+        moment = to_iso(now or utcnow())
+        with self._write() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunError("run_not_found", f"{run_id}를 찾을 수 없습니다.")
+            connection.execute(
+                "UPDATE runs SET workspace_status = ?, workspace_removed_at = ? WHERE run_id = ?",
+                (WorkspaceStatus.REMOVED.value, moment, run_id),
+            )
+            self._record(
+                connection,
+                kind="workspace_removed",
+                moment=moment,
+                task_id=row["task_id"],
+                run_id=run_id,
+                detail={"branch": row["branch"], "branch_kept": branch_kept, "reason": reason},
+            )
+            return self._run_from_row(
+                connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            )
+
+    def record_workspace_event(
+        self,
+        run_id: str,
+        kind: str,
+        detail: dict[str, Any],
+        now: datetime | None = None,
+    ) -> None:
+        """cleanup 실패나 reconciliation 판정을 감사 기록으로 남깁니다."""
+
+        moment = to_iso(now or utcnow())
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT task_id FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            self._record(
+                connection,
+                kind=kind,
+                moment=moment,
+                task_id=row["task_id"] if row else None,
+                run_id=run_id,
+                detail=detail,
+            )
+
+    def runs_with_workspace(self) -> list[Run]:
+        """정리 대상이 될 수 있는 workspace를 가진 Run을 돌려줍니다."""
+
+        rows = self._connection.execute(
+            "SELECT * FROM runs WHERE workspace_status IN (?, ?, ?) ORDER BY created_at ASC",
+            (
+                WorkspaceStatus.PREPARING.value,
+                WorkspaceStatus.READY.value,
+                WorkspaceStatus.FAILED.value,
+            ),
+        )
+        return [self._run_from_row(row) for row in rows]
+
+    def run_owning_branch(self, branch: str) -> Run | None:
+        """DB provenance 확인용. Atlas가 이 branch를 만들었는지 봅니다."""
+
+        row = self._connection.execute(
+            "SELECT * FROM runs WHERE branch = ? ORDER BY created_at DESC LIMIT 1", (branch,)
+        ).fetchone()
+        return self._run_from_row(row) if row else None
+
     # -- run reads -------------------------------------------------------
+
 
     def run(self, run_id: str) -> Run | None:
         row = self._connection.execute(
@@ -989,6 +1236,14 @@ class TaskStore:
             failure_category=row["failure_category"],
             failure_message=row["failure_message"],
             previous_run_id=row["previous_run_id"],
+            workspace_status=WorkspaceStatus(row["workspace_status"]),
+            branch=row["branch"],
+            worktree_path=row["worktree_path"],
+            base_branch=row["base_branch"],
+            base_revision=row["base_revision"],
+            workspace_created_at=row["workspace_created_at"],
+            workspace_removed_at=row["workspace_removed_at"],
+            workspace_error=row["workspace_error"],
         )
 
     # -- reads -----------------------------------------------------------

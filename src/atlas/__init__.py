@@ -5,7 +5,7 @@
 PR delivery는 구현하지 않았습니다.
 """
 
-from .config import ClaimConfig, PollingConfig, RunConfig, WorkerConfig
+from .config import ClaimConfig, PollingConfig, RunConfig, WorkerConfig, WorkspaceConfig
 from .idempotency import IdempotencyKey, InProcessIntakeCache
 from .intake import IssueIntake
 from .issue_source import (
@@ -16,6 +16,7 @@ from .issue_source import (
     IssueSourceError,
 )
 from .parser import ParsedBody, parse_issue_body
+from .gitcmd import GitError, GitRunner
 from .polling import IssuePoller, PollReport, candidate_rejection, is_task_candidate
 from .reconciliation import ReconcileReport, RunReconciler, RunVerdict
 from .schema import (
@@ -28,8 +29,11 @@ from .schema import (
     Task,
     TaskStatus,
     ValidationIssue,
+    WorkspaceStatus,
 )
-from .store import Claim, Registration, RunError, TaskStore
+from .store import Claim, Registration, RunError, TaskStore, WorkspaceConflict
+from .workspace import WorkspaceError, WorkspacePlanner, branch_name
+from .workspace_service import CleanupResult, WorkspaceResult, WorkspaceService
 from .validation import validate_intake
 
 __all__ = [
@@ -62,8 +66,19 @@ __all__ = [
     "Task",
     "TaskStatus",
     "TaskStore",
+    "CleanupResult",
+    "GitError",
+    "GitRunner",
     "ValidationIssue",
     "WorkerConfig",
+    "WorkspaceConfig",
+    "WorkspaceConflict",
+    "WorkspaceError",
+    "WorkspacePlanner",
+    "WorkspaceResult",
+    "WorkspaceService",
+    "WorkspaceStatus",
+    "branch_name",
     "candidate_rejection",
     "is_task_candidate",
     "parse_issue_body",

@@ -1,14 +1,42 @@
 # ADR-010: Task Execution Isolation
 
-- Status: Proposed
+- Status: Partially Accepted
 - Date: 2026-08-31
+- Accepted: 2026-09-06 (filesystem/branch isolation 부분)
 - Decision owners: Project owner
 
 ## Context
 
 Atlas가 여러 Project와 Task를 처리하면 conversation, mutable filesystem, branch, process, log가 섞일 위험이 있습니다. 논리적인 Task ID만으로는 동시 실행 충돌, stale process, 다른 Project context 유출을 막을 수 없습니다.
 
-현재 자동 Runner와 isolation enforcement는 구현되지 않았습니다.
+branch와 worktree isolation은 구현됐습니다. executor process isolation은 구현되지 않았습니다.
+
+## Accepted Scope (2026-09-06)
+
+Project owner가 worktree/branch isolation 구현을 지시하면서 **filesystem과 branch 격리 부분만** 승인했습니다. process와 executor 관련 결정은 실행할 executor가 아직 없으므로 `Proposed`로 남깁니다.
+
+### Accepted
+
+- Run마다 unique Task ID와 unique Run ID를 가집니다.
+- Run마다 dedicated branch를 사용합니다. 이름은 `atlas/<task-id>/<run-id-short>`이며 Atlas namespace(`atlas/`) 밖의 branch는 만들지도 삭제하지도 않습니다.
+- Run마다 dedicated git worktree를 사용합니다. clone은 이번에 채택하지 않았고 필요해지면 별도로 결정합니다.
+- worktree의 resolved path는 Project별 worker root 아래여야 하며 path traversal과 symlink escape를 거부합니다.
+- `main`을 포함한 보호 branch를 직접 checkout하거나 수정하지 않습니다.
+- Atlas가 만들었다고 증명할 수 있는 리소스만 정리합니다. 증명은 Atlas branch namespace와 operational store의 provenance 기록이 함께 성립할 때만 인정합니다.
+- 여러 Task가 하나의 mutable worktree를 공유하지 않고, 여러 Run이 같은 branch를 동시에 수정하지 않습니다.
+
+### 계속 Proposed
+
+- dedicated executor process와 이전 shell/conversation 재사용 금지. executor를 실행하는 slice에서 결정합니다.
+- explicit timeout과 cancellation state.
+- clone per Task를 선택할 기준.
+- credential injection과 회수 절차.
+- orphan process 탐지와 강제 종료.
+
+### Open
+
+- worktree retention 기간과 disk 사용량 정책.
+- 여러 Project를 다룰 때 worker root를 Project별로 분리할 방식.
 
 ## Proposed Decision
 
@@ -63,8 +91,11 @@ worker는 Run 종료 시 child process를 중지하고, credential을 해제하�
 
 ## Follow-up Tasks
 
-- [ ] Project owner가 Task/Run isolation 제안을 승인
-- [ ] branch naming, worktree root, Run ID format 결정
-- [ ] concurrent branch lock과 process ownership acceptance test 작성
-- [ ] success, failure, cancel, timeout별 cleanup matrix 정의
-- [ ] stale worktree와 orphan process recovery 절차 검증
+- [x] Project owner가 filesystem/branch isolation 범위를 승인
+- [x] branch naming(`atlas/<task-id>/<run-id-short>`)과 worktree root 결정
+- [x] success, failure, cancel, orphaned별 branch 보존 정책 정의
+- [x] stale worktree recovery 판정 절차 구현 (임의 복구 없이 근거만 기록)
+- [ ] Project owner가 executor process isolation 범위를 승인
+- [ ] concurrent process ownership acceptance test 작성
+- [ ] orphan process recovery 절차 검증
+- [ ] worktree retention과 disk 사용량 정책 결정
