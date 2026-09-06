@@ -87,6 +87,8 @@ class PublicationFailure(str, Enum):
     AUTHORIZATION_LOST = "publication_authorization_lost"
     # commit 내용이 검증한 내용과 다릅니다.
     CONTENT_MISMATCH = "publication_content_mismatch"
+    # 내용 지문을 계산하지 못했습니다. 증명할 수 없으면 게시하지 않습니다.
+    CONTENT_DIGEST_UNAVAILABLE = "publication_content_digest_unavailable"
 
 
 @dataclass(frozen=True)

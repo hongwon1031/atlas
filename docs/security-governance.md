@@ -135,8 +135,11 @@ Atlas가 지키는 것과 지키지 않는 것을 나눠 적습니다.
 - **git/GitHub credential 값을 읽어 저장하지 않습니다.** argv, DB, log, event, 오류 메시지 어디에도 넣지 않습니다. 환경의 credential helper와 Authorization 헤더로만 씁니다.
 - 외부 side effect마다 durable checkpoint를 남기고, 모호한 외부 상태를 자동으로 덮어쓰지 않습니다.
 - **crash 이후 기존 commit 채택은 내용에 근거합니다.** subject나 "base+1" 같은 metadata만으로 우리 commit이라고 판단하지 않습니다. 검증 시점에 저장한 내용 지문과 일치해야 채택하고, 지문이 없으면 채택하지 않습니다.
-- **push 직전에 remote URL을 다시 읽고 검증합니다.** 예약 시점 검증만 믿으면 그 사이 `git remote set-url`로 대상이 바뀔 수 있습니다. 확인한 URL을 그대로 push 대상으로 써서 확인과 사용 사이의 간격을 없앱니다.
-- **외부 side effect를 만들기 직전마다 승인과 claim을 다시 확인합니다.** push 직전과 PR 생성 직전 두 곳입니다. 이미 만든 side effect는 되돌리지 않고 checkpoint를 남긴 뒤 실패시킵니다.
+- **push 직전에 remote URL을 다시 읽고 검증합니다.** 예약 시점 검증만 믿으면 그 사이 `git remote set-url`로 대상이 바뀔 수 있습니다. 확인한 URL을 그대로 push 대상으로 써서 확인과 사용 사이의 간격을 없앱니다. **어떤 경우에도 remote 이름으로 되돌아가지 않습니다.**
+- SSH URL의 `git@`은 credential이 아니라 username입니다. 인증은 SSH agent가 합니다. HTTP(S) URL에 실제 credential이 박혀 있으면 argv 노출과 race를 모두 피하기 위해 **거부합니다.** credential은 credential helper가 들고 있어야 합니다.
+- **외부 side effect를 만들기 직전마다 승인과 claim을 다시 확인합니다.** 마지막 확인은 `git push` 명령과 PR 생성 POST **바로 앞**에 둡니다. remote·PR 조회는 network 호출이라 그 사이에 권한이 사라질 수 있습니다. 이미 만든 side effect는 되돌리지 않고 checkpoint를 남긴 뒤 실패시킵니다.
+- **내용 지문을 계산하지 못하면 게시하지 않습니다.** 검증한 내용만 게시한다는 보장을 증명할 수 없기 때문입니다. commit도 push도 PR도 만들지 않습니다.
+- 게시 service는 요청 상태를 instance에 보관하지 않습니다. 동시 요청이 서로의 worker 권한으로 확인하는 일이 없어야 합니다.
 
 ### Provider credential
 

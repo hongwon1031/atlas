@@ -929,3 +929,81 @@ PR 본문이 "Published DB record but remote evidence missing"을 지원한다�
 #### 확인하지 못한 항목
 
 앞 절의 항목이 그대로 남습니다. 실제 GitHub push와 PR 생성은 여전히 미검증이고, 파일 mode는 내용 지문에 포함하지 않습니다.
+
+### 2026-09-06 추가 — SSH remote race, 늦은 권한 확인, 요청 상태, 지문 fail-closed
+
+final review 네 건을 고치고 다시 검증했습니다.
+
+#### SSH remote에서 TOCTOU가 되살아나던 문제
+
+`_has_userinfo`가 `git@github.com:owner/repo.git`의 `git@`을 credential로 오인해 remote 이름으로 되돌아갔습니다. 그러면 검증한 URL이 아니라 이름으로 push하게 되고, 그 사이 `set-url`로 대상을 바꿀 수 있습니다. **정상 SSH remote에서 race가 그대로 남아 있었습니다.**
+
+SSH username은 credential이 아닙니다. 인증은 SSH agent가 하고 URL에 secret이 없습니다. HTTP(S) URL의 실제 credential만 구분해 거부합니다.
+
+| remote 형태 | 결과 |
+| --- | --- |
+| `git@github.com:owner/repo.git` | 검증한 exact URL을 대상으로 사용 |
+| `ssh://git@github.com/owner/repo.git` | 검증한 exact URL |
+| `https://github.com/owner/repo.git` | 검증한 exact URL |
+| 로컬 bare 경로 | 검증한 exact 경로 |
+| `https://token@github.com/...` | **거부**. push 0 |
+| `https://user:pass@github.com/...` | **거부** |
+| 이름으로 되돌아가는 경로 | 없음 |
+| 검증 뒤 이름의 대상 변경 | push 목적지 불변. 원래 bare에만 올라감 |
+| 거부 근거에 token | 없음 |
+
+#### authorization 확인이 side effect에서 멀었던 문제
+
+기존에는 단계 진입 시점에만 확인했습니다. 그런데 `ls-remote`와 PR 조회는 network 호출이라 그 사이에 승인이 회수돼도 실제 push나 POST가 실행됐습니다.
+
+마지막 확인을 `git push` 명령과 `create_draft` POST **바로 앞**으로 옮겼습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| `remote_head` 조회 도중 승인 회수 | push 0. stage=`push_command` |
+| `remote_head` 조회 도중 lease 만료 | push 0 |
+| `find_open` 도중 승인 회수 | `create_draft` 0. stage=`pr_create_call` |
+| `find_open` 도중 claim 해제 | `create_draft` 0 |
+| 기존 PR 채택 경로 | 외부 write가 아니므로 POST 직전 확인 없음. `Published` 확정 직전에는 확인 |
+| 정상 경로 | 영향 없음 |
+
+push가 필요 없는 경우(remote가 이미 같은 commit)는 외부 write가 없으므로 추가 확인을 하지 않습니다.
+
+#### service가 요청 상태를 들고 있던 문제
+
+`publish()`가 `worker_id`를 instance에 보관해, 같은 instance로 동시 게시하면 서로 덮어쓸 수 있었습니다. **다른 worker의 권한으로 확인**하게 됩니다.
+
+`self._worker_id`를 제거하고 호출 인자로만 흘립니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| instance 상태 | `_worker_id` 속성 없음 |
+| 서로 다른 worker의 게시 두 건 | 각 확인이 자기 worker를 사용 |
+| 다른 worker의 게시 시도 | gate가 거부. push 0 |
+
+#### 지문 계산 실패를 통과시키던 문제
+
+`safe_content_digest`가 `computed=False`를 돌려줘도 무결성 확인이 계속 진행했고, commit 직후 확인도 지문이 없으면 건너뛰었습니다. "검증한 내용만 게시한다"는 보장을 증명하지 못한 채 게시되는 경로였습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 지문 계산 실패(`computed=false`) | `publication_content_digest_unavailable`. **commit 0, push 0, PR 0** |
+| 빈 digest | 같은 분류로 차단 |
+| commit 직후 지문 부재 | 건너뛰지 않고 실패 |
+| 실패 기록 | raw source 없음 |
+| 정상 지문 | 동작 변화 없음 |
+
+#### 회귀 테스트가 실제로 잡는지 확인
+
+네 수정(SSH exact URL, push 직전 확인, POST 직전 확인, 지문 fail-closed)을 각각 되돌렸습니다. **16건이 실패**했고 복원하니 전부 통과했습니다.
+
+#### 재실행한 검증
+
+- 전체 테스트 통과
+- `compileall` (src, tests) 통과
+- bare remote smoke 재실행 통과
+- secret scan, `git diff --check` 통과
+
+#### 확인하지 못한 항목
+
+앞 절의 항목이 그대로 남습니다. 실제 GitHub push와 PR 생성, 실제 SSH remote로의 push는 여전히 미검증입니다.

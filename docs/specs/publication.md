@@ -61,8 +61,15 @@ Run 하나에 active publication은 최대 하나입니다. **database의 partia
 
 | 시점 | 확인 | 실패 시 |
 | --- | --- | --- |
-| push 직전 | 승인·claim·owner·lease·workspace·branch | push하지 않음. `publication_authorization_lost` |
-| PR 생성 직전 | 같은 항목 | PR을 만들지 않음. **이미 push한 branch는 되돌리지 않음** |
+| push 단계 진입 | 승인·claim·owner·lease·workspace·branch | push하지 않음 |
+| **`git push` 바로 앞** | 같은 항목 | push하지 않음. `publication_authorization_lost` |
+| PR 단계 진입 | 같은 항목 | PR을 만들지 않음 |
+| **`create_draft` POST 바로 앞** | 같은 항목 | PR을 만들지 않음. **이미 push한 branch는 되돌리지 않음** |
+| `Published` 확정 직전 | 같은 항목 | 확정하지 않음 |
+
+**마지막 확인이 side effect에 최대한 붙어 있어야 합니다.** `ls-remote`와 PR 조회는 network 호출이라 수백 밀리초가 걸립니다. 단계 진입 시점에만 확인하면 그 사이에 승인이 회수돼도 실제 push나 POST가 실행됩니다.
+
+remote가 이미 같은 commit을 가리켜 push가 필요 없으면 외부 write가 없으므로 추가 확인을 하지 않습니다. 기존 PR 채택도 **외부 write가 아닙니다** — GitHub에 아무것도 만들지 않고 이미 있는 것을 기록만 합니다. 다만 `Published` 확정 직전에 권한을 다시 봅니다.
 
 시작 gate와 다른 검사 집합을 씁니다. 진행 중에는 Run이 이미 `Validating`이 아니고 publication도 이미 active이므로, 문맥에 의존하는 항목(`not_already_published`, `run_succeeded` 등)까지 보면 정상 경로가 막힙니다. **재사용 가능한 `authorization_checks`**로 분리했습니다.
 
@@ -104,6 +111,16 @@ commit 직전에 검증 이후 worktree가 그대로인지 확인합니다.
 
 5번이 실제 증명이고 1~4는 값싼 사전 거름입니다. 기록된 지문이 없으면 채택하지 않습니다(fail closed). 같은 Run의 이전 attempt가 남긴 지문은 유효한 근거로 인정합니다.
 
+#### 지문을 계산하지 못하면 게시하지 않습니다
+
+이번 단계의 보장은 "검증한 내용만 게시한다"입니다. 그 내용을 증명할 지문을 계산하지 못했다면 보장을 지킬 수 없습니다.
+
+- 무결성 확인 단계에서 지문이 `computed=false`이거나 비어 있으면 **commit을 시작하기 전에** 실패합니다.
+- commit 직후 확인도 지문이 없으면 건너뛰지 않고 실패합니다.
+- 분류는 `publication_content_digest_unavailable`입니다.
+
+commit도 push도 PR도 만들지 않습니다.
+
 내용이 다른 commit이 branch에 있으면 `publication_content_mismatch`이고 `RecoveryRequired`입니다. 덮어쓰지 않습니다.
 
 정상 경로에서도 **방금 만든 commit이 검증한 내용과 같은지 확인합니다.** stage 과정의 예상치 못한 변환이 있었다면 여기서 드러납니다.
@@ -124,6 +141,10 @@ canonical 표현입니다.
 담지 않는 것은 **raw source**입니다. digest와 개수만 저장합니다. 파일 mode도 담지 않습니다. Windows에서 실행 비트를 신뢰할 수 없기 때문이고, 이것은 알려진 한계입니다.
 
 `PublicationService`의 resume와 `PublicationReconciler`의 채택이 **같은 verifier**를 씁니다.
+
+### service는 요청 상태를 들고 있지 않습니다
+
+`PublicationService` instance 하나로 여러 게시를 처리할 수 있습니다. `worker_id`를 instance에 보관하면 동시 요청이 서로 덮어써서 **다른 worker의 권한으로 확인**하게 됩니다. 그래서 요청 값은 instance가 아니라 호출 인자로만 흐릅니다.
 
 ## Commit policy
 
@@ -201,7 +222,21 @@ suffix 비교는 `https://github.com/evil/owner/repo.git` 같은 lookalike URL�
 
 그리고 **확인한 URL을 그대로 push 대상으로 씁니다.** 이름을 한 번 더 거치지 않으므로 확인과 사용 사이의 간격이 사라집니다. `ls-remote`도 같은 대상을 씁니다.
 
-URL에 credential이 박혀 있으면(`https://user:token@host/...`) argv에 넣을 수 없으므로 그때만 remote 이름을 씁니다. 그 경우에도 직전에 URL을 검증했습니다.
+**이름으로 되돌아가는 경로를 두지 않습니다.** 어떤 이유로든 이름을 쓰면 그 순간 race가 되살아납니다.
+
+#### SSH username은 credential이 아닙니다
+
+`git@github.com:owner/repo.git`과 `ssh://git@github.com/owner/repo.git`의 `git@`은 SSH username입니다. 인증은 SSH agent가 하고 URL에는 secret이 없습니다. 이것을 credential로 오인해 이름으로 되돌아가면 정상 SSH remote에서 race가 되살아납니다.
+
+| remote 형태 | push 대상 |
+| --- | --- |
+| `git@github.com:owner/repo.git` | 검증한 exact URL |
+| `ssh://git@github.com/owner/repo.git` | 검증한 exact URL |
+| `https://github.com/owner/repo.git` | 검증한 exact URL |
+| `https://token@github.com/...` | **거부** |
+| `https://user:pass@github.com/...` | **거부** |
+
+HTTP(S) URL에 실제 credential이 박혀 있으면 argv에 넣을 수 없고, 이름으로 우회하면 race가 되살아납니다. 그래서 **거부합니다**(fail closed). credential은 credential helper나 SSH agent가 들고 있어야 합니다. 거부 근거에 URL이나 token을 넣지 않습니다.
 
 reconciliation도 저장된 `remote_url`과 현재 URL이 다르면 `publication_remote_changed`로 남깁니다. 근거에 URL 자체를 넣지 않습니다. credential이 박혀 있을 수 있습니다.
 
@@ -336,6 +371,7 @@ Run failure taxonomy와 **분리합니다.**
 | `publication_remote_changed` | 예약 이후 remote가 다른 대상 | 아니오 |
 | `publication_authorization_lost` | 예약 이후 승인·claim 상실 | 아니오 |
 | `publication_content_mismatch` | commit 내용이 검증한 내용과 다름 | **예** |
+| `publication_content_digest_unavailable` | 내용 지문을 계산하지 못함 | 아니오 |
 
 ## CLI
 

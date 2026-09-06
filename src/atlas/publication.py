@@ -172,7 +172,6 @@ class PublicationService:
         self._pull_requests = pull_requests or GitHubPullRequestClient()
         # 기본값은 엄격한 GitHub 검증입니다. 환경변수로 끌 수 없습니다.
         self._remote_identity = remote_identity or GitHubRemoteIdentity()
-        self._worker_id = ""
 
     @property
     def config(self) -> PublicationConfig:
@@ -383,12 +382,25 @@ class PublicationService:
     def _push_target(remote: str, url: str) -> str:
         """push와 조회에 쓸 대상.
 
-        URL에 credential이 박혀 있으면 argv에 넣을 수 없으므로 remote 이름을
-        씁니다. 그 경우에도 직전에 URL을 검증했습니다.
+        **검증한 exact URL을 그대로 씁니다.** remote 이름으로 되돌아가면
+        검증과 사용 사이에 `set-url`이 끼어들 수 있습니다.
+
+        `git@github.com:owner/repo.git`이나 `ssh://git@github.com/...`의
+        `git@`은 secret이 아니라 SSH username입니다. credential은 SSH agent가
+        들고 있으므로 URL을 argv에 넣어도 노출되는 것이 없습니다.
+
+        HTTPS URL에 실제 credential(`https://token@...`,
+        `https://user:pass@...`)이 박혀 있으면 argv에 넣을 수 없고, 이름으로
+        우회하면 race가 되살아납니다. 그래서 **거부합니다.** credential은
+        credential helper가 들고 있어야 합니다.
         """
 
-        if _has_userinfo(url):
-            return remote
+        if _has_http_credential(url):
+            raise PublicationError(
+                PublicationFailure.REMOTE_INVALID,
+                "remote URL에 credential이 박혀 있습니다. credential helper를 쓰세요.",
+                {"remote": remote, "scheme": "http(s)"},
+            )
         return url
 
     # -- 실행 ---------------------------------------------------------------
@@ -412,7 +424,6 @@ class PublicationService:
         base_branch = run.base_branch or "main"
         repository = str(task.get("repository") or "")
 
-        self._worker_id = worker_id
         publication_id = self._store.start_publication(
             run_id,
             worker_id=worker_id,
@@ -426,7 +437,14 @@ class PublicationService:
 
         try:
             return self._execute(
-                publication_id, run, task, validation, repository, base_branch, remote
+                publication_id,
+                run,
+                task,
+                validation,
+                repository,
+                base_branch,
+                remote,
+                worker_id,
             )
         except PublicationError as error:
             self._fail(publication_id, run_id, error)
@@ -448,6 +466,7 @@ class PublicationService:
         repository: str,
         base_branch: str,
         remote: str,
+        worker_id: str,
     ) -> PublicationReport:
         adopted: list[str] = []
         warnings: list[str] = []
@@ -466,9 +485,9 @@ class PublicationService:
         # E~G. push 직전에 근거와 remote를 모두 다시 확인합니다.
         self._store.update_publication(publication_id, status=PublicationStatus.PUSHING)
         self._require_authorization(
-            publication_id, run, self._worker_id, "push", side_effects_exist=False
+            publication_id, run, worker_id, "push", side_effects_exist=False
         )
-        pushed_new = self._push(publication_id, run, remote, commit_sha)
+        pushed_new = self._push(publication_id, run, remote, commit_sha, worker_id)
         if not pushed_new:
             adopted.append("remote_branch")
 
@@ -478,7 +497,7 @@ class PublicationService:
             publication_id, status=PublicationStatus.CREATING_PR
         )
         self._require_authorization(
-            publication_id, run, self._worker_id, "pull_request", side_effects_exist=True
+            publication_id, run, worker_id, "pull_request", side_effects_exist=True
         )
         pull_request, created = self._pull_request(
             publication_id,
@@ -490,11 +509,15 @@ class PublicationService:
             commit_sha,
             changed_files,
             warnings,
+            worker_id,
         )
         if not created:
             adopted.append("pull_request")
 
-        # K. 확정
+        # K. 확정. 채택 경로도 권한 없이 Published로 만들지 않습니다.
+        self._require_authorization(
+            publication_id, run, worker_id, "publish", side_effects_exist=True
+        )
         summary = (
             f"published: commit={commit_sha[:12]} branch={run.branch} "
             f"pr=#{pull_request.number}"
@@ -619,6 +642,14 @@ class PublicationService:
         digest = safe_content_digest(
             run.worktree_path, run.base_revision, timeout_seconds=self._config.git_timeout_seconds
         )
+        if not digest.computed or not digest.digest:
+            # 이번 slice의 보장은 "검증한 내용만 게시한다"입니다. 그 내용을
+            # 증명할 지문을 계산하지 못했으면 commit도 push도 하지 않습니다.
+            raise PublicationError(
+                PublicationFailure.CONTENT_DIGEST_UNAVAILABLE,
+                "변경 내용의 지문을 계산하지 못했습니다. 게시하지 않습니다.",
+                {"reason": digest.reason, "base": digest.base},
+            )
         self._store.update_publication(
             publication_id,
             content_digest=digest.to_dict(),
@@ -845,21 +876,26 @@ class PublicationService:
                 PublicationFailure.COMMIT_FAILED, "commit 후 branch가 바뀌었습니다."
             )
 
-        # 방금 만든 commit이 검증한 내용과 같은지 확인합니다. stage 과정에서
-        # 예상치 못한 변환(줄바꿈, filter)이 있었다면 여기서 드러납니다.
-        if expected is not None and expected.computed:
-            actual = safe_content_digest(
-                run.worktree_path,
-                run.base_revision,
-                commit_sha,
-                timeout_seconds=self._config.git_timeout_seconds,
+        # 방금 만든 commit이 검증한 내용과 같은지 **반드시** 확인합니다.
+        # 지문이 없으면 확인할 수 없으므로 진행하지 않습니다. stage 과정의
+        # 예상치 못한 변환(줄바꿈, filter)도 여기서 드러납니다.
+        if expected is None or not expected.computed:
+            raise PublicationError(
+                PublicationFailure.CONTENT_DIGEST_UNAVAILABLE,
+                "검증한 내용의 지문이 없어 commit을 확인할 수 없습니다.",
             )
-            if not expected.matches(actual):
-                raise PublicationError(
-                    PublicationFailure.CONTENT_MISMATCH,
-                    "만든 commit의 내용이 검증한 내용과 다릅니다.",
-                    {"expected_digest": expected.digest, "actual_digest": actual.digest},
-                )
+        actual = safe_content_digest(
+            run.worktree_path,
+            run.base_revision,
+            commit_sha,
+            timeout_seconds=self._config.git_timeout_seconds,
+        )
+        if not expected.matches(actual):
+            raise PublicationError(
+                PublicationFailure.CONTENT_MISMATCH,
+                "만든 commit의 내용이 검증한 내용과 다릅니다.",
+                {"expected_digest": expected.digest, "actual_digest": actual.digest},
+            )
 
         # D. checkpoint. 여기서 죽어도 재시작 시 HEAD를 보고 채택합니다.
         self._store.update_publication(
@@ -876,7 +912,9 @@ class PublicationService:
 
     # -- F. push ------------------------------------------------------------
 
-    def _push(self, publication_id: str, run, remote: str, commit_sha: str) -> bool:
+    def _push(
+        self, publication_id: str, run, remote: str, commit_sha: str, worker_id: str
+    ) -> bool:
         """필요할 때만 push합니다. `True`면 이번에 push했습니다."""
 
         git = GitRunner(run.worktree_path, timeout_seconds=self._config.push_timeout_seconds)
@@ -912,6 +950,11 @@ class PublicationService:
                 {"remote_sha": remote_sha, "local_sha": commit_sha, "branch": run.branch},
             )
 
+        # **실제 push 바로 앞**에서 마지막으로 확인합니다. remote 조회는
+        # network 호출이라 그 사이에 승인이 회수될 수 있습니다.
+        self._require_authorization(
+            publication_id, run, worker_id, "push_command", side_effects_exist=False
+        )
         try:
             git.push_branch(target, run.branch, commit_sha)
         except GitError as error:
@@ -954,8 +997,15 @@ class PublicationService:
         commit_sha: str,
         changed_files: tuple[str, ...],
         warnings: list[str],
+        worker_id: str,
     ) -> tuple[PullRequestRef, bool]:
-        """draft PR을 만듭니다. 이미 있으면 채택합니다."""
+        """draft PR을 만듭니다. 이미 있으면 채택합니다.
+
+        기존 PR 채택은 **외부 write가 아닙니다.** GitHub에 아무것도 만들지
+        않고 이미 있는 것을 기록만 합니다. 그래서 채택 경로에는 side effect
+        직전 재확인을 두지 않습니다. 대신 `Published` 확정 직전에 권한을
+        다시 봅니다.
+        """
 
         row = self._store.publication(publication_id)
         if row and row["pr_number"]:
@@ -1008,6 +1058,11 @@ class PublicationService:
         )
         title = pull_request_title(run.task_id, str(task.get("objective") or ""))
 
+        # **실제 POST 바로 앞**에서 마지막으로 확인합니다. PR 조회도 network
+        # 호출이라 그 사이에 승인이 회수될 수 있습니다.
+        self._require_authorization(
+            publication_id, run, worker_id, "pr_create_call", side_effects_exist=True
+        )
         created = self._pull_requests.create_draft(
             repository, run.branch, base_branch, title, body
         )
@@ -1126,16 +1181,25 @@ class PublicationService:
         }
 
 
-def _has_userinfo(url: str) -> bool:
-    """URL에 credential이 박혀 있는지 확인합니다.
+def _has_http_credential(url: str) -> bool:
+    """HTTP(S) URL에 실제 credential이 박혀 있는지 확인합니다.
 
-    박혀 있으면 argv에 넣을 수 없습니다. token이 명령줄에 노출됩니다.
+    SSH username은 credential이 아닙니다. `git@github.com:owner/repo.git`의
+    `git`은 계정 이름일 뿐이고 인증은 SSH agent가 합니다. 그것까지 거부하면
+    정상 SSH remote를 쓸 수 없습니다.
+
+    반면 `https://token@github.com/...`이나 `https://user:pass@...`는 URL 자체가
+    credential을 담고 있습니다.
     """
 
     text = (url or "").strip()
     if "://" not in text:
-        return "@" in text.split(":", 1)[0]
-    authority = text.split("://", 1)[1].split("/", 1)[0]
+        # scp-style(`git@host:path`)은 SSH입니다.
+        return False
+    scheme, _, rest = text.partition("://")
+    if scheme.lower() not in ("http", "https"):
+        return False
+    authority = rest.split("/", 1)[0]
     return "@" in authority
 
 

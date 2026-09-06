@@ -45,7 +45,7 @@ from atlas.validation import validate_intake
 from atlas.validation_models import ValidationStatus
 from atlas.workspace import PROTECTED_BRANCHES, WorkspacePlanner
 from atlas.workspace_service import WorkspaceService
-from atlas.worktree_changes import content_digest
+from atlas.worktree_changes import ContentDigest, content_digest
 from tests.fixtures import make_issue
 
 GIT_AVAILABLE = shutil.which("git") is not None
@@ -491,10 +491,10 @@ class PublicationTestCase(unittest.TestCase):
         self.store.finish_run(run.run_id, RunStatus.SUCCEEDED)
         return self.store.run(run.run_id)
 
-    def finish_validation(self, run_id, outcome="passed"):
+    def finish_validation(self, run_id, outcome="passed", worker_id=WORKER):
         validation_id = self.store.start_validation(
             run_id,
-            worker_id=WORKER,
+            worker_id=worker_id,
             cwd=self.store.run(run_id).worktree_path,
             plan={"steps": [], "trust": {"policy": "trusted"}},
         )
@@ -1561,6 +1561,389 @@ class PublishedEvidenceTest(PublicationTestCase):
         self.assertTrue(
             any(f["kind"] == "publication_published_without_pr" for f in findings), findings
         )
+
+
+class PushTargetTest(unittest.TestCase):
+    """검증한 exact URL을 그대로 push 대상으로 써야 합니다."""
+
+    def target(self, url):
+        return PublicationService._push_target("origin", url)
+
+    def test_scp_style_ssh_uses_the_exact_url(self):
+        """`git@`은 SSH username입니다. secret이 아닙니다."""
+
+        url = "git@github.com:hongwon1031/atlas.git"
+
+        self.assertEqual(self.target(url), url)
+
+    def test_ssh_scheme_uses_the_exact_url(self):
+        url = "ssh://git@github.com/hongwon1031/atlas.git"
+
+        self.assertEqual(self.target(url), url)
+
+    def test_https_without_credential_uses_the_exact_url(self):
+        url = "https://github.com/hongwon1031/atlas.git"
+
+        self.assertEqual(self.target(url), url)
+
+    def test_https_with_token_userinfo_is_rejected(self):
+        for url in (
+            "https://ghp_tokenvalue123456@github.com/hongwon1031/atlas.git",
+            "https://user:password@github.com/hongwon1031/atlas.git",
+            "http://token@github.com/hongwon1031/atlas.git",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(PublicationError) as caught:
+                    self.target(url)
+                self.assertIs(caught.exception.failure, PublicationFailure.REMOTE_INVALID)
+                # 근거에 URL이나 token이 들어가면 안 됩니다.
+                self.assertNotIn("ghp_", str(caught.exception.evidence))
+                self.assertNotIn("password", str(caught.exception.evidence))
+
+    def test_local_path_uses_the_exact_target(self):
+        """테스트용 bare remote 경로도 그대로 씁니다."""
+
+        self.assertEqual(self.target("/tmp/bare.git"), "/tmp/bare.git")
+
+    def test_never_falls_back_to_the_remote_name(self):
+        """이름으로 되돌아가면 검증과 사용 사이에 race가 생깁니다."""
+
+        for url in (
+            "git@github.com:o/r.git",
+            "ssh://git@github.com/o/r.git",
+            "https://github.com/o/r.git",
+            "/tmp/x.git",
+        ):
+            with self.subTest(url=url):
+                self.assertNotEqual(self.target(url), "origin")
+
+
+class SshRemoteTargetTest(PublicationTestCase):
+    """SSH remote에서도 이름이 아니라 URL로 push해야 합니다."""
+
+    def push_calls(self, expect_failure=True):
+        calls: list[tuple[str, ...]] = []
+        original = GitRunner.run
+
+        def spy(self_runner, *args, **kwargs):
+            calls.append(args)
+            return original(self_runner, *args, **kwargs)
+
+        GitRunner.run = spy
+        try:
+            self.publish()
+        except Exception:  # noqa: BLE001 - SSH는 실제로 붙지 않습니다.
+            if not expect_failure:
+                raise
+        finally:
+            GitRunner.run = original
+        return calls
+
+    def test_scp_style_remote_is_used_as_the_target(self):
+        url = "git@github.com:hongwon1031/atlas.git"
+        git("remote", "set-url", "bare", url, cwd=Path(self.run.worktree_path))
+
+        calls = self.push_calls()
+
+        remote_ops = [c for c in calls if c and c[0] in ("ls-remote", "push")]
+        self.assertTrue(remote_ops, calls)
+        for call in remote_ops:
+            # 이름이 아니라 URL이 대상이어야 합니다.
+            self.assertIn(url, call)
+            self.assertNotIn("bare", call)
+
+    def test_local_bare_remote_is_used_as_the_target(self):
+        calls = self.push_calls(expect_failure=False)
+
+        remote_ops = [c for c in calls if c and c[0] in ("ls-remote", "push")]
+        self.assertTrue(remote_ops)
+        for call in remote_ops:
+            self.assertIn(str(self.bare), call)
+            self.assertNotIn("bare", call)
+
+    def test_https_credential_remote_is_rejected_before_push(self):
+        git(
+            "remote", "set-url", "bare",
+            "https://ghp_secretvalue1234567890@github.com/hongwon1031/atlas.git",
+            cwd=Path(self.run.worktree_path),
+        )
+        identity = self.identity
+
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+
+        self.assertIs(caught.exception.failure, PublicationFailure.REMOTE_INVALID)
+        self.assertIsNone(self.bare_head())
+        blob = json.dumps([dict(r) for r in self.store.events()], ensure_ascii=False)
+        self.assertNotIn("ghp_secretvalue", blob)
+
+    def test_renaming_the_remote_after_verification_cannot_redirect_push(self):
+        """검증 뒤 이름이 가리키는 대상을 바꿔도 push 목적지는 그대로입니다."""
+
+        other = self.root / "hijack.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(other)], check=True, capture_output=True
+        )
+        original = GitRunner.push_branch
+        seen: list[str] = []
+
+        def spy(self_runner, target, branch, expected_head):
+            seen.append(target)
+            # push 직전에 이름의 대상을 바꿉니다. URL을 쓰므로 영향이 없습니다.
+            git("remote", "set-url", "bare", str(other), cwd=Path(self.run.worktree_path))
+            return original(self_runner, target, branch, expected_head)
+
+        GitRunner.push_branch = spy
+        try:
+            report = self.publish()
+        finally:
+            GitRunner.push_branch = original
+
+        self.assertEqual(seen, [str(self.bare)])
+        self.assertEqual(self.bare_head(), report.commit_sha)
+        self.assertIsNone(GitRunner(self.repo).remote_head(str(other), self.run.branch))
+
+
+class LateAuthorizationTest(PublicationTestCase):
+    """lookup 도중 권한을 잃어도 side effect가 실행되면 안 됩니다."""
+
+    def test_revoke_during_remote_lookup_blocks_push(self):
+        original = GitRunner.remote_head
+        service = self.service
+
+        def spy(self_runner, remote, branch):
+            result = original(self_runner, remote, branch)
+            service._store.revoke_approval(self.run.task_id, "회수")
+            return result
+
+        GitRunner.remote_head = spy
+        try:
+            with self.assertRaises(PublicationError) as caught:
+                self.publish()
+        finally:
+            GitRunner.remote_head = original
+
+        self.assertIs(caught.exception.failure, PublicationFailure.AUTHORIZATION_LOST)
+        self.assertEqual(caught.exception.evidence["stage"], "push_command")
+        self.assertIsNone(self.bare_head())
+
+    def test_lease_expiry_during_remote_lookup_blocks_push(self):
+        original = GitRunner.remote_head
+        store = self.store
+        claim_id = self.run.claim_id
+
+        def spy(self_runner, remote, branch):
+            result = original(self_runner, remote, branch)
+            store._connection.execute(
+                "UPDATE claims SET lease_expires_at = ? WHERE claim_id = ?",
+                ("2000-01-01T00:00:00Z", claim_id),
+            )
+            store._connection.commit()
+            return result
+
+        GitRunner.remote_head = spy
+        try:
+            with self.assertRaises(PublicationError) as caught:
+                self.publish()
+        finally:
+            GitRunner.remote_head = original
+
+        self.assertIs(caught.exception.failure, PublicationFailure.AUTHORIZATION_LOST)
+        self.assertIsNone(self.bare_head())
+
+    def test_revoke_during_pr_lookup_blocks_creation(self):
+        store = self.store
+        task_id = self.run.task_id
+        original = self.pull_requests.find_open
+
+        def spy(repository, head_branch, base_branch):
+            result = original(repository, head_branch, base_branch)
+            store.revoke_approval(task_id, "회수")
+            return result
+
+        self.pull_requests.find_open = spy
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+
+        self.assertIs(caught.exception.failure, PublicationFailure.AUTHORIZATION_LOST)
+        self.assertEqual(caught.exception.evidence["stage"], "pr_create_call")
+        self.assertEqual(len(self.pull_requests.created), 0)
+        # push는 이미 일어났고 되돌리지 않았습니다.
+        self.assertEqual(self.bare_head(), self.store.publications(self.run.run_id)[0]["pushed_sha"])
+
+    def test_claim_release_during_pr_lookup_blocks_creation(self):
+        store = self.store
+        claim_id = self.run.claim_id
+        original = self.pull_requests.find_open
+
+        def spy(repository, head_branch, base_branch):
+            result = original(repository, head_branch, base_branch)
+            store.release(claim_id, "해제")
+            return result
+
+        self.pull_requests.find_open = spy
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+
+        self.assertIs(caught.exception.failure, PublicationFailure.AUTHORIZATION_LOST)
+        self.assertEqual(len(self.pull_requests.created), 0)
+
+    def test_normal_path_is_unaffected(self):
+        report = self.publish()
+
+        self.assertIs(report.status, PublicationStatus.PUBLISHED)
+        self.assertEqual(len(self.pull_requests.created), 1)
+
+    def test_adoption_path_also_requires_authorization_to_publish(self):
+        """기존 PR 채택도 권한 없이 Published로 확정하지 않습니다."""
+
+        self.pull_requests.existing.append(
+            PullRequestRef(
+                number=61, url="https://github.com/x/y/pull/61", draft=True,
+                head=self.run.branch, base="main",
+            )
+        )
+        store = self.store
+        task_id = self.run.task_id
+        original = self.pull_requests.find_open
+
+        def spy(repository, head_branch, base_branch):
+            result = original(repository, head_branch, base_branch)
+            store.revoke_approval(task_id, "회수")
+            return result
+
+        self.pull_requests.find_open = spy
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+
+        self.assertIs(caught.exception.failure, PublicationFailure.AUTHORIZATION_LOST)
+        row = self.store.publications(self.run.run_id)[0]
+        self.assertNotEqual(row["status"], PublicationStatus.PUBLISHED.value)
+
+
+class ConcurrentWorkerTest(PublicationTestCase):
+    """service instance는 요청 상태를 들고 있으면 안 됩니다."""
+
+    def test_service_holds_no_request_state(self):
+        self.assertFalse(hasattr(self.service, "_worker_id"))
+
+    def test_interleaved_publications_use_their_own_worker(self):
+        """같은 instance로 다른 worker의 게시가 섞여도 각자 근거를 씁니다."""
+
+        # 두 번째 Task를 다른 worker가 claim합니다.
+        other_issue = make_issue(number=91)
+        key = build_idempotency_key(other_issue)
+        self.store.register(
+            validate_intake(other_issue, parse_issue_body(other_issue.body), key),
+            key,
+            repository=other_issue.repository,
+            issue_number=other_issue.number,
+            labels=other_issue.labels,
+            approved=True,
+            approval_signal="queue_label:atlas:queued",
+        )
+        self.store.claim("worker-b", 3600, task_id="ATLAS-0091")
+        other = self.store.start_run("ATLAS-0091", "worker-b")
+        self.workspaces.create(other.run_id)
+        other = self.store.run(other.run_id)
+        write(Path(other.worktree_path) / "docs" / "other.md", "다른 Run\n")
+        self.store.await_validation(other.run_id)
+        self.finish_validation(other.run_id, worker_id="worker-b")
+        self.store.finish_run(other.run_id, RunStatus.SUCCEEDED)
+
+        seen: list[tuple[str, str]] = []
+        original = self.service.authorization_checks
+
+        def spy(run, worker_id, now=None):
+            seen.append((run.run_id, worker_id))
+            return original(run, worker_id, now)
+
+        self.service.authorization_checks = spy
+        try:
+            first = self.service.publish(self.run.run_id, WORKER)
+            second = self.service.publish(other.run_id, "worker-b")
+        finally:
+            self.service.authorization_checks = original
+
+        self.assertIs(first.status, PublicationStatus.PUBLISHED)
+        self.assertIs(second.status, PublicationStatus.PUBLISHED)
+        # 각 publication이 자기 worker로만 확인해야 합니다.
+        for run_id, worker_id in seen:
+            expected = WORKER if run_id == self.run.run_id else "worker-b"
+            self.assertEqual(worker_id, expected, seen)
+
+    def test_wrong_worker_cannot_ride_another_publication(self):
+        with self.assertRaises(PublicationGateFailed):
+            self.service.publish(self.run.run_id, "worker-b")
+
+        self.assertIsNone(self.bare_head())
+
+
+class DigestFailClosedTest(PublicationTestCase):
+    """지문을 계산하지 못하면 아무 side effect도 만들지 않습니다."""
+
+    def break_digest(self, computed=False, digest=""):
+        import atlas.publication as module
+
+        original = module.safe_content_digest
+
+        def broken(worktree, base, commit_ref=None, timeout_seconds=30.0):
+            if commit_ref is None:
+                return ContentDigest(
+                    digest=digest, computed=computed, base=base, reason="simulated"
+                )
+            return original(worktree, base, commit_ref, timeout_seconds)
+
+        module.safe_content_digest = broken
+        self.addCleanup(setattr, module, "safe_content_digest", original)
+
+    def test_uncomputed_digest_blocks_everything(self):
+        self.break_digest(computed=False)
+
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+
+        self.assertIs(
+            caught.exception.failure, PublicationFailure.CONTENT_DIGEST_UNAVAILABLE
+        )
+        # commit도 push도 PR도 없습니다.
+        self.assertEqual(
+            GitRunner(self.run.worktree_path).head_revision(), self.run.base_revision
+        )
+        self.assertIsNone(self.bare_head())
+        self.assertEqual(len(self.pull_requests.created), 0)
+
+    def test_empty_digest_blocks_everything(self):
+        self.break_digest(computed=True, digest="")
+
+        with self.assertRaises(PublicationError) as caught:
+            self.publish()
+
+        self.assertIs(
+            caught.exception.failure, PublicationFailure.CONTENT_DIGEST_UNAVAILABLE
+        )
+        self.assertIsNone(self.bare_head())
+
+    def test_failure_is_recorded_without_raw_source(self):
+        self.break_digest(computed=False)
+        try:
+            self.publish()
+        except PublicationError:
+            pass
+
+        row = self.store.publications(self.run.run_id)[0]
+        self.assertEqual(
+            row["failure_category"], PublicationFailure.CONTENT_DIGEST_UNAVAILABLE.value
+        )
+        blob = json.dumps([dict(r) for r in self.store.events()], ensure_ascii=False)
+        self.assertNotIn("구현 결과", blob)
+
+    def test_normal_digest_is_unaffected(self):
+        report = self.publish()
+
+        self.assertIs(report.status, PublicationStatus.PUBLISHED)
+        row = self.store.publications(self.run.run_id)[0]
+        self.assertTrue(json.loads(row["content_digest"])["digest"])
 
 
 class SecurityTest(PublicationTestCase):
