@@ -58,6 +58,8 @@
 
 Run 상태는 Task 상태와 다릅니다. Run이 `Succeeded`여도 Task는 사람 승인과 merge 전까지 `Completed`가 아닙니다.
 
+`Succeeded` 이후의 commit·push·draft PR은 [Git Publication](publication.md)이 다룹니다. publication은 Run status가 아니라 별도 attempt이므로 게시에 실패해도 Run은 `Succeeded`로 남습니다.
+
 이 표는 **provider adapter가 없는 generic 경로**입니다. Claude Code adapter는 아래 "구현 결과 판정"을 추가로 적용합니다.
 
 ## Claude Code Adapter

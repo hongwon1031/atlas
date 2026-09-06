@@ -717,3 +717,293 @@ executor runtime의 invariant가 validation에 적용되지 않고 있었습니�
 - **실제 sandbox는 만들지 않았습니다.** filesystem 경계, process spawn 제한, network deny를 강제하지 않습니다. 신뢰 정책이 유일한 통제입니다.
 - 신뢰를 부여한 repository에서 악성 코드가 실제로 host에 미치는 영향은 검증 대상이 아닙니다. 그 경우 통제 수단이 없습니다.
 - 앞 절의 미확인 항목(POSIX, Node 실제 실행, pytest·ruff·mypy·pyright 실행 경로)이 그대로 남습니다.
+
+## 2026-09-06 — Git publication과 draft PR 생성
+
+Windows 11, Python 3.12.x, git 설치 환경에서 확인했습니다.
+
+**실제 GitHub에는 side effect를 만들지 않았습니다.** push 대상은 로컬 bare remote이고 PR client는 fake입니다. 실제 GitHub PR 생성은 이번 검증 범위가 아닙니다.
+
+### 실제 Atlas repository publication smoke
+
+Atlas repository를 임시 위치로 clone하고 bare remote를 붙인 뒤, 구현·검증이 끝난 Run을 실제로 게시했습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| Run 상태 | `Succeeded` |
+| **기본 정책이 로컬 remote 거부** | `publication_remote_invalid` |
+| 거부 시 side effect | 없음. remote branch 생성되지 않음 |
+| 게시 결과 | `Published` |
+| commit 생성 | 확인 |
+| push 수행 | 확인 |
+| draft 여부 | `draft=true` |
+| branch | 예상 atlas branch 유지 |
+| HEAD == commit | 확인 |
+| commit 전진 | 정확히 1 |
+| working tree | commit 후 clean |
+| staged 경로 | `['docs/publication-smoke.md']` — 검증된 경로와 정확히 일치 |
+| commit author | `Atlas <atlas@users.noreply.github.com>` |
+| commit message | `atlas: implement ATLAS-9101`로 시작 |
+| commit에 사용자 텍스트 | 없음 |
+| remote branch | commit과 일치 |
+| **remote에 main** | 없음 |
+| main repository HEAD | 변경 없음 |
+| main repository dirty | 아님 |
+| main branch | 그대로 |
+| main에 결과 파일 | 없음 |
+| 재시도 | `PublicationGateFailed`로 거부 |
+| PR 생성 횟수 | 1 |
+| reconciliation 후 PR 생성 | 추가 없음 |
+| durable linkage | commit SHA, PR 번호, validation id, status 모두 저장 |
+| Run 상태 | `Succeeded` 유지 |
+| credential 흔적 | event·DB·PR body 전체에 없음 |
+| PR body 로컬 경로 | 없음 |
+| Issue 연결 | `Refs #9101`. `Closes #` 없음 |
+| 사람 검토 문구 | 포함 |
+
+### bare remote 통합 테스트
+
+| 확인 | 결과 |
+| --- | --- |
+| `Succeeded` → commit → push → draft PR | 확인 |
+| 정확한 branch만 push | 확인. `main`은 remote에 없음 |
+| 전역 git config | 변경 없음 |
+| 같은 commit 재push | 건너뜀(`remote_already_matches`) |
+| **remote가 다른 commit** | `publication_remote_conflict`. **덮어쓰지 않음.** remote 그대로 |
+| 이미 열린 PR | 채택. 새로 만들지 않음 |
+| 열린 PR 여러 개 | `publication_pr_conflict` + `RecoveryRequired` |
+| draft 아닌 기존 PR | 채택하되 경고. 상태를 바꾸지 않음 |
+| 닫힌 PR | 채택하지 않고 새로 생성 |
+| 중복 publication 시작 | database가 거부 |
+| PR 생성 실패 | commit·push 기록은 남고 `Failed` |
+| 인증 실패 | `publication_authentication_failed`. Run은 `Succeeded` 유지 |
+
+### 무결성 재확인
+
+| 확인 | 결과 |
+| --- | --- |
+| 검증 이후 파일 내용 변경 | `publication_workspace_drift`. PR 생성 안 함 |
+| 검증 이후 사람이 만든 commit | `publication_workspace_drift`. push 안 함 |
+| allowed scope 밖 변경 | `publication_workspace_drift` |
+| 게시할 변경 없음 | `publication_nothing_to_publish` |
+| branch 전환 | 거부. remote 변화 없음 |
+| 보호 branch(main, master, HEAD, trunk, develop) | 전부 거부. remote에 push 없음 |
+
+### crash window 복구
+
+| 창 | 결과 |
+| --- | --- |
+| commit 후 저장 전 | branch HEAD로 채택 |
+| push 후 저장 전 | `ls-remote`로 채택 |
+| PR 생성 후 저장 전 | head/base 검색으로 채택. **새로 만들지 않음** |
+| commit 전 중단 | `publication_not_committed`. 재시작 가능 |
+| remote branch 없음 | `publication_remote_branch_missing`. 재시도 가능 |
+| remote 충돌 | `publication_remote_conflict` + `RecoveryRequired`. remote 그대로 |
+| 기록과 local HEAD 불일치 | `publication_local_drift` + `RecoveryRequired` |
+| reconciliation 자체 | **side effect를 만들지 않음.** PR 생성 0, push 0 |
+
+### 보안
+
+| 확인 | 결과 |
+| --- | --- |
+| `push` 실행 문장에 force 옵션 | 없음 |
+| `+refs/heads` refspec | 없음 |
+| publication 코드에 `shell=True` | 없음 |
+| `git add -A` / `git add .` | 없음 |
+| 악의적 objective(`--force +refs/heads/main:...; rm -rf /`) | refspec·argv 불변. commit message에 반영 안 됨. `main` push 없음 |
+| 기본 정책의 임의 remote | 거부 |
+| token이 DB·event에 | 없음 |
+| token이 PR body에 | 없음 |
+
+### 검증 중 발견해 고친 것
+
+1. **재시도 시 이미 만든 commit을 무결성 검사가 거부했습니다.** HEAD가 base보다 앞서 있으면 "검증 이후 새 commit"으로 판정했습니다. Atlas가 만든 commit인지 네 조건(정확히 1 전진, clean tree, 결정적 subject 일치, 기대 branch)으로 판별해 채택하도록 고쳤습니다. 채택하더라도 범위 검사는 그대로 수행합니다.
+2. **commit message에 objective가 들어갔습니다.** refspec이나 argv에 영향은 없었지만 사용자 텍스트를 git history에 영구히 남길 이유가 없습니다. 식별자만 남기고 사람이 읽을 요약은 PR에 두도록 바꿨습니다.
+3. **publication이 공용 예약 guard의 `run_active`에 걸렸습니다.** publication은 terminal Run(`Succeeded`)에서 돌기 때문입니다. 승인·claim·lease·workspace는 그대로 확인하고 `run_active`만 제외하는 전용 guard를 만들었습니다.
+
+### 회귀 테스트가 실제로 잡는지 확인
+
+remote 충돌 시 덮어쓰기, 무결성 재확인 제거, staged 경로 검증 제거, 기존 PR 무시를 각각 되돌렸습니다. **5건이 실패**했고 복원하니 전부 통과했습니다.
+
+### 확인하지 못한 항목
+
+- **실제 GitHub PR 생성.** network와 credential이 필요하고, 실제 repository에 함부로 side effect를 만들지 않기 위해 fake client로 대체했습니다. GitHub REST 호출 경로(`github_pr.py`)는 단위 수준에서만 확인했습니다.
+- **실제 GitHub remote로의 push.** 로컬 bare remote로만 확인했습니다.
+- GitHub API의 rate limit, 2차 rate limit, 대규모 PR 본문 처리.
+- PR이 merge되거나 닫힌 뒤의 재게시 정책.
+- POSIX에서의 동작. 이 검증은 Windows에서 수행했습니다.
+- 여러 Run이 동시에 같은 repository로 게시할 때의 경쟁.
+- branch cleanup. 게시 후 remote branch를 정리하지 않습니다.
+
+### 2026-09-06 추가 — 내용 기반 commit 채택, remote TOCTOU, 게시 중 권한 상실
+
+merge-blocking review 세 건과 추가 점검 하나를 고치고 다시 검증했습니다.
+
+#### crash recovery commit 채택이 metadata에만 의존하던 문제
+
+기존 조건(base+1, clean, subject 일치, 기대 branch)은 **사람이 만든 commit도 만족할 수 있습니다.** subject를 `atlas: implement <task-id>`로 맞추고 허용 경로 안에서 다른 내용을 commit하면 채택돼, 검증하지 않은 내용이 게시됩니다.
+
+commit 전후로 같은 값이 나오는 **내용 지문**을 도입했습니다. base revision 기준으로 각 경로의 blob 해시를 모아 SHA-256으로 요약합니다. `git hash-object`가 내는 값과 commit 안의 blob sha가 같다는 사실을 실측으로 확인한 뒤 설계했습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| commit 전 지문 == commit 후 지문 | 일치 |
+| rename·삭제·untracked 혼합 | 일치. entry 수도 동일 |
+| 내용이 다른 commit | 지문 불일치 |
+| subject를 맞춘 사람 commit | `publication_content_mismatch`. 채택하지 않음 |
+| 허용 경로 안의 사람 commit | reconciliation이 `content_mismatch`로 판정, `RecoveryRequired` |
+| 정확한 Atlas commit | 채택 |
+| 지문이 아예 없는 경우 | 채택하지 않음(fail closed) |
+| 같은 Run의 이전 attempt 지문 | 유효한 근거로 인정 |
+| 정상 commit 직후 | 만든 commit의 내용을 다시 확인 |
+| raw source | 지문·event·DB 어디에도 없음. digest 64자만 |
+| service와 reconciler | 같은 verifier 사용 |
+
+파일 mode는 지문에 넣지 않았습니다. Windows에서 실행 비트를 신뢰할 수 없기 때문이고, 알려진 한계로 문서에 적었습니다.
+
+#### remote identity TOCTOU
+
+예약 시점에 URL을 검증한 뒤 remote **이름**으로만 push하면, 그 사이 `git remote set-url`로 다른 repository를 가리키게 만들 수 있었습니다.
+
+push 직전에 URL을 다시 읽어 저장된 값과 정확히 비교하고 identity를 재검증한 뒤, **확인한 URL을 그대로 push 대상으로** 씁니다. 이름을 한 번 더 거치지 않으므로 확인과 사용 사이의 간격이 사라집니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 예약 후 다른 bare로 변경 | `publication_remote_changed`. **push 0** |
+| lookalike GitHub URL로 변경 | 차단. push 0 |
+| 다른 owner/repo로 변경 | 차단. push 0 |
+| 변경 없음 | 정상 게시 |
+| identity 재검증 호출 | push 직전에도 호출됨 |
+| reconciliation | 저장된 URL과 다르면 `publication_remote_changed` + `RecoveryRequired` |
+| 근거에 URL 자체 | 넣지 않음. credential이 박혀 있을 수 있음 |
+| credential이 박힌 URL | argv에 넣지 않고 remote 이름 사용 |
+
+#### 예약 이후 권한 상실
+
+예약 guard 통과 뒤에도 승인 회수·claim 해제·owner 변경·lease 만료가 commit과 push와 PR 생성 사이에 일어날 수 있었습니다.
+
+외부 side effect 직전마다 재확인하는 `authorization_checks`를 분리했습니다. 시작 gate와 달리 문맥 의존 항목(`not_already_published`, `run_succeeded` 등)을 넣지 않습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 예약 후 승인 회수 | `publication_authorization_lost`. **push 0, PR 0** |
+| 예약 후 claim 해제 | 차단. push 0 |
+| commit 후 lease 만료 | 차단. push 0 |
+| commit 후 owner 변경 | 차단. push 0 |
+| **push 성공 후 승인 회수** | **PR 0.** push된 branch는 되돌리지 않음. `side_effects_exist=true` 기록 |
+| 근거 기록 | `publication_authorization_lost` event |
+| 정상 경로 | 영향 없음 |
+| 검사 집합 | 문맥 의존 항목 미포함 확인 |
+
+이미 만든 side effect를 force push나 삭제로 정리하려 들지 않습니다. checkpoint를 남기고 사람이 판단합니다.
+
+#### Published 외부 증거 확인 (추가 점검)
+
+PR 본문이 "Published DB record but remote evidence missing"을 지원한다고 적었으므로 구현을 맞췄습니다. DB만 보고 게시됐다고 믿지 않고 remote branch와 PR을 실제로 확인합니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 정상 Published | finding 없음 |
+| remote branch 삭제됨 | `publication_remote_evidence_missing` |
+| remote branch가 다른 commit | `publication_remote_evidence_changed` |
+| PR이 더 이상 열려 있지 않음 | `publication_pr_no_longer_open`. **자동으로 고치지 않음** |
+| PR 번호 없음 | `publication_published_without_pr` |
+
+닫히거나 merge된 PR의 처리 정책이 정해지지 않았으므로 finding만 남깁니다.
+
+#### 검증 중 발견해 고친 것
+
+**한 번도 추적된 적 없는 파일이 삭제되면 staging이 통째로 실패했습니다.** `git add --all -- <paths>`에 매칭되는 것이 없는 경로가 섞이면 exit 128입니다. 실제 경로에서는 잘 생기지 않지만 방어가 필요합니다. stage할 것이 없는 경로를 조용히 빼고 나머지를 정상 처리하도록 고쳤습니다.
+
+#### 회귀 테스트가 실제로 잡는지 확인
+
+내용 검증 없이 metadata만으로 채택, push 직전 remote 재검증 제거, 예약 이후 authorization 재확인 제거, reconciler의 지문 비교 제거를 각각 되돌렸습니다. **12건이 실패**했고 복원하니 전부 통과했습니다.
+
+#### 재실행한 검증
+
+- 전체 테스트 통과
+- `compileall` (src, tests) 통과
+- bare remote smoke 재실행 통과 — 기본 정책의 로컬 remote 거부 포함
+- secret scan, `git diff --check` 통과
+
+#### 확인하지 못한 항목
+
+앞 절의 항목이 그대로 남습니다. 실제 GitHub push와 PR 생성은 여전히 미검증이고, 파일 mode는 내용 지문에 포함하지 않습니다.
+
+### 2026-09-06 추가 — SSH remote race, 늦은 권한 확인, 요청 상태, 지문 fail-closed
+
+final review 네 건을 고치고 다시 검증했습니다.
+
+#### SSH remote에서 TOCTOU가 되살아나던 문제
+
+`_has_userinfo`가 `git@github.com:owner/repo.git`의 `git@`을 credential로 오인해 remote 이름으로 되돌아갔습니다. 그러면 검증한 URL이 아니라 이름으로 push하게 되고, 그 사이 `set-url`로 대상을 바꿀 수 있습니다. **정상 SSH remote에서 race가 그대로 남아 있었습니다.**
+
+SSH username은 credential이 아닙니다. 인증은 SSH agent가 하고 URL에 secret이 없습니다. HTTP(S) URL의 실제 credential만 구분해 거부합니다.
+
+| remote 형태 | 결과 |
+| --- | --- |
+| `git@github.com:owner/repo.git` | 검증한 exact URL을 대상으로 사용 |
+| `ssh://git@github.com/owner/repo.git` | 검증한 exact URL |
+| `https://github.com/owner/repo.git` | 검증한 exact URL |
+| 로컬 bare 경로 | 검증한 exact 경로 |
+| `https://token@github.com/...` | **거부**. push 0 |
+| `https://user:pass@github.com/...` | **거부** |
+| 이름으로 되돌아가는 경로 | 없음 |
+| 검증 뒤 이름의 대상 변경 | push 목적지 불변. 원래 bare에만 올라감 |
+| 거부 근거에 token | 없음 |
+
+#### authorization 확인이 side effect에서 멀었던 문제
+
+기존에는 단계 진입 시점에만 확인했습니다. 그런데 `ls-remote`와 PR 조회는 network 호출이라 그 사이에 승인이 회수돼도 실제 push나 POST가 실행됐습니다.
+
+마지막 확인을 `git push` 명령과 `create_draft` POST **바로 앞**으로 옮겼습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| `remote_head` 조회 도중 승인 회수 | push 0. stage=`push_command` |
+| `remote_head` 조회 도중 lease 만료 | push 0 |
+| `find_open` 도중 승인 회수 | `create_draft` 0. stage=`pr_create_call` |
+| `find_open` 도중 claim 해제 | `create_draft` 0 |
+| 기존 PR 채택 경로 | 외부 write가 아니므로 POST 직전 확인 없음. `Published` 확정 직전에는 확인 |
+| 정상 경로 | 영향 없음 |
+
+push가 필요 없는 경우(remote가 이미 같은 commit)는 외부 write가 없으므로 추가 확인을 하지 않습니다.
+
+#### service가 요청 상태를 들고 있던 문제
+
+`publish()`가 `worker_id`를 instance에 보관해, 같은 instance로 동시 게시하면 서로 덮어쓸 수 있었습니다. **다른 worker의 권한으로 확인**하게 됩니다.
+
+`self._worker_id`를 제거하고 호출 인자로만 흘립니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| instance 상태 | `_worker_id` 속성 없음 |
+| 서로 다른 worker의 게시 두 건 | 각 확인이 자기 worker를 사용 |
+| 다른 worker의 게시 시도 | gate가 거부. push 0 |
+
+#### 지문 계산 실패를 통과시키던 문제
+
+`safe_content_digest`가 `computed=False`를 돌려줘도 무결성 확인이 계속 진행했고, commit 직후 확인도 지문이 없으면 건너뛰었습니다. "검증한 내용만 게시한다"는 보장을 증명하지 못한 채 게시되는 경로였습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 지문 계산 실패(`computed=false`) | `publication_content_digest_unavailable`. **commit 0, push 0, PR 0** |
+| 빈 digest | 같은 분류로 차단 |
+| commit 직후 지문 부재 | 건너뛰지 않고 실패 |
+| 실패 기록 | raw source 없음 |
+| 정상 지문 | 동작 변화 없음 |
+
+#### 회귀 테스트가 실제로 잡는지 확인
+
+네 수정(SSH exact URL, push 직전 확인, POST 직전 확인, 지문 fail-closed)을 각각 되돌렸습니다. **16건이 실패**했고 복원하니 전부 통과했습니다.
+
+#### 재실행한 검증
+
+- 전체 테스트 통과
+- `compileall` (src, tests) 통과
+- bare remote smoke 재실행 통과
+- secret scan, `git diff --check` 통과
+
+#### 확인하지 못한 항목
+
+앞 절의 항목이 그대로 남습니다. 실제 GitHub push와 PR 생성, 실제 SSH remote로의 push는 여전히 미검증입니다.

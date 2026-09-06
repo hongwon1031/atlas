@@ -11,7 +11,7 @@ Issue → Task → claim → Run → isolated worktree → 구현
      → changes_applied → AwaitingValidation → Validating → Succeeded / Failed
 ```
 
-이 문서는 `AwaitingValidation` 이후를 다룹니다. `Succeeded` 이후의 commit, push, PR 생성은 아직 구현되지 않았습니다.
+이 문서는 `AwaitingValidation` 이후를 다룹니다. `Succeeded` 이후의 commit, push, draft PR 생성은 [Git Publication](publication.md)이 다룹니다.
 
 ## 실행되는 것은 repository의 코드입니다
 
@@ -369,3 +369,4 @@ python -m atlas validation-reconcile
 - 자동 재검증
 - step 단위 resume (ambiguous 상태 식별까지만 구현)
 - **실제 sandbox** — filesystem 경계, process spawn 제한, network deny를 강제하지 않습니다
+- commit, push, PR 생성 — [Git Publication](publication.md)에 있습니다

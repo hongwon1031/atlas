@@ -21,7 +21,7 @@
 
 ## Current Manual Workflow
 
-현재 repository에는 Issue polling, Task persistence, atomic claim, Run lifecycle, workspace 격리, executor process runtime을 수행하는 worker가 있습니다. candidate Issue를 polling해 Task로 저장하고, lease 기반으로 claim하고, 전용 branch·worktree를 만들고, 그 안에서 별도 OS process를 실행하며, heartbeat와 restart reconciliation으로 stale Run·workspace·process 불일치를 판정합니다. executor는 mock과 **실제 Claude Code CLI** 두 가지가 있고, 구현 결과를 검증하는 **validation pipeline**이 Run을 `Succeeded`/`Failed`로 확정합니다. webhook, Codex invocation, git commit·push, PR delivery는 없습니다.
+현재 repository에는 Issue polling, Task persistence, atomic claim, Run lifecycle, workspace 격리, executor process runtime을 수행하는 worker가 있습니다. candidate Issue를 polling해 Task로 저장하고, lease 기반으로 claim하고, 전용 branch·worktree를 만들고, 그 안에서 별도 OS process를 실행하며, heartbeat와 restart reconciliation으로 stale Run·workspace·process 불일치를 판정합니다. executor는 mock과 **실제 Claude Code CLI** 두 가지가 있고, validation pipeline이 Run을 `Succeeded`/`Failed`로 확정하며, publication이 **commit·push하고 draft PR을 만듭니다.** webhook, Codex invocation, auto merge는 없습니다.
 
 ```mermaid
 flowchart LR
@@ -235,7 +235,7 @@ stateDiagram-v2
 
 ## Recommended MVP
 
-[ADR-003](adr/0003-initial-execution-environment.md)에 따라 primary automated path는 **GitHub Issue → Atlas worker → self-hosted Claude Code worker → validation → PR → human review/merge**입니다. Codex Cloud는 manual/secondary로 유지합니다. 현재 이 경로 중 polling, parse·validation, Task persistence, atomic claim, Run lifecycle과 heartbeat, 격리된 branch·worktree 준비, provider-neutral executor process runtime까지 구현됐습니다. 실제 Claude Code adapter와 validation pipeline까지 구현됐습니다. git commit, push, PR delivery는 구현되지 않았습니다.
+[ADR-003](adr/0003-initial-execution-environment.md)에 따라 primary automated path는 **GitHub Issue → Atlas worker → self-hosted Claude Code worker → validation → PR → human review/merge**입니다. Codex Cloud는 manual/secondary로 유지합니다. 현재 이 경로 중 polling, parse·validation, Task persistence, atomic claim, Run lifecycle과 heartbeat, 격리된 branch·worktree 준비, provider-neutral executor process runtime까지 구현됐습니다. 실제 Claude Code adapter, validation pipeline, git publication까지 구현됐습니다. **MVP 핵심 경로가 Issue에서 draft PR까지 이어집니다.** auto merge는 하지 않습니다.
 
 ## Recommended Next Sprint Scope
 
@@ -246,11 +246,11 @@ stateDiagram-v2
 5. ~~승인 회수·claim 해제 시 실행 중인 executor cancellation을 구현합니다.~~ (완료 — safety gate와 `cancel_for_lost_authorization`)
 6. ~~실제 provider adapter를 하나 연결합니다.~~ (완료 — `claude_code.py`, `claude_prompt.py`, `implementation.py`, `worktree_changes.py`)
 7. ~~implementation validation pipeline을 추가합니다.~~ (완료 — `validation_plan.py`, `validation_pipeline.py`, `validation_models.py`)
-8. 검증을 통과한 Run을 commit·push하고 draft PR을 만듭니다.
+8. ~~검증을 통과한 Run을 commit·push하고 draft PR을 만듭니다.~~ (완료 — `publication.py`, `github_pr.py`, `publication_content.py`)
 7. validation pipeline과 draft PR delivery를 구현합니다.
 5. repository allowlist 아래 격리 worktree와 branch를 만듭니다.
 6. provider-neutral contract를 따르는 mock executor를 새 process로 호출합니다.
 7. scope·forbidden path·secret validation을 수행하고 draft PR을 생성합니다.
 8. ~~self-hosted Claude Code invocation은 별도 후속 PR에서 추가합니다.~~ (완료 — 로컬 CLI invocation)
 
-다음 Sprint는 git commit·push와 draft PR 생성에 한정하며 multi-agent routing, automated Codex adapter, Web UI, vector memory, production deployment를 포함하지 않습니다.
+MVP 핵심 E2E가 완료됐습니다. 다음 우선순위(phone UX, worker hosting, Codex adapter, project bootstrap)는 재결정이 필요하며 multi-agent routing, Web UI, vector memory, production deployment는 여전히 범위 밖입니다.

@@ -22,6 +22,7 @@ from typing import Any
 
 from .idempotency import IdempotencyKey
 from .executor import ExecutionStatus
+from .publication_models import PublicationStatus
 from .validation_models import ValidationStatus
 from .schema import (
     ACTIVE_RUN_STATUSES,
@@ -34,7 +35,7 @@ from .schema import (
     WorkspaceStatus,
 )
 
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "9"
 
 _PRIORITY_RANK = {
     Priority.LOW: 0,
@@ -241,6 +242,50 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_validation_steps_position
     ON validation_steps(validation_id, position);
 CREATE INDEX IF NOT EXISTS idx_validation_steps_run ON validation_steps(run_id);
 
+-- publication attempt. Run이 Succeeded인 것과 GitHub에 게시된 것은 다른
+-- 사실이라 별도 table입니다. 외부 side effect마다 checkpoint를 남겨야
+-- 재시작한 worker가 같은 side effect를 두 번 만들지 않습니다.
+CREATE TABLE IF NOT EXISTS publications (
+    publication_id    TEXT PRIMARY KEY,
+    run_id            TEXT NOT NULL,
+    task_id           TEXT NOT NULL,
+    validation_id     TEXT,
+    worker_id         TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    github_repository TEXT NOT NULL,
+    branch            TEXT NOT NULL,
+    base_branch       TEXT NOT NULL,
+    remote            TEXT,
+    remote_url        TEXT,
+    commit_sha        TEXT,
+    committed_at      TEXT,
+    -- 검증한 변경 내용의 지문. commit 채택이 metadata가 아니라 내용에
+    -- 근거하도록 예약 직후 저장합니다.
+    content_digest    TEXT,
+    pushed_at         TEXT,
+    pushed_sha        TEXT,
+    pr_number         INTEGER,
+    pr_url            TEXT,
+    pr_node_id        TEXT,
+    pr_state          TEXT,
+    pr_created_at     TEXT,
+    failure_category  TEXT,
+    summary           TEXT,
+    warnings          TEXT,
+    adopted           TEXT,
+    recovery_evidence TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+
+-- Run 하나에 active publication은 최대 하나입니다. 중복 게시를 database가
+-- 최종적으로 막습니다.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_publications_active
+    ON publications(run_id)
+    WHERE status IN ('Starting','Committing','Pushing','CreatingPR','RecoveryRequired');
+CREATE INDEX IF NOT EXISTS idx_publications_run ON publications(run_id);
+CREATE INDEX IF NOT EXISTS idx_publications_branch ON publications(github_repository, branch);
+
 CREATE TABLE IF NOT EXISTS poll_cursors (
     repository      TEXT PRIMARY KEY,
     last_updated_at TEXT,
@@ -268,6 +313,18 @@ class RunError(Exception):
         super().__init__(message)
         self.category = category
         self.message = message
+
+
+class PublicationError(RunError):
+    """publication lifecycle 위반."""
+
+
+class PublicationConflict(PublicationError):
+    """이미 게시됐거나 기대한 단계가 아닙니다."""
+
+    def __init__(self, category: str, message: str, publication: dict | None = None) -> None:
+        super().__init__(category, message)
+        self.publication = publication
 
 
 class ValidationError(RunError):
@@ -388,6 +445,8 @@ class TaskStore:
             self._connection.execute("ALTER TABLE events ADD COLUMN execution_id TEXT")
         if "validation_id" not in event_columns2:
             self._connection.execute("ALTER TABLE events ADD COLUMN validation_id TEXT")
+        if "publication_id" not in event_columns2:
+            self._connection.execute("ALTER TABLE events ADD COLUMN publication_id TEXT")
 
         # schema v3 database의 runs에는 workspace 컬럼이 없습니다.
         run_columns = {
@@ -412,6 +471,15 @@ class TaskStore:
         }
         if "run_id" not in event_columns:
             self._connection.execute("ALTER TABLE events ADD COLUMN run_id TEXT")
+        # schema v8의 publications에는 content_digest가 없습니다.
+        publication_columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(publications)")
+        }
+        if publication_columns and "content_digest" not in publication_columns:
+            self._connection.execute(
+                "ALTER TABLE publications ADD COLUMN content_digest TEXT"
+            )
+
         # schema v5의 active Run 인덱스는 AwaitingValidation을 모릅니다. 그대로
         # 두면 구현을 마친 Run이 슬롯을 지키지 못해 같은 Task로 새 Run이
         # 시작될 수 있습니다. 정의가 다르면 다시 만듭니다.
@@ -1478,6 +1546,41 @@ class TaskStore:
         return execution_id
 
     @staticmethod
+    def _publication_guards(
+        connection: sqlite3.Connection, run: sqlite3.Row, worker_id: str, moment: datetime
+    ) -> list[str]:
+        """게시 예약 transaction 안에서 근거를 확인합니다.
+
+        execution·validation과 달리 **Run이 terminal(`Succeeded`)입니다.** 그래서
+        `run_active`를 요구하는 공용 guard를 쓰지 않고 별도로 확인합니다.
+        승인과 claim은 여전히 살아 있어야 합니다. 승인이 회수된 Task의 결과를
+        GitHub에 올리면 안 됩니다.
+        """
+
+        failed: list[str] = []
+        if run["workspace_status"] != WorkspaceStatus.READY.value:
+            failed.append("workspace_ready")
+
+        task = connection.execute(
+            "SELECT approved, is_current FROM tasks WHERE fingerprint = ?",
+            (run["fingerprint"],),
+        ).fetchone()
+        if task is None or not task["approved"] or not task["is_current"]:
+            failed.append("task_approved")
+
+        claim = connection.execute(
+            "SELECT * FROM claims WHERE claim_id = ?", (run["claim_id"],)
+        ).fetchone()
+        if claim is None or claim["released_at"] is not None:
+            failed.append("claim_active")
+        else:
+            if claim["lease_owner"] != worker_id:
+                failed.append("claim_owner_matches")
+            if from_iso(claim["lease_expires_at"]) <= moment:
+                failed.append("lease_valid")
+        return failed
+
+    @staticmethod
     def _reservation_guards(
         connection: sqlite3.Connection, run_id: str, worker_id: str, moment: datetime
     ) -> list[str]:
@@ -2111,6 +2214,302 @@ class TaskStore:
             "worker_id": row["worker_id"],
         }
 
+    # -- publication ------------------------------------------------------
+
+    def start_publication(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+        github_repository: str,
+        branch: str,
+        base_branch: str,
+        remote: str,
+        remote_url: str,
+        validation_id: str | None = None,
+        now: datetime | None = None,
+    ) -> str:
+        """publication을 예약합니다. `Succeeded` Run에서만 시작할 수 있습니다.
+
+        예약과 근거 확인을 하나의 transaction에서 합니다. git과 GitHub side
+        effect는 이 transaction 밖에서 수행합니다. 외부 호출을 transaction
+        안에 넣으면 그 시간 동안 다른 worker가 막힙니다.
+        """
+
+        moment = now or utcnow()
+        stamp = to_iso(moment)
+        publication_id = f"pub-{uuid.uuid4().hex[:16]}"
+
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise RunError("run_not_found", f"{run_id}를 찾을 수 없습니다.")
+
+            status = RunStatus(row["status"])
+            if status is not RunStatus.SUCCEEDED:
+                raise PublicationConflict(
+                    "run_not_succeeded",
+                    f"{run_id}는 {status.value} 상태입니다. "
+                    f"{RunStatus.SUCCEEDED.value}에서만 게시할 수 있습니다.",
+                )
+
+            existing = connection.execute(
+                "SELECT * FROM publications WHERE run_id = ? AND status IN "
+                "('Starting','Committing','Pushing','CreatingPR','RecoveryRequired')",
+                (run_id,),
+            ).fetchone()
+            if existing is not None:
+                raise PublicationConflict(
+                    "publication_already_active",
+                    f"{run_id}에 이미 active publication "
+                    f"{existing['publication_id']}이 있습니다.",
+                    self._publication_from_row(existing),
+                )
+            done = connection.execute(
+                "SELECT * FROM publications WHERE run_id = ? AND status = 'Published'",
+                (run_id,),
+            ).fetchone()
+            if done is not None:
+                raise PublicationConflict(
+                    "already_published",
+                    f"{run_id}는 이미 게시됐습니다: PR #{done['pr_number']}",
+                    self._publication_from_row(done),
+                )
+
+            for table, label in (("executions", "execution"), ("validations", "validation")):
+                statuses = (
+                    "('Starting','Running','Cancelling')"
+                    if table == "executions"
+                    else "('Starting','Running','RecoveryRequired')"
+                )
+                active = connection.execute(
+                    f"SELECT 1 FROM {table} WHERE run_id = ? AND status IN {statuses}",
+                    (run_id,),
+                ).fetchone()
+                if active is not None:
+                    raise PublicationConflict(
+                        f"{label}_still_active",
+                        f"{run_id}에 아직 진행 중인 {label}이 있습니다.",
+                    )
+
+            failed = self._publication_guards(connection, row, worker_id, moment)
+            if failed:
+                raise PublicationConflict(
+                    "publication_guard_failed",
+                    f"게시 근거 확인에 실패했습니다: {', '.join(failed)}",
+                    {"failed_checks": failed},
+                )
+
+            connection.execute(
+                "INSERT INTO publications(publication_id, run_id, task_id, validation_id, "
+                "worker_id, status, github_repository, branch, base_branch, remote, "
+                "remote_url, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    publication_id,
+                    run_id,
+                    row["task_id"],
+                    validation_id,
+                    worker_id,
+                    PublicationStatus.STARTING.value,
+                    github_repository,
+                    branch,
+                    base_branch,
+                    remote,
+                    remote_url,
+                    stamp,
+                    stamp,
+                ),
+            )
+            self._record(
+                connection,
+                kind="publication_started",
+                moment=stamp,
+                task_id=row["task_id"],
+                fingerprint=row["fingerprint"],
+                claim_id=row["claim_id"],
+                run_id=run_id,
+                publication_id=publication_id,
+                detail={
+                    "worker_id": worker_id,
+                    "repository": github_repository,
+                    "branch": branch,
+                    "base_branch": base_branch,
+                    "remote": remote,
+                },
+            )
+        return publication_id
+
+    def update_publication(
+        self,
+        publication_id: str,
+        *,
+        status: "PublicationStatus | None" = None,
+        commit_sha: str | None = None,
+        committed_at: str | None = None,
+        content_digest: dict[str, Any] | None = None,
+        pushed_sha: str | None = None,
+        pushed_at: str | None = None,
+        pull_request: dict[str, Any] | None = None,
+        failure_category: str | None = None,
+        summary: str | None = None,
+        warnings: list[str] | tuple[str, ...] | None = None,
+        adopted: list[str] | tuple[str, ...] | None = None,
+        recovery_evidence: dict[str, Any] | None = None,
+        event: str | None = None,
+        detail: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """단계를 진행하고 durable checkpoint를 남깁니다.
+
+        외부 side effect 하나마다 한 번씩 부릅니다. 저장 전에 죽으면
+        reconciliation이 외부 증거를 보고 복구합니다.
+        """
+
+        stamp = to_iso(now or utcnow())
+        assignments: list[str] = ["updated_at = ?"]
+        values: list[Any] = [stamp]
+
+        def add(column: str, value: Any) -> None:
+            assignments.append(f"{column} = ?")
+            values.append(value)
+
+        if status is not None:
+            add("status", status.value)
+        if commit_sha is not None:
+            add("commit_sha", commit_sha)
+            add("committed_at", committed_at or stamp)
+        if content_digest is not None:
+            add("content_digest", json.dumps(content_digest, ensure_ascii=False))
+        if pushed_sha is not None:
+            add("pushed_sha", pushed_sha)
+            add("pushed_at", pushed_at or stamp)
+        if pull_request is not None:
+            add("pr_number", pull_request.get("number"))
+            add("pr_url", pull_request.get("url"))
+            add("pr_node_id", pull_request.get("node_id"))
+            add("pr_state", pull_request.get("state"))
+            add("pr_created_at", stamp)
+        if failure_category is not None:
+            add("failure_category", failure_category)
+        if summary is not None:
+            add("summary", summary)
+        if warnings is not None:
+            add("warnings", json.dumps(list(warnings), ensure_ascii=False))
+        if adopted is not None:
+            add("adopted", json.dumps(list(adopted), ensure_ascii=False))
+        if recovery_evidence is not None:
+            add("recovery_evidence", json.dumps(recovery_evidence, ensure_ascii=False))
+
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT * FROM publications WHERE publication_id = ?", (publication_id,)
+            ).fetchone()
+            if row is None:
+                raise PublicationConflict(
+                    "publication_not_found", f"{publication_id}를 찾을 수 없습니다."
+                )
+            connection.execute(
+                f"UPDATE publications SET {', '.join(assignments)} WHERE publication_id = ?",
+                (*values, publication_id),
+            )
+            if event:
+                self._record(
+                    connection,
+                    kind=event,
+                    moment=stamp,
+                    task_id=row["task_id"],
+                    run_id=row["run_id"],
+                    publication_id=publication_id,
+                    detail=detail or {},
+                )
+
+    def record_publication_event(
+        self,
+        publication_id: str | None,
+        run_id: str,
+        kind: str,
+        detail: dict[str, Any],
+        now: datetime | None = None,
+    ) -> None:
+        stamp = to_iso(now or utcnow())
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT task_id FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            self._record(
+                connection,
+                kind=kind,
+                moment=stamp,
+                task_id=row["task_id"] if row else None,
+                run_id=run_id,
+                publication_id=publication_id,
+                detail=detail,
+            )
+
+    def publication(self, publication_id: str) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT * FROM publications WHERE publication_id = ?", (publication_id,)
+        ).fetchone()
+
+    def active_publication(self, run_id: str) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT * FROM publications WHERE run_id = ? AND status IN "
+            "('Starting','Committing','Pushing','CreatingPR','RecoveryRequired')",
+            (run_id,),
+        ).fetchone()
+
+    def publications(self, run_id: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+        if run_id is None:
+            return self._connection.execute(
+                "SELECT * FROM publications ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return self._connection.execute(
+            "SELECT * FROM publications WHERE run_id = ? ORDER BY created_at DESC LIMIT ?",
+            (run_id, limit),
+        ).fetchall()
+
+    def active_publications(self) -> list[sqlite3.Row]:
+        return self._connection.execute(
+            "SELECT * FROM publications WHERE status IN "
+            "('Starting','Committing','Pushing','CreatingPR','RecoveryRequired') "
+            "ORDER BY created_at ASC"
+        ).fetchall()
+
+    def published_publications(self, limit: int = 200) -> list[sqlite3.Row]:
+        return self._connection.execute(
+            "SELECT * FROM publications WHERE status = 'Published' "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def publication_for_branch(
+        self, github_repository: str, branch: str
+    ) -> sqlite3.Row | None:
+        """같은 repository의 같은 branch를 쓰는 publication.
+
+        다른 Run의 branch를 덮어쓰지 않기 위한 조회입니다.
+        """
+
+        return self._connection.execute(
+            "SELECT * FROM publications WHERE github_repository = ? AND branch = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (github_repository, branch),
+        ).fetchone()
+
+    @staticmethod
+    def _publication_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "publication_id": row["publication_id"],
+            "run_id": row["run_id"],
+            "status": row["status"],
+            "branch": row["branch"],
+            "commit_sha": row["commit_sha"],
+            "pr_number": row["pr_number"],
+            "pr_url": row["pr_url"],
+        }
+
     def run(self, run_id: str) -> Run | None:
         row = self._connection.execute(
             "SELECT * FROM runs WHERE run_id = ?", (run_id,)
@@ -2308,13 +2707,14 @@ class TaskStore:
         run_id: str | None = None,
         execution_id: str | None = None,
         validation_id: str | None = None,
+        publication_id: str | None = None,
         detail: dict[str, Any] | None = None,
     ) -> None:
         connection.execute(
             "INSERT INTO events"
             "(occurred_at, kind, task_id, fingerprint, claim_id, run_id, execution_id, "
-            "validation_id, detail) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "validation_id, publication_id, detail) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 moment,
                 kind,
@@ -2324,6 +2724,7 @@ class TaskStore:
                 run_id,
                 execution_id,
                 validation_id,
+                publication_id,
                 json.dumps(detail or {}, ensure_ascii=False, default=str),
             ),
         )

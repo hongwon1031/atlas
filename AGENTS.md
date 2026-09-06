@@ -22,9 +22,9 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 - Target MVP에서는 Atlas worker가 Issue를 검증·claim하고 always-available server의 self-hosted Claude Code worker가 primary automated executor로 실행됩니다.
 - Codex Cloud는 manual/secondary executor입니다. 다른 Adapter를 배제하지 않지만 primary automated path로 간주하지 않습니다.
 - Atlas Control Plane의 초기 구현 언어는 [ADR-011](docs/adr/0011-initial-implementation-language.md)에 따라 Python 3.11 이상입니다.
-- `src/atlas/`의 현재 구현은 Issue polling, Task 저장(SQLite), atomic claim과 lease, Run lifecycle과 heartbeat, restart reconciliation, Run별 branch·worktree 격리, executor process runtime, 실제 Claude Code CLI invocation, **구현 결과 validation pipeline**까지입니다. Codex 호출, git commit·push, PR delivery는 없습니다.
+- `src/atlas/`의 현재 구현은 Issue polling, Task 저장(SQLite), atomic claim과 lease, Run lifecycle과 heartbeat, restart reconciliation, Run별 branch·worktree 격리, executor process runtime, 실제 Claude Code CLI invocation, 구현 결과 validation pipeline, **commit·push와 draft PR 생성**까지입니다. Codex 호출, auto merge, webhook은 없습니다.
 - polling-first ingestion은 [ADR-008](docs/adr/0008-initial-github-event-ingestion.md) Accepted이고 operational store는 [ADR-012](docs/adr/0012-operational-state-store.md) Accepted입니다. [ADR-010](docs/adr/0010-task-execution-isolation.md)은 branch/worktree 격리와 process 격리가 Accepted이고 provider별 정책과 credential injection은 계속 Proposed입니다. tmux PoC supervision(ADR-009)도 `Proposed`이며 승인된 구현 근거로 취급하지 않습니다.
-- webhook, comment/label command automation, Codex invocation, credential injection은 아직 구현되지 않았습니다. 현재 존재한다고 주장하거나 문서 Task에서 구현하지 않습니다. Claude Code는 로그인된 CLI 세션을 그대로 쓰며 Atlas가 credential을 다루지 않습니다.
+- webhook, comment/label command automation, Codex invocation, credential injection, auto merge는 아직 구현되지 않았습니다. **Atlas는 PR을 merge하지 않습니다.** 현재 존재한다고 주장하거나 문서 Task에서 구현하지 않습니다. Claude Code는 로그인된 CLI 세션을 그대로 쓰며 Atlas가 credential을 다루지 않습니다.
 
 ## 우선순위와 기본 행동
 
@@ -50,7 +50,7 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 6. `docs/architecture.md`
 7. `docs/security-governance.md`
 8. `docs/specs/task-schema.md`와 `docs/specs/task-state-machine.md`
-9. runtime 작업은 `docs/specs/execution-runtime.md`, validation 작업은 `docs/specs/validation-pipeline.md`, routing 작업은 `docs/specs/agent-registry.md`와 `docs/specs/usage-availability.md`, ingestion 작업은 `docs/specs/github-event-ingestion.md`
+9. runtime 작업은 `docs/specs/execution-runtime.md`, validation 작업은 `docs/specs/validation-pipeline.md`, 게시 작업은 `docs/specs/publication.md`, routing 작업은 `docs/specs/agent-registry.md`와 `docs/specs/usage-availability.md`, ingestion 작업은 `docs/specs/github-event-ingestion.md`
 10. Task에 적용되는 `docs/specs/`, `docs/adr/`, `docs/research/` 문서. ADR-008·011·012는 `Accepted`이고 ADR-004~007·009·010은 `Proposed` 상태임을 확인합니다.
 11. `docs/context-memory.md`, `docs/agents-router-scheduler.md`, `docs/mobile-workflow.md` 중 Task 관련 문서
 12. 연결된 GitHub Issue, 이전 PR, 현재 브랜치의 변경 내용
@@ -67,7 +67,7 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 - Task가 문서·거버넌스 전용이면 application code, dependency, CI, infrastructure를 추가하지 않습니다.
 - Issue가 존재한다는 사실만으로 Task 후보가 되지 않습니다. `atlas:queued` label이 approval signal이며, GitHub가 label 추가를 triage 이상 권한자로 제한하는 것이 현재의 authorization gate입니다.
 - Target MVP의 worker가 구현되기 전에는 `/atlas` command나 `atlas:*` label이 작업을 자동 시작한다고 가정하지 않습니다.
-- `python -m atlas <issue-number>`는 단건 validation 결과만 출력하며 저장하지 않습니다. `poll`은 valid Task를 저장하고, `claim`은 lease를 잡고, `run-start`는 Run record를, `workspace-create`는 격리된 branch/worktree를 만듭니다. `executor-start --executor claude`는 실제 Claude Code CLI로 worktree 안의 코드를 수정하고, `--mock-mode`는 개발·테스트용 mock executor를 씁니다. `validation-start`는 `AwaitingValidation` Run을 검증해 `Succeeded` 또는 `Failed`로 확정합니다.
+- `python -m atlas <issue-number>`는 단건 validation 결과만 출력하며 저장하지 않습니다. `poll`은 valid Task를 저장하고, `claim`은 lease를 잡고, `run-start`는 Run record를, `workspace-create`는 격리된 branch/worktree를 만듭니다. `executor-start --executor claude`는 실제 Claude Code CLI로 worktree 안의 코드를 수정하고, `--mock-mode`는 개발·테스트용 mock executor를 씁니다. `validation-start`는 `AwaitingValidation` Run을 검증해 `Succeeded` 또는 `Failed`로 확정합니다. `publication-start`는 `Succeeded` Run을 commit·push하고 draft PR을 만듭니다.
 - usage detection, routing, mobile notification이 구현됐다고 가정하지 않습니다. validation은 repository에서 발견한 근거로만 검증하며, 테스트가 없는 repository는 `no_tests_discovered` 경고와 함께 통과할 수 있습니다.
 - validation은 repository 코드를 sandbox 없이 실행합니다. 기본 정책은 `untrusted`이고 이때는 정적 검사만 수행합니다. 신뢰를 부여하기 전에는 테스트와 package script가 실행되지 않는다고 가정합니다.
 

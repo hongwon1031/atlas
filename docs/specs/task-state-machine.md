@@ -151,6 +151,14 @@ Validating         → Failed               (required step 실패 또는 수행 
 
 자세한 판정은 [Execution Runtime](execution-runtime.md)의 "구현 결과 판정"과 [Validation Pipeline](validation-pipeline.md)을 따릅니다.
 
+### Run 성공 이후
+
+Run이 `Succeeded`가 되면 [Git Publication](publication.md)이 commit·push하고 draft PR을 만듭니다.
+
+publication은 **Run status가 아니라 별도 operational attempt**입니다. 게시에 실패해도 Run은 `Succeeded`로 남습니다. 구현과 검증이 성공했다는 사실은 전달 실패로 바뀌지 않습니다.
+
+Task 상태는 여전히 자동으로 옮기지 않습니다. PR merge가 곧 Task 종료인지 정하지 않았으므로 PR 본문은 `Refs #N`만 쓰고 `Closes #N`을 쓰지 않습니다.
+
 ## Retry and Idempotency
 
 - 동일 실패에 대한 자동 retry는 기본 1회이며 Task별 policy가 더 엄격하면 그 값을 따릅니다.
