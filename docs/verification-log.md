@@ -99,6 +99,7 @@ heartbeat를 남기고 프로세스가 사라진 상황을 재현했습니다.
 
 ### 확인하지 못한 항목
 
+- 승인 회수 또는 claim 해제 이후 실행 중인 executor를 실제로 멈추는 동작. executor가 없어 취소할 대상이 없습니다. [Execution Runtime](specs/execution-runtime.md)에 executor slice 요구사항으로 기록했습니다.
 - process identity(PID, start time) 기반 판정. executor process가 없어 수행할 수 없으며 판정 event에 `process_identity_checked: false`로 명시합니다
 - 실제 worker가 장시간 heartbeat를 보내는 상황의 안정성
 - orphan process와 stale worktree 정리. worktree가 아직 없습니다

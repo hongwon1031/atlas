@@ -672,11 +672,19 @@ class TaskStore:
 
             if previous_run_id is not None:
                 previous = connection.execute(
-                    "SELECT status FROM runs WHERE run_id = ?", (previous_run_id,)
+                    "SELECT status, task_id FROM runs WHERE run_id = ?", (previous_run_id,)
                 ).fetchone()
                 if previous is None:
                     raise RunError(
                         "previous_run_not_found", f"{previous_run_id}를 찾을 수 없습니다."
+                    )
+                if previous["task_id"] != task_id:
+                    # retry chain은 한 Task 안에서만 이어집니다. 다른 Task의 Run을
+                    # 참조하면 lineage와 감사 기록이 뒤섞입니다.
+                    raise RunError(
+                        "previous_run_task_mismatch",
+                        f"{previous_run_id}는 {previous['task_id']}의 Run입니다. "
+                        f"{task_id}의 retry로 지정할 수 없습니다.",
                     )
                 if not RunStatus(previous["status"]).is_terminal:
                     raise RunError(
@@ -839,27 +847,88 @@ class TaskStore:
                 connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             )
 
-    def mark_orphaned(
-        self, run_id: str, failure: RunFailure, evidence: dict[str, Any], now: datetime | None = None
-    ) -> Run:
+    def orphan_if_stale(
+        self,
+        run_id: str,
+        *,
+        observed_heartbeat_at: str,
+        stale_after_seconds: float,
+        failure: RunFailure,
+        evidence: dict[str, Any],
+        now: datetime | None = None,
+    ) -> Run | None:
         """stale Run을 recovery review 대상으로 전환합니다.
 
-        판단 근거를 event로 남깁니다. 재실행은 하지 않습니다.
+        판정과 전이 사이에 worker가 살아나 heartbeat를 보낼 수 있습니다. stale
+        snapshot만 믿고 전이하면 살아 있는 Run을 죽은 것으로 만듭니다. 그래서
+        하나의 write transaction 안에서 다음을 모두 수행합니다.
+
+        1. 현재 status와 heartbeat_at을 다시 읽습니다.
+        2. 판정 때 본 `observed_heartbeat_at`과 다르면 회수하지 않습니다.
+        3. 현재 heartbeat 기준으로도 stale한지 다시 확인합니다.
+        4. 근거 event와 상태 전이를 같은 transaction에 기록합니다.
+
+        회수하지 않으면 `None`을 돌려줍니다.
         """
 
         moment = now or utcnow()
+        stamp = to_iso(moment)
+
         with self._write() as connection:
             row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-            if row is not None and not RunStatus(row["status"]).is_terminal:
-                self._record(
-                    connection,
-                    kind="run_orphaned",
-                    moment=to_iso(moment),
-                    task_id=row["task_id"],
-                    run_id=run_id,
-                    detail=evidence,
-                )
-        return self.finish_run(run_id, RunStatus.ORPHANED, failure=failure, now=moment)
+            if row is None:
+                return None
+
+            current = RunStatus(row["status"])
+            if current.is_terminal:
+                # 다른 경로가 먼저 종료시켰습니다.
+                return None
+            if row["heartbeat_at"] != observed_heartbeat_at:
+                # 판정 이후 heartbeat가 갱신됐습니다. 살아 있는 Run입니다.
+                return None
+            deadline = from_iso(row["heartbeat_at"]) + timedelta(seconds=stale_after_seconds)
+            if deadline > moment:
+                # 현재 시각 기준으로는 더 이상 stale하지 않습니다.
+                return None
+
+            self._record(
+                connection,
+                kind="run_orphaned",
+                moment=stamp,
+                task_id=row["task_id"],
+                fingerprint=row["fingerprint"],
+                claim_id=row["claim_id"],
+                run_id=run_id,
+                detail=evidence,
+            )
+            connection.execute(
+                "UPDATE runs SET status = ?, finished_at = ?, "
+                "failure_category = ?, failure_message = ? WHERE run_id = ?",
+                (
+                    RunStatus.ORPHANED.value,
+                    stamp,
+                    failure.category,
+                    failure.message,
+                    run_id,
+                ),
+            )
+            self._record(
+                connection,
+                kind="run_finished",
+                moment=stamp,
+                task_id=row["task_id"],
+                fingerprint=row["fingerprint"],
+                claim_id=row["claim_id"],
+                run_id=run_id,
+                detail={
+                    "status": RunStatus.ORPHANED.value,
+                    "from": current.value,
+                    "failure": failure.to_dict(),
+                },
+            )
+            return self._run_from_row(
+                connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            )
 
     # -- run reads -------------------------------------------------------
 

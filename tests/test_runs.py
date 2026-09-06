@@ -12,7 +12,7 @@ from atlas.intake import build_idempotency_key
 from atlas.parser import parse_issue_body
 from atlas.reconciliation import RunReconciler
 from atlas.schema import RunFailure, RunStatus
-from atlas.store import RunError, TaskStore, utcnow
+from atlas.store import RunError, TaskStore, from_iso, utcnow
 from atlas.validation import validate_intake
 from tests.fixtures import body_replacing, make_issue
 
@@ -507,6 +507,262 @@ class ReconciliationTest(RunTestCase):
 
         self.assertEqual(report.orphaned, (self.run.run_id,))
         self.assertEqual(restarted.run(self.run.run_id).status, RunStatus.ORPHANED)
+
+
+class ReconcileRaceTest(RunTestCase):
+    """판정과 전이 사이에 heartbeat가 도착하는 경쟁을 막아야 합니다."""
+
+    def setUp(self):
+        super().setUp()
+        self.config = RunConfig(heartbeat_interval_seconds=30.0, stale_after_seconds=300.0)
+        self.reconciler = RunReconciler(self.store, self.config)
+        self.run = self.store.start_run("ATLAS-0042", WORKER)
+        self.store.heartbeat(self.run.run_id, WORKER)
+        self.stale_at = utcnow() + timedelta(seconds=301)
+
+    def observed(self):
+        return self.store.run(self.run.run_id).heartbeat_at
+
+    def test_heartbeat_between_verdict_and_transition_cancels_the_orphan(self):
+        snapshot = self.store.run(self.run.run_id)
+        verdict = self.reconciler.evaluate(snapshot, now=self.stale_at)
+        self.assertEqual(verdict.action, "orphan")
+
+        # worker가 살아나 heartbeat를 보냅니다.
+        self.store.heartbeat(self.run.run_id, WORKER, now=self.stale_at)
+
+        result = self.store.orphan_if_stale(
+            self.run.run_id,
+            observed_heartbeat_at=snapshot.heartbeat_at,
+            stale_after_seconds=300.0,
+            failure=RunFailure("worker_lost", "stale"),
+            evidence=verdict.evidence,
+            now=self.stale_at,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(self.store.run(self.run.run_id).status, RunStatus.RUNNING)
+
+    def test_run_that_became_fresh_is_not_orphaned(self):
+        self.store.heartbeat(self.run.run_id, WORKER, now=self.stale_at)
+
+        result = self.store.orphan_if_stale(
+            self.run.run_id,
+            observed_heartbeat_at=self.observed(),
+            stale_after_seconds=300.0,
+            failure=RunFailure("worker_lost", "stale"),
+            evidence={},
+            now=self.stale_at,
+        )
+
+        self.assertIsNone(result)
+
+    def test_terminal_run_is_not_orphaned(self):
+        observed = self.observed()
+        self.store.finish_run(self.run.run_id, RunStatus.SUCCEEDED)
+
+        result = self.store.orphan_if_stale(
+            self.run.run_id,
+            observed_heartbeat_at=observed,
+            stale_after_seconds=300.0,
+            failure=RunFailure("worker_lost", "stale"),
+            evidence={},
+            now=self.stale_at,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(self.store.run(self.run.run_id).status, RunStatus.SUCCEEDED)
+
+    def test_unknown_run_is_ignored(self):
+        self.assertIsNone(
+            self.store.orphan_if_stale(
+                "run-nope",
+                observed_heartbeat_at="2026-01-01T00:00:00Z",
+                stale_after_seconds=300.0,
+                failure=RunFailure("worker_lost", "x"),
+                evidence={},
+            )
+        )
+
+    def test_genuinely_stale_run_is_still_orphaned(self):
+        result = self.store.orphan_if_stale(
+            self.run.run_id,
+            observed_heartbeat_at=self.observed(),
+            stale_after_seconds=300.0,
+            failure=RunFailure("worker_lost", "stale"),
+            evidence={"reason": "test"},
+            now=self.stale_at,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.status, RunStatus.ORPHANED)
+
+    def test_event_and_transition_share_one_transaction(self):
+        """run_orphaned event와 상태 전이가 따로 커밋되면 안 됩니다."""
+
+        self.store.orphan_if_stale(
+            self.run.run_id,
+            observed_heartbeat_at=self.observed(),
+            stale_after_seconds=300.0,
+            failure=RunFailure("worker_lost", "stale"),
+            evidence={"reason": "test"},
+            now=self.stale_at,
+        )
+
+        rows = self.store._connection.execute(
+            "SELECT kind FROM events WHERE run_id = ? ORDER BY event_id", (self.run.run_id,)
+        ).fetchall()
+        kinds = [row["kind"] for row in rows]
+        self.assertIn("run_orphaned", kinds)
+        self.assertIn("run_finished", kinds)
+        # 같은 transaction이므로 두 event 사이에 다른 run의 event가 끼지 않습니다.
+        self.assertEqual(kinds.index("run_finished"), kinds.index("run_orphaned") + 1)
+
+    def test_reconcile_reports_the_run_as_healthy_when_it_revives(self):
+        snapshot = self.store.run(self.run.run_id)
+
+        class RevivingStore:
+            """orphan_if_stale 직전에 heartbeat가 도착한 상황을 재현합니다."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def orphan_if_stale(self, run_id, **kwargs):
+                self._inner.heartbeat(run_id, WORKER, now=kwargs["now"])
+                return self._inner.orphan_if_stale(run_id, **kwargs)
+
+        reconciler = RunReconciler(RevivingStore(self.store), self.config)
+        report = reconciler.reconcile(now=self.stale_at)
+
+        self.assertEqual(report.orphaned, ())
+        self.assertEqual(report.healthy, (snapshot.run_id,))
+        self.assertEqual(self.store.run(self.run.run_id).status, RunStatus.RUNNING)
+        self.assertEqual(report.verdicts[0].action, "keep")
+        self.assertTrue(report.verdicts[0].evidence["revalidated"])
+
+    def test_concurrent_heartbeat_never_loses_to_a_stale_snapshot(self):
+        """heartbeat와 reconcile을 실제로 경쟁시켜 invariant를 확인합니다.
+
+        불변식: Run이 Orphaned가 됐다면 그 heartbeat_at은 판정 때 본 값과 같아야
+        합니다. 즉 heartbeat가 먼저 성공했는데도 Orphaned가 되는 일은 없습니다.
+        """
+
+        for _ in range(15):
+            run = self.store.active_run("ATLAS-0042")
+            if run is None or run.status.is_terminal:
+                self.store.start_run("ATLAS-0042", WORKER)
+                run = self.store.active_run("ATLAS-0042")
+                self.store.heartbeat(run.run_id, WORKER)
+                run = self.store.run(run.run_id)
+
+            observed = run.heartbeat_at
+            stale_at = from_iso(observed) + timedelta(seconds=301)
+            barrier = threading.Barrier(2)
+            results: dict[str, object] = {}
+
+            def beat():
+                store = TaskStore(self.path, busy_timeout_seconds=10.0)
+                try:
+                    barrier.wait(timeout=10)
+                    try:
+                        store.heartbeat(run.run_id, WORKER, now=stale_at)
+                        results["heartbeat"] = "ok"
+                    except RunError as error:
+                        results["heartbeat"] = error.category
+                finally:
+                    store.close()
+
+            def orphan():
+                store = TaskStore(self.path, busy_timeout_seconds=10.0)
+                try:
+                    barrier.wait(timeout=10)
+                    results["orphan"] = store.orphan_if_stale(
+                        run.run_id,
+                        observed_heartbeat_at=observed,
+                        stale_after_seconds=300.0,
+                        failure=RunFailure("worker_lost", "stale"),
+                        evidence={},
+                        now=stale_at,
+                    )
+                finally:
+                    store.close()
+
+            threads = [threading.Thread(target=beat), threading.Thread(target=orphan)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+
+            final = self.store.run(run.run_id)
+            if final.status is RunStatus.ORPHANED:
+                self.assertEqual(
+                    final.heartbeat_at,
+                    observed,
+                    "heartbeat가 성공했는데도 Orphaned가 됐습니다.",
+                )
+                self.assertEqual(results.get("heartbeat"), "run_terminal")
+            else:
+                self.assertEqual(final.status, RunStatus.RUNNING)
+                self.assertIsNone(results.get("orphan"))
+                self.store.finish_run(run.run_id, RunStatus.SUCCEEDED)
+
+
+class RetryLineageTest(RunTestCase):
+    """retry chain은 한 Task 안에서만 이어져야 합니다."""
+
+    def setUp(self):
+        super().setUp()
+        other = make_issue(number=99)
+        self.register(other)
+        self.store.claim(WORKER, 900, task_id="ATLAS-0099")
+
+        self.other_run = self.store.start_run("ATLAS-0099", WORKER)
+        self.store.finish_run(
+            self.other_run.run_id, RunStatus.FAILED, failure=RunFailure("timeout", "다른 Task")
+        )
+
+    def test_previous_run_from_another_task_is_refused(self):
+        with self.assertRaises(RunError) as caught:
+            self.store.start_run(
+                "ATLAS-0042", WORKER, previous_run_id=self.other_run.run_id
+            )
+
+        self.assertEqual(caught.exception.category, "previous_run_task_mismatch")
+        self.assertIsNone(self.store.active_run("ATLAS-0042"))
+
+    def test_error_message_names_both_tasks(self):
+        with self.assertRaises(RunError) as caught:
+            self.store.start_run(
+                "ATLAS-0042", WORKER, previous_run_id=self.other_run.run_id
+            )
+
+        self.assertIn("ATLAS-0099", caught.exception.message)
+        self.assertIn("ATLAS-0042", caught.exception.message)
+
+    def test_same_task_previous_run_is_accepted(self):
+        first = self.store.start_run("ATLAS-0042", WORKER)
+        self.store.finish_run(
+            first.run_id, RunStatus.FAILED, failure=RunFailure("timeout", "같은 Task")
+        )
+
+        retry = self.store.start_run("ATLAS-0042", WORKER, previous_run_id=first.run_id)
+
+        self.assertEqual(retry.previous_run_id, first.run_id)
+
+    def test_task_mismatch_is_checked_before_terminal_state(self):
+        """다른 Task의 active Run도 lineage 위반으로 거부해야 합니다."""
+
+        active_elsewhere = self.store.start_run("ATLAS-0099", WORKER)
+
+        with self.assertRaises(RunError) as caught:
+            self.store.start_run(
+                "ATLAS-0042", WORKER, previous_run_id=active_elsewhere.run_id
+            )
+
+        self.assertEqual(caught.exception.category, "previous_run_task_mismatch")
 
 
 class RunConfigTest(unittest.TestCase):

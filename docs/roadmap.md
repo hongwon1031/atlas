@@ -54,6 +54,7 @@ Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge*
 - [ ] Task별 worktree/clone, branch, process, Run ID, log scope
 - [ ] mock executor invocation
 - [ ] timeout, cancel, retry, process/worktree cleanup
+- [ ] 승인 회수·claim 해제 시 실행 중인 executor cancellation (executor slice 필수)
 - [ ] worker restart, stale lease, orphan resource recovery
 - [ ] Proposed tmux PoC로 process persistence 검증
 

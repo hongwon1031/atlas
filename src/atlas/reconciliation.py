@@ -15,7 +15,7 @@ event에 남겨 나중에 감사할 수 있게 합니다.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -88,17 +88,35 @@ class RunReconciler:
 
         for run in active:
             verdict = self.evaluate(run, moment)
-            counters.verdicts.append(verdict)
-            if verdict.action == "orphan":
-                self._store.mark_orphaned(
-                    run.run_id,
-                    RunFailure(ORPHAN_FAILURE_CATEGORY, verdict.reason),
-                    verdict.evidence,
-                    now=moment,
-                )
-                counters.orphaned.append(run.run_id)
-            else:
+
+            if verdict.action != "orphan":
+                counters.verdicts.append(verdict)
                 counters.healthy.append(run.run_id)
+                continue
+
+            # 판정과 전이 사이에 heartbeat가 도착할 수 있습니다. store가 하나의
+            # transaction 안에서 다시 확인하고, 조건이 깨졌으면 회수하지 않습니다.
+            orphaned = self._store.orphan_if_stale(
+                run.run_id,
+                observed_heartbeat_at=run.heartbeat_at,
+                stale_after_seconds=self._config.stale_after_seconds,
+                failure=RunFailure(ORPHAN_FAILURE_CATEGORY, verdict.reason),
+                evidence=verdict.evidence,
+                now=moment,
+            )
+            if orphaned is None:
+                counters.verdicts.append(
+                    replace(
+                        verdict,
+                        action="keep",
+                        reason="판정 이후 Run 상태가 바뀌어 회수하지 않았습니다.",
+                        evidence={**verdict.evidence, "revalidated": True},
+                    )
+                )
+                counters.healthy.append(run.run_id)
+            else:
+                counters.verdicts.append(verdict)
+                counters.orphaned.append(run.run_id)
 
         return ReconcileReport(
             checked=len(active),
@@ -108,7 +126,11 @@ class RunReconciler:
         )
 
     def evaluate(self, run: Run, now: datetime | None = None) -> RunVerdict:
-        """Run 하나를 판정합니다. 상태를 바꾸지 않으므로 단독 조회에 쓸 수 있습니다."""
+        """Run 하나를 판정합니다. 상태를 바꾸지 않으므로 단독 조회에 쓸 수 있습니다.
+
+        판정은 snapshot 기반입니다. 실제 회수는 `TaskStore.orphan_if_stale`이
+        transaction 안에서 조건을 다시 확인한 뒤에만 수행합니다.
+        """
 
         moment = now or utcnow()
         heartbeat_at = from_iso(run.heartbeat_at)

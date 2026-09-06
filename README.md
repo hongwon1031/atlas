@@ -157,6 +157,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 
 - webhook ingestion이 없습니다. polling만 있으며 지연은 interval에 좌우됩니다.
 - Run은 실행 단위 record까지입니다. worktree, branch, executor process, timeout은 아직 없습니다.
+- 승인이 회수되거나 claim이 해제돼도 실행 중인 executor를 멈추는 기능은 없습니다. 지금은 executor 자체가 없어 문제가 되지 않지만, executor를 도입하는 slice에서 cancellation을 함께 구현해야 합니다.
 - reconciliation은 heartbeat 경과와 claim/lease 상태로만 판단합니다. executor process가 없어 PID identity 확인을 수행하지 못하며, 판정 event에 `process_identity_checked: false`로 기록합니다.
 - live E2E는 Issue #7로 확인했습니다. 단계별 결과는 [Verification Log](docs/verification-log.md)에 있습니다.
 - operational store는 단일 SQLite 파일이라 여러 host가 공유할 수 없습니다.

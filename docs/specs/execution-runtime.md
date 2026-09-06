@@ -131,6 +131,29 @@ worker 시작 시 또는 `reconcile` command로 다음 순서를 수행합니다
 
 heartbeat interval과 stale threshold는 `RunConfig`로 설정합니다. 아래 Open Questions의 "heartbeat interval, recovery grace period"는 기본값을 두되 운영 측정 후 조정해야 합니다.
 
+### 승인 회수와 claim 해제 이후의 cancellation (executor slice 요구사항)
+
+**아직 구현되지 않았습니다.** executor process가 없어 이번 단계에서는 취소할 대상이 없기 때문입니다. executor를 실행하는 slice에서 반드시 함께 구현해야 하는 요구사항이므로 여기에 계약으로 남깁니다.
+
+현재 Task 승인은 회수될 수 있고(`atlas:queued` label 제거, Issue 종료, 내용이 invalid로 변경) claim도 해제될 수 있습니다. 그런데 이때 **이미 실행 중인 executor는 그대로 살아 있습니다.** 승인 근거가 사라진 뒤에도 executor가 파일을 쓰고 branch를 밀고 PR을 만들 수 있다는 뜻입니다. 이는 [Constitution](../constitution.md)의 "사람 승인 없는 반영 금지"와 정면으로 충돌합니다.
+
+따라서 executor slice는 다음을 만족해야 합니다.
+
+- 승인 회수 또는 claim 해제를 관찰하면 해당 Task의 active Run에 cancellation을 요청합니다.
+- executor process와 child process를 종료하고 종료 결과를 Run에 기록합니다.
+- 종료 이후 side effect(파일 변경, branch push, PR 생성, comment 작성)를 허용하지 않습니다.
+- 이미 발생한 side effect는 [Cleanup Matrix](#cleanup-matrix)의 timeout/cancel 항목에 따라 정리하고 결과를 기록합니다.
+- executor가 즉시 멈추지 못하는 경우를 위해 graceful 종료와 강제 종료의 escalation 순서를 정합니다.
+- side effect를 만들기 직전(branch push, PR 생성)에 승인과 claim이 여전히 유효한지 다시 확인합니다. reconciliation은 주기적이므로 그 사이의 창을 닫으려면 delivery 직전 재확인이 필요합니다.
+
+현재 구현이 제공하는 것은 여기까지입니다.
+
+- 승인이 회수되면 active claim이 함께 해제됩니다.
+- claim이 해제된 Run은 reconciliation이 `Orphaned` 후보로 판정합니다.
+- 판정 근거 event에 `claim_released`와 `lease_expired`가 남습니다.
+
+즉 **기록은 되지만 실행은 멈추지 않습니다.** 이 간극을 executor slice 전에 닫아야 합니다.
+
 ## Cleanup Matrix
 
 | 종료 유형 | process | worktree/clone | branch | logs/artifacts |
@@ -149,3 +172,4 @@ cleanup 실패는 성공으로 숨기지 않으며 별도 상태와 operator act
 - default timeout과 cancel escalation 순서
 - stable supervisor로 systemd와 Docker 중 무엇을 선택할지
 - log와 failed workspace retention 기간
+- 승인 회수와 delivery 사이의 재확인 시점(주기적 reconciliation만으로 충분한지, side effect 직전 재확인이 필요한지)
