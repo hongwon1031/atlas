@@ -151,7 +151,15 @@ class ImplementationRunner:
         request = self._adapter.build_request(base, prompt, environment=environment)
 
         outcome = self._service.run(
-            run_id, worker_id, request.argv, stdin_data=prompt, environment=environment, **kwargs
+            run_id,
+            worker_id,
+            request.argv,
+            stdin_data=prompt,
+            environment=environment,
+            # 파싱은 redaction 이전 원문에서 합니다. 저장본은 그대로
+            # redaction을 거칩니다.
+            structured_capture=request.structured_capture,
+            **kwargs,
         )
         result = outcome.result
 
@@ -192,6 +200,8 @@ class ImplementationRunner:
             "failure": report.failure.value if report.failure else None,
             "executor": self._adapter.name,
             "provider": self._adapter.provider,
+            # raw config가 아니라 검증을 통과한 정규화 값만 남깁니다.
+            "effective_policy": self._adapter.config.normalized(),
         }
         if report.claude is not None:
             detail["claude"] = report.claude.to_dict()
@@ -209,7 +219,9 @@ class ImplementationRunner:
 
         구현이 성공했다고 Run을 `Succeeded`로 만들지 않습니다. 아직 validation
         pipeline이 없어서 "코드가 올바른지"를 아무도 확인하지 않았습니다.
-        성공 경로에서는 Run을 `Running`으로 남기고 validation을 기다립니다.
+        대신 `AwaitingValidation`으로 전이합니다. terminal이 아니고 heartbeat
+        대상도 아니므로, executor가 끝났다는 이유로 staleness reconciliation이
+        정상 결과를 `Orphaned`로 만들지 않습니다.
         """
 
         run = self._store.run(report.run_id)
@@ -217,7 +229,16 @@ class ImplementationRunner:
             return
 
         if report.outcome is ImplementationOutcome.CHANGES_APPLIED:
-            # 성공 경로. Run을 종료하지 않습니다.
+            self._store.await_validation(
+                report.run_id,
+                evidence={
+                    "changed_file_count": len(report.changes.changed_files)
+                    if report.changes
+                    else 0,
+                    "executor": self._adapter.name,
+                    "provider": self._adapter.provider,
+                },
+            )
             return
 
         if report.outcome is ImplementationOutcome.NO_CHANGES:

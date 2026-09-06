@@ -35,7 +35,9 @@ from pathlib import Path
 from typing import Any
 
 from .executor import (
+    DEFAULT_STRUCTURED_CAPTURE_BYTES,
     CancellationState,
+    StructuredCapture,
     ExecutorError,
     ExecutorFailure,
     ExecutorRequest,
@@ -43,15 +45,47 @@ from .executor import (
     ProcessHandle,
     TerminationOutcome,
 )
-from .local_process import LocalProcessExecutor, read_log_tail
+from .local_process import LocalProcessExecutor
 from .redaction import redact_line
 
 EXECUTOR_NAME = "claude_code_local"
 EXECUTOR_PROVIDER = "anthropic"
 
-# 편집에 필요한 도구만 남깁니다. Bash를 주지 않으므로 CLI가 git commit이나
+# 허용하는 도구 집합입니다. 여기 없는 이름은 거부합니다(fail closed).
+# 새 도구가 생겨도 명시적으로 넣기 전에는 executor에 주어지지 않습니다.
+SAFE_TOOLS: frozenset[str] = frozenset({"Read", "Edit", "Write", "Glob", "Grep"})
+
+# 명령이나 코드를 실행할 수 있어 절대 허용하지 않는 도구입니다. allowlist가
+# 이미 막지만, 거부 사유를 정확히 남기기 위해 따로 둡니다.
+FORBIDDEN_TOOLS: frozenset[str] = frozenset(
+    {
+        "Bash",
+        "BashOutput",
+        "PowerShell",
+        "REPL",
+        "Shell",
+        "Execute",
+        "Task",
+        "Agent",
+        "KillShell",
+        "KillBash",
+        "WebFetch",
+        "NotebookEdit",
+    }
+)
+
+# 편집에 필요한 도구만 남깁니다. shell을 주지 않으므로 CLI가 git commit이나
 # push를 실행할 수단이 없습니다. 권한을 넓게 여는 대신 도구를 좁힙니다.
 DEFAULT_TOOLS = "Read,Edit,Write,Glob,Grep"
+
+# 허용하는 permission mode입니다. MVP에서는 파일 편집 자동 승인만 씁니다.
+# 여기 없는 값은 설정으로도 쓸 수 없습니다.
+SAFE_PERMISSION_MODES: frozenset[str] = frozenset({"acceptEdits"})
+
+# 권한 우회 계열입니다. config나 환경변수로도 절대 허용하지 않습니다.
+FORBIDDEN_PERMISSION_MODES: frozenset[str] = frozenset(
+    {"bypassPermissions", "bypasspermissions", "auto", "dontAsk"}
+)
 
 # 파일 편집만 승인 없이 허용합니다. bypassPermissions와
 # --dangerously-skip-permissions는 쓰지 않습니다.
@@ -95,6 +129,8 @@ class ClaudeFailure(str, Enum):
     NO_CHANGES = "claude_no_changes"
     POLICY_VIOLATION = "claude_policy_violation"
     OUTPUT_UNPARSEABLE = "claude_output_unparseable"
+    OUTPUT_TOO_LARGE = "claude_output_too_large"
+    INVALID_CONFIGURATION = "claude_invalid_configuration"
 
 
 # provider category를 generic executor category로 옮깁니다. Run failure는
@@ -109,6 +145,8 @@ CLAUDE_TO_EXECUTOR_FAILURE: dict[ClaudeFailure, ExecutorFailure] = {
     ClaudeFailure.NO_CHANGES: ExecutorFailure.UNKNOWN,
     ClaudeFailure.POLICY_VIOLATION: ExecutorFailure.SAFETY_GATE,
     ClaudeFailure.OUTPUT_UNPARSEABLE: ExecutorFailure.UNKNOWN,
+    ClaudeFailure.OUTPUT_TOO_LARGE: ExecutorFailure.UNKNOWN,
+    ClaudeFailure.INVALID_CONFIGURATION: ExecutorFailure.SAFETY_GATE,
 }
 
 # docs/specs/task-state-machine.md의 Failure Taxonomy 어휘로만 옮깁니다.
@@ -122,6 +160,8 @@ CLAUDE_TO_RUN_CATEGORY: dict[ClaudeFailure, str] = {
     ClaudeFailure.NO_CHANGES: "unknown",
     ClaudeFailure.POLICY_VIOLATION: "policy_violation",
     ClaudeFailure.OUTPUT_UNPARSEABLE: "unknown",
+    ClaudeFailure.OUTPUT_TOO_LARGE: "unknown",
+    ClaudeFailure.INVALID_CONFIGURATION: "policy_violation",
 }
 
 # CLI 출력에서 인증 문제로 볼 표지입니다. 원문을 저장하지 않고 분류만
@@ -134,6 +174,70 @@ AUTH_MARKERS = (
     "invalid api key",
     "credit balance",
 )
+
+
+class ClaudeConfigurationError(ExecutorError):
+    """설정이 안전 경계를 벗어났습니다.
+
+    startup/preflight에서 즉시 실패합니다. 잘못된 설정으로 process를 띄우고
+    나서 발견하면 이미 늦습니다.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(ClaudeFailure.INVALID_CONFIGURATION.value, message)
+        self.failure = ClaudeFailure.INVALID_CONFIGURATION
+
+
+def validate_permission_mode(mode: str) -> str:
+    """허용 목록에 있는 permission mode만 통과시킵니다."""
+
+    value = (mode or "").strip()
+    if not value:
+        raise ClaudeConfigurationError("permission mode가 비어 있습니다.")
+    if value in FORBIDDEN_PERMISSION_MODES or "dangerous" in value.lower():
+        raise ClaudeConfigurationError(
+            f"권한 우회 permission mode는 허용하지 않습니다: {value!r}"
+        )
+    if value not in SAFE_PERMISSION_MODES:
+        raise ClaudeConfigurationError(
+            f"허용하지 않는 permission mode입니다: {value!r}. "
+            f"가능한 값: {', '.join(sorted(SAFE_PERMISSION_MODES))}"
+        )
+    return value
+
+
+def validate_tools(tools: str) -> tuple[str, ...]:
+    """safe tool set의 subset만 통과시킵니다.
+
+    모르는 이름은 통과시키지 않습니다(fail closed). 새 도구가 생겨도 명시적으로
+    allowlist에 넣기 전에는 executor에 주어지지 않습니다.
+    """
+
+    names = tuple(
+        name for name in (part.strip() for part in (tools or "").replace(" ", ",").split(","))
+        if name
+    )
+    if not names:
+        raise ClaudeConfigurationError("tool 목록이 비어 있습니다.")
+
+    forbidden = [n for n in names if n in FORBIDDEN_TOOLS]
+    if forbidden:
+        raise ClaudeConfigurationError(
+            f"명령을 실행할 수 있는 도구는 허용하지 않습니다: {', '.join(sorted(set(forbidden)))}"
+        )
+    unknown = [n for n in names if n not in SAFE_TOOLS]
+    if unknown:
+        raise ClaudeConfigurationError(
+            f"허용 목록에 없는 도구입니다: {', '.join(sorted(set(unknown)))}. "
+            f"가능한 값: {', '.join(sorted(SAFE_TOOLS))}"
+        )
+    # 중복만 제거하고 순서는 그대로 둡니다. 기본 설정 문자열이 그대로
+    # 유지돼야 설정 diff를 읽기 쉽습니다.
+    seen: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.append(name)
+    return tuple(seen)
 
 
 class ClaudeCodeError(ExecutorError):
@@ -161,6 +265,43 @@ class ClaudeCodeConfig:
     # 깨집니다. Run 하나가 곧 대화 하나입니다.
     session_persistence: bool = False
     max_budget_usd: float | None = None
+    # structured output 파싱 상한. persisted log의 max_output_bytes와 별개입니다.
+    # 저장 한도와 파싱 한도는 목적이 다릅니다.
+    structured_output_bytes: int = DEFAULT_STRUCTURED_CAPTURE_BYTES
+
+    def __post_init__(self) -> None:
+        """설정 자체가 안전 경계를 넘지 못하게 막습니다.
+
+        환경변수로 `bypassPermissions`나 `Bash`를 넣어 이 adapter의 핵심
+        경계를 우회할 수 있으면 안 됩니다. 생성 시점에 거부합니다.
+        """
+
+        validate_permission_mode(self.permission_mode)
+        if self.structured_output_bytes <= 0:
+            raise ClaudeConfigurationError(
+                f"structured_output_bytes는 0보다 커야 합니다: {self.structured_output_bytes}"
+            )
+        # 정규화한 값을 그대로 되돌려 씁니다. frozen이라 object.__setattr__이
+        # 필요합니다.
+        object.__setattr__(self, "tools", ",".join(validate_tools(self.tools)))
+
+    @property
+    def tool_names(self) -> tuple[str, ...]:
+        return tuple(name for name in self.tools.split(",") if name)
+
+    def normalized(self) -> dict[str, Any]:
+        """event에 남길 안전한 유효 설정.
+
+        raw config가 아니라 검증을 통과한 정규화 값만 남깁니다. 경로와 모델은
+        환경 정보라 포함하지 않습니다.
+        """
+
+        return {
+            "permission_mode": self.permission_mode,
+            "tools": list(self.tool_names),
+            "session_persistence": self.session_persistence,
+            "structured_output_bytes": self.structured_output_bytes,
+        }
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> ClaudeCodeConfig:
@@ -427,6 +568,10 @@ class ClaudeCodeExecutor:
     def preflight(self, environment: dict[str, str] | None = None) -> ExecutableInfo:
         """실행 파일을 찾고 version probe까지 마칩니다. 결과를 캐시합니다."""
 
+        # 설정은 생성 시점에 검증되지만, preflight에서도 한 번 더 확인합니다.
+        # process를 띄운 뒤에 발견하면 이미 늦습니다.
+        validate_permission_mode(self._config.permission_mode)
+        validate_tools(self._config.tools)
         if self._executable is None:
             path = resolve_executable(self._config)
             self._executable = probe_version(
@@ -445,7 +590,14 @@ class ClaudeCodeExecutor:
         """provider-neutral 요청에 Claude argv와 prompt를 채웁니다."""
 
         info = self.preflight(environment)
-        return replace(base, argv=build_argv(info.path, self._config), stdin_data=prompt)
+        return replace(
+            base,
+            argv=build_argv(info.path, self._config),
+            stdin_data=prompt,
+            # 저장본은 redaction을 거치므로 JSON 문법이 남는다는 보장이
+            # 없습니다. 파싱은 원문을 담은 임시 버퍼에서 합니다.
+            structured_capture=StructuredCapture(limit=self._config.structured_output_bytes),
+        )
 
     # -- ExecutorAdapter -------------------------------------------------
 
@@ -479,8 +631,13 @@ class ClaudeCodeExecutor:
         secret이 나오지 않습니다.
         """
 
-        if result.stdout is None:
+        capture = request.structured_capture
+        if capture is None:
+            # 원문 버퍼가 없으면 파싱하지 않습니다. persisted log는 redaction을
+            # 거쳐 JSON이 깨졌을 수 있으므로 대체 경로로 쓰지 않습니다.
             return ClaudeOutcome(parsed=False, failure=ClaudeFailure.OUTPUT_UNPARSEABLE)
-        # JSON 한 덩어리라 뒤에서 조금만 읽으면 잘립니다. 상한까지 읽습니다.
-        text = read_log_tail(result.stdout.path, max_bytes=request.max_output_bytes)
+        if capture.overflowed:
+            return ClaudeOutcome(parsed=False, failure=ClaudeFailure.OUTPUT_TOO_LARGE)
+        # 읽는 즉시 버퍼가 비워집니다. raw 값을 오래 들고 있지 않습니다.
+        text = capture.take()
         return parse_cli_output(text, secrets=request.secret_values)

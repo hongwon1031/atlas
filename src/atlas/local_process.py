@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .executor import (
+    StructuredCapture,
     CancellationState,
     ExecutionStatus,
     ExecutorError,
@@ -244,11 +245,16 @@ def _write_stdin(stream, text: str) -> None:
             pass
 
 
-def _pump(stream, capture: _Capture) -> None:
+def _pump(stream, capture: _Capture, transient: StructuredCapture | None = None) -> None:
     """pipe를 redaction하며 파일로 흘립니다.
 
     한도를 넘어도 읽기는 계속합니다. 읽기를 멈추면 pipe가 차서 child가 블록되기
     때문입니다. 메모리에 전체 출력을 쌓지 않습니다.
+
+    `transient`가 있으면 **redaction 이전 원문**을 상한 있는 메모리 버퍼에도
+    복사합니다. 구조화된 출력을 파싱하려는 호출자를 위한 것으로, 이 버퍼는
+    디스크나 DB에 저장되지 않고 한 번 읽히면 버려집니다. 파일에 쓰는 경로는
+    영향을 받지 않습니다. 저장본은 그대로 redaction을 거칩니다.
     """
 
     sink = None
@@ -258,6 +264,8 @@ def _pump(stream, capture: _Capture) -> None:
             chunk = stream.read(8192)
             if not chunk:
                 break
+            if transient is not None:
+                transient.feed(chunk)
             sink.feed(chunk)
     except (OSError, ValueError):
         # stream이 닫혔거나 디스크 오류입니다. 수집만 중단합니다.
@@ -345,7 +353,11 @@ class LocalProcessExecutor:
             ).start()
 
         threads = [
-            threading.Thread(target=_pump, args=(process.stdout, stdout_capture), daemon=True),
+            threading.Thread(
+            target=_pump,
+            args=(process.stdout, stdout_capture, request.structured_capture),
+            daemon=True,
+        ),
             threading.Thread(target=_pump, args=(process.stderr, stderr_capture), daemon=True),
         ]
         for thread in threads:

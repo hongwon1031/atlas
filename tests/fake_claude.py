@@ -11,7 +11,9 @@
 동작은 환경변수로 지시합니다. argv로 받으면 adapter가 만드는 argv를 그대로
 검증할 수 없습니다.
 
-- `FAKE_CLAUDE_MODE`: success | nochange | fail | sleep | badjson | escape | commit
+- `FAKE_CLAUDE_MODE`: success | nochange | fail | sleep | badjson | commit | huge
+- `FAKE_CLAUDE_RESULT`: 결과 JSON의 `result` 문자열을 이 값으로 바꿉니다.
+- `FAKE_CLAUDE_HUGE_BYTES`: huge 모드에서 만들 result 길이.
 - `FAKE_CLAUDE_WRITE`: 만들 파일 경로(cwd 기준). `:` 로 여러 개.
 - `FAKE_CLAUDE_TEXT`: 파일에 쓸 내용.
 - `FAKE_CLAUDE_ECHO`: 지정하면 받은 prompt를 이 파일에 그대로 씁니다.
@@ -70,6 +72,10 @@ def main() -> int:
         time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "60")))
         return _emit({"type": "result", "is_error": False, "result": "slept"}, 0)
 
+    if mode == "huge":
+        size = int(os.environ.get("FAKE_CLAUDE_HUGE_BYTES", "500000"))
+        return _emit({"type": "result", "is_error": False, "result": "x" * size}, 0)
+
     if mode == "badjson":
         sys.stdout.write("이건 JSON이 아닙니다")
         return 0
@@ -118,7 +124,8 @@ def main() -> int:
             "num_turns": 2,
             "session_id": "fake-session",
             "permission_denials": [],
-            "result": f"{len(targets)}개 파일을 수정했습니다.",
+            "result": os.environ.get("FAKE_CLAUDE_RESULT")
+            or f"{len(targets)}개 파일을 수정했습니다.",
         },
         0,
     )

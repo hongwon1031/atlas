@@ -298,6 +298,18 @@ class RunReconciler:
         """
 
         moment = now or utcnow()
+        if not run.status.expects_heartbeat:
+            # heartbeat를 기대하지 않는 상태입니다. AwaitingValidation은
+            # executor가 정상 종료해 heartbeat가 멈춘 것이 정상이므로,
+            # 멈췄다는 이유로 회수하면 정상 결과를 잃습니다.
+            return RunVerdict(
+                run.run_id,
+                run.task_id,
+                "healthy",
+                f"{run.status.value}는 heartbeat 대상이 아닙니다.",
+                {"status": run.status.value, "heartbeat_expected": False},
+            )
+
         heartbeat_at = from_iso(run.heartbeat_at)
         heartbeat_age = (moment - heartbeat_at).total_seconds()
         deadline = heartbeat_at + timedelta(seconds=self._config.stale_after_seconds)
@@ -344,8 +356,14 @@ class RunReconciler:
 
 
 def is_stale(run: Run, config: RunConfig, now: datetime | None = None) -> bool:
+    """heartbeat가 끊긴 지 오래된 Run인가.
+
+    heartbeat를 기대하지 않는 상태는 stale이 아닙니다. 멈춘 것이 정상입니다.
+    """
+
     moment = now or utcnow()
+    status = RunStatus(run.status)
     return (
-        not RunStatus(run.status).is_terminal
+        status.expects_heartbeat
         and from_iso(run.heartbeat_at) + timedelta(seconds=config.stale_after_seconds) <= moment
     )

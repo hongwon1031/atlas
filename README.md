@@ -93,8 +93,8 @@ python -m atlas reconcile
 | `ATLAS_EXECUTOR` | `mock` | 사용할 executor adapter. `claude` 또는 `mock` |
 | `ATLAS_CLAUDE_EXECUTABLE` | (PATH 검색) | Claude Code 실행 파일 경로 |
 | `ATLAS_CLAUDE_MODEL` | (CLI 기본값) | Claude 모델 |
-| `ATLAS_CLAUDE_PERMISSION_MODE` | `acceptEdits` | Claude 권한 모드 |
-| `ATLAS_CLAUDE_TOOLS` | `Read,Edit,Write,Glob,Grep` | Claude에 허용할 도구 |
+| `ATLAS_CLAUDE_PERMISSION_MODE` | `acceptEdits` | Claude 권한 모드. allowlist 밖 값은 거부됩니다 |
+| `ATLAS_CLAUDE_TOOLS` | `Read,Edit,Write,Glob,Grep` | Claude에 허용할 도구. safe set의 subset만 허용하고 shell 계열은 거부됩니다 |
 | `ATLAS_EXECUTOR_GRACE_SECONDS` | `5` | graceful 종료 후 강제 종료까지 |
 | `ATLAS_EXECUTOR_MAX_OUTPUT_BYTES` | `1048576` | stdout/stderr 각각의 최대 저장 크기 |
 | `ATLAS_DISABLE_QUEUE_LABEL` | 미설정 | approval gate 해제. 신뢰된 repository에서만 사용 |
@@ -187,7 +187,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 - Claude Code는 **현재 로그인된 CLI 세션**을 씁니다. Atlas는 credential 값을 읽거나 저장하지 않고 API key를 argv에 넣지 않습니다.
 - Codex adapter는 없습니다.
 - **`changes_applied`는 "코드가 올바르다"는 뜻이 아닙니다.** worktree가 바뀌었다는 뜻일 뿐입니다. validation pipeline이 없어 구현 품질은 검증되지 않습니다.
-- 구현이 성공하면 Run은 `Succeeded`가 아니라 `Running`으로 남습니다. 아직 아무도 결과를 검증하지 않았기 때문입니다. heartbeat가 멈추므로 reconciliation이 결국 그 Run을 `Orphaned`로 표시합니다. validation slice가 이 전이를 담당할 때까지의 알려진 한계입니다.
+- 구현이 성공하면 Run은 `Succeeded`가 아니라 `AwaitingValidation`으로 갑니다. terminal이 아니고 heartbeat 대상도 아니라서 reconciliation이 회수하지 않으며, claim과 workspace가 유지된 채 validation을 기다립니다.
 - allowed path 위반은 **탐지하고 기록만** 합니다. 자동으로 되돌리지 않습니다.
 - executor log는 redaction을 거쳐 저장되므로 원본과 byte 단위로 같지 않습니다. binary 출력은 UTF-8 대체 문자가 됩니다.
 - push, PR 생성, validation pipeline이 없습니다. executor가 worktree를 수정해도 그 결과를 전달하지 않습니다.

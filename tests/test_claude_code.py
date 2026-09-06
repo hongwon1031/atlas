@@ -13,10 +13,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 
 from atlas.claude_code import (
     CLAUDE_TO_RUN_CATEGORY,
+    FORBIDDEN_TOOLS,
+    SAFE_PERMISSION_MODES,
+    SAFE_TOOLS,
+    ClaudeConfigurationError,
     DEFAULT_PERMISSION_MODE,
     DEFAULT_TOOLS,
     ClaudeCodeConfig,
@@ -32,14 +37,16 @@ from atlas.claude_prompt import STANDING_RULES, build_prompt
 from atlas.config import WorkerConfig
 from atlas.config import RunConfig
 from atlas.execution_service import ExecutionService
-from atlas.executor import ExecutorFailure, ExecutorRequest
+from atlas.executor import ExecutorFailure, ExecutorRequest, StructuredCapture
 from atlas.gitcmd import GitRunner
 from atlas.implementation import ImplementationRunner
 from atlas.intake import build_idempotency_key
 from atlas.local_process import LocalProcessExecutor, read_log_tail
 from atlas.parser import parse_issue_body
-from atlas.schema import FAILURE_CATEGORIES, RunStatus
-from atlas.store import ExecutionConflict, TaskStore
+from atlas.redaction import redact
+from atlas.reconciliation import RunReconciler
+from atlas.schema import FAILURE_CATEGORIES, RunFailure, RunStatus
+from atlas.store import SCHEMA_VERSION, ExecutionConflict, RunError, TaskStore, utcnow
 from atlas.validation import validate_intake
 from atlas.workspace import WorkspacePlanner
 from atlas.workspace_service import WorkspaceService
@@ -389,6 +396,134 @@ class ConfigSelectionTest(unittest.TestCase):
             self.assertNotIn("claude", name)
 
 
+class ConfigHardeningTest(unittest.TestCase):
+    """환경변수로 안전 경계를 우회할 수 없어야 합니다."""
+
+    def test_default_config_is_unchanged(self):
+        config = ClaudeCodeConfig()
+
+        self.assertEqual(config.permission_mode, DEFAULT_PERMISSION_MODE)
+        self.assertEqual(config.tools, DEFAULT_TOOLS)
+
+    def test_bypass_permissions_is_rejected(self):
+        for mode in ("bypassPermissions", "bypasspermissions", "dontAsk", "auto"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ClaudeConfigurationError):
+                    ClaudeCodeConfig.from_env({"ATLAS_CLAUDE_PERMISSION_MODE": mode})
+
+    def test_dangerous_sounding_modes_are_rejected(self):
+        with self.assertRaises(ClaudeConfigurationError):
+            ClaudeCodeConfig(permission_mode="dangerously-skip")
+
+    def test_unknown_permission_mode_is_rejected(self):
+        for mode in ("plan", "manual", "", "   ", "acceptedits"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ClaudeConfigurationError):
+                    ClaudeCodeConfig(permission_mode=mode)
+
+    def test_safe_permission_mode_is_accepted(self):
+        for mode in SAFE_PERMISSION_MODES:
+            with self.subTest(mode=mode):
+                self.assertEqual(ClaudeCodeConfig(permission_mode=mode).permission_mode, mode)
+
+    def test_shell_capable_tools_are_rejected(self):
+        for tool in sorted(FORBIDDEN_TOOLS):
+            with self.subTest(tool=tool):
+                with self.assertRaises(ClaudeConfigurationError):
+                    ClaudeCodeConfig.from_env({"ATLAS_CLAUDE_TOOLS": f"Read,Edit,{tool}"})
+
+    def test_unknown_tool_fails_closed(self):
+        for tools in ("Read,SomethingNew", "Read Bash", "bash", "", "   "):
+            with self.subTest(tools=tools):
+                with self.assertRaises(ClaudeConfigurationError):
+                    ClaudeCodeConfig(tools=tools)
+
+    def test_safe_subset_is_accepted(self):
+        config = ClaudeCodeConfig.from_env({"ATLAS_CLAUDE_TOOLS": "Read,Grep"})
+
+        self.assertEqual(config.tool_names, ("Read", "Grep"))
+        self.assertTrue(set(config.tool_names) <= SAFE_TOOLS)
+
+    def test_trailing_separators_are_ignored(self):
+        self.assertEqual(ClaudeCodeConfig(tools="Read,,Grep,").tool_names, ("Read", "Grep"))
+
+    def test_duplicates_are_collapsed(self):
+        self.assertEqual(ClaudeCodeConfig(tools="Read,Read,Grep").tool_names, ("Read", "Grep"))
+
+    def test_invalid_config_fails_at_preflight(self):
+        adapter = ClaudeCodeExecutor(ClaudeCodeConfig())
+        # 검증을 우회해 만든 설정이라도 preflight에서 막아야 합니다.
+        object.__setattr__(adapter.config, "tools", "Read,Bash")
+
+        with self.assertRaises(ClaudeConfigurationError):
+            adapter.preflight()
+
+    def test_normalized_policy_has_no_raw_config(self):
+        policy = ClaudeCodeConfig(executable="/secret/path/claude", model="opus").normalized()
+
+        self.assertEqual(policy["permission_mode"], DEFAULT_PERMISSION_MODE)
+        self.assertEqual(policy["tools"], list(ClaudeCodeConfig().tool_names))
+        self.assertNotIn("executable", policy)
+        self.assertNotIn("/secret/path", json.dumps(policy))
+
+    def test_argv_never_contains_forbidden_values(self):
+        argv = " ".join(build_argv("/bin/claude"))
+
+        for tool in FORBIDDEN_TOOLS:
+            self.assertNotIn(tool, argv)
+        self.assertNotIn("bypassPermissions", argv)
+
+
+class StructuredCaptureTest(unittest.TestCase):
+    """파싱 대상과 저장 대상을 분리해야 합니다."""
+
+    PAYLOAD = {
+        "is_error": False,
+        "subtype": "success",
+        "result": "Changed Authorization: Bearer abc123def456 safely",
+    }
+
+    def test_text_redaction_breaks_single_line_json(self):
+        """이 테스트가 문제의 근거입니다. redaction 후 JSON이 깨집니다."""
+
+        raw = json.dumps(self.PAYLOAD, ensure_ascii=False)
+
+        with self.assertRaises(ValueError):
+            json.loads(redact(raw))
+
+    def test_capture_returns_raw_text_and_clears(self):
+        capture = StructuredCapture()
+        capture.feed(b'{"a": ')
+        capture.feed(b'1}')
+
+        self.assertEqual(capture.take(), '{"a": 1}')
+        # 한 번 읽으면 비워집니다. raw 값을 오래 들고 있지 않습니다.
+        self.assertEqual(capture.take(), "")
+
+    def test_capture_is_bounded_and_fails_closed(self):
+        capture = StructuredCapture(limit=32)
+        capture.feed(b"x" * 100)
+
+        self.assertTrue(capture.overflowed)
+        self.assertEqual(capture.take(), "")
+
+    def test_capture_never_exposes_content_in_to_dict(self):
+        capture = StructuredCapture()
+        capture.feed(b'{"result": "ghp_secretvalue1234567890"}')
+
+        self.assertNotIn("ghp_", json.dumps(capture.to_dict()))
+
+    def test_parsing_survives_authorization_header_in_result(self):
+        raw = json.dumps(self.PAYLOAD, ensure_ascii=False)
+
+        outcome = parse_cli_output(raw)
+
+        self.assertTrue(outcome.parsed)
+        self.assertFalse(outcome.is_error)
+        # 요약은 여전히 redaction을 거칩니다.
+        self.assertNotIn("abc123def456", outcome.result_text)
+
+
 class ChangeDetectionTest(unittest.TestCase):
     """git 없이 판정 로직만 검증합니다."""
 
@@ -471,6 +606,56 @@ class ChangeDetectionTest(unittest.TestCase):
 
 
 @unittest.skipUnless(GIT_AVAILABLE, "git 실행 파일이 없습니다")
+class SchemaMigrationTest(unittest.TestCase):
+    """v5 database의 active Run 인덱스는 AwaitingValidation을 모릅니다."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="atlas-claude-migrate-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.db = str(self.root / "atlas.db")
+
+    def test_v5_index_is_recreated(self):
+        store = TaskStore(self.db)
+        connection = store._connection
+        # v5 정의로 되돌립니다.
+        connection.execute("DROP INDEX idx_runs_active")
+        connection.execute(
+            "CREATE UNIQUE INDEX idx_runs_active ON runs(task_id) "
+            "WHERE status IN ('Pending', 'Running')"
+        )
+        connection.execute("UPDATE schema_meta SET value = '5' WHERE key = 'schema_version'")
+        connection.commit()
+        store.close()
+
+        migrated = TaskStore(self.db)
+        self.addCleanup(migrated.close)
+
+        sql = migrated._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_runs_active'"
+        ).fetchone()["sql"]
+        version = migrated._connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()["value"]
+
+        self.assertIn("AwaitingValidation", sql)
+        self.assertEqual(version, SCHEMA_VERSION)
+
+    def test_recreation_is_idempotent(self):
+        store = TaskStore(self.db)
+        first = store._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_runs_active'"
+        ).fetchone()["sql"]
+        store.close()
+
+        again = TaskStore(self.db)
+        self.addCleanup(again.close)
+        second = again._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'idx_runs_active'"
+        ).fetchone()["sql"]
+
+        self.assertEqual(first, second)
+
+
 class ClaudeIntegrationTestCase(unittest.TestCase):
     """가짜 Claude 실행 파일로 adapter 전체 경로를 확인합니다."""
 
@@ -649,7 +834,9 @@ class ImplementationResultTest(ClaudeIntegrationTestCase):
 
         self.assertIs(report.outcome, ImplementationOutcome.CHANGES_APPLIED)
         # validation이 아직 없으므로 Run을 성공으로 확정하지 않습니다.
-        self.assertIs(self.store.run(self.run.run_id).status, RunStatus.RUNNING)
+        run = self.store.run(self.run.run_id)
+        self.assertIs(run.status, RunStatus.AWAITING_VALIDATION)
+        self.assertFalse(run.status.is_terminal)
 
     def test_no_op_is_not_reported_as_success(self):
         report = self.implement(FAKE_CLAUDE_MODE="nochange")
@@ -732,6 +919,173 @@ class ImplementationResultTest(ClaudeIntegrationTestCase):
         blob += Path(self.db).read_bytes().decode("latin-1")
         blob += read_log_tail(report.result.stdout.path, max_bytes=1_000_000)
         self.assertNotIn(secret, blob)
+
+
+class StructuredParsingIntegrationTest(ClaudeIntegrationTestCase):
+    """persisted log는 redacted, 파싱은 원문에서."""
+
+    SECRET = "ghp_" + "K" * 32
+
+    def implement_with_result(self, text, secrets=()):
+        return self.runner.run(
+            self.run.run_id,
+            WORKER,
+            timeout_seconds=60.0,
+            secret_values=tuple(secrets),
+            environment=self.env(
+                FAKE_CLAUDE_WRITE="docs/note.md", FAKE_CLAUDE_RESULT=text
+            ),
+        )
+
+    def persisted(self, report):
+        return Path(report.result.stdout.path).read_text(encoding="utf-8", errors="replace")
+
+    def test_authorization_header_in_result_still_parses(self):
+        report = self.implement_with_result("Changed Authorization: Bearer abc123def456 safely")
+
+        self.assertTrue(report.claude.parsed, "redacted log를 파싱하면 여기서 깨집니다")
+        self.assertIsNone(report.claude.failure)
+        self.assertIs(report.outcome, ImplementationOutcome.CHANGES_APPLIED)
+        self.assertNotIn("abc123def456", self.persisted(report))
+
+    def test_provider_token_in_result_still_parses(self):
+        report = self.implement_with_result("wrote " + self.SECRET + " to config")
+
+        self.assertTrue(report.claude.parsed)
+        self.assertNotIn(self.SECRET, self.persisted(report))
+        self.assertNotIn(self.SECRET, report.claude.result_text)
+
+    def test_url_credential_in_result_still_parses(self):
+        report = self.implement_with_result(
+            "cloned https://user:tokenvalue123@example.com/x.git"
+        )
+
+        self.assertTrue(report.claude.parsed)
+        self.assertNotIn("tokenvalue123", self.persisted(report))
+
+    def test_injected_secret_is_not_persisted_anywhere(self):
+        secret = "inject3d-" + ("V" * 24)
+        report = self.implement_with_result("used " + secret + " once", secrets=(secret,))
+
+        self.assertTrue(report.claude.parsed)
+        blob = self.persisted(report)
+        blob += json.dumps([dict(r) for r in self.store.events()], ensure_ascii=False)
+        blob += Path(self.db).read_bytes().decode("latin-1")
+        self.assertNotIn(secret, blob)
+
+    def test_malformed_json_is_unparseable(self):
+        report = self.implement(FAKE_CLAUDE_MODE="badjson", FAKE_CLAUDE_WRITE="docs/note.md")
+
+        self.assertFalse(report.claude.parsed)
+        self.assertEqual(report.claude.failure, ClaudeFailure.OUTPUT_UNPARSEABLE)
+
+    def test_oversized_json_fails_closed(self):
+        adapter = ClaudeCodeExecutor(
+            ClaudeCodeConfig(executable=str(self.fake), structured_output_bytes=4096)
+        )
+        runner = ImplementationRunner(self.store, self.service, adapter)
+
+        report = runner.run(
+            self.run.run_id,
+            WORKER,
+            timeout_seconds=60.0,
+            environment=self.env(FAKE_CLAUDE_MODE="huge", FAKE_CLAUDE_HUGE_BYTES=200000),
+        )
+
+        self.assertFalse(report.claude.parsed)
+        self.assertEqual(report.claude.failure, ClaudeFailure.OUTPUT_TOO_LARGE)
+
+    def test_effective_policy_is_recorded_normalized(self):
+        self.implement_with_result("done")
+
+        rows = [r for r in self.store.events() if r["kind"] == "implementation_completed"]
+        detail = json.loads(rows[0]["detail"])
+        self.assertEqual(detail["effective_policy"]["permission_mode"], DEFAULT_PERMISSION_MODE)
+        self.assertNotIn("Bash", detail["effective_policy"]["tools"])
+        self.assertNotIn(str(self.fake), rows[0]["detail"])
+
+
+class AwaitingValidationTest(ClaudeIntegrationTestCase):
+    """구현 완료는 terminal도 아니고 stale도 아닙니다."""
+
+    def test_changes_applied_moves_to_awaiting_validation(self):
+        report = self.implement(FAKE_CLAUDE_WRITE="docs/note.md")
+
+        self.assertIs(report.outcome, ImplementationOutcome.CHANGES_APPLIED)
+        run = self.store.run(self.run.run_id)
+        self.assertIs(run.status, RunStatus.AWAITING_VALIDATION)
+        self.assertFalse(run.status.is_terminal)
+        self.assertTrue(run.status.is_active)
+        self.assertFalse(run.status.expects_heartbeat)
+
+    def test_it_is_not_orphaned_after_the_stale_threshold(self):
+        self.implement(FAKE_CLAUDE_WRITE="docs/note.md")
+        later = utcnow() + timedelta(seconds=10000)
+
+        reconciler = RunReconciler(
+            self.store, RunConfig(heartbeat_interval_seconds=1.0, stale_after_seconds=60.0)
+        )
+        reconciler.reconcile(now=later)
+
+        self.assertIs(self.store.run(self.run.run_id).status, RunStatus.AWAITING_VALIDATION)
+
+    def test_orphan_if_stale_refuses_the_state(self):
+        self.implement(FAKE_CLAUDE_WRITE="docs/note.md")
+        run = self.store.run(self.run.run_id)
+
+        orphaned = self.store.orphan_if_stale(
+            run.run_id,
+            observed_heartbeat_at=run.heartbeat_at,
+            stale_after_seconds=0.0,
+            failure=RunFailure("worker_lost", "강제 시도"),
+            evidence={},
+            now=utcnow() + timedelta(seconds=10000),
+        )
+
+        self.assertIsNone(orphaned)
+        self.assertIs(self.store.run(run.run_id).status, RunStatus.AWAITING_VALIDATION)
+
+    def test_no_active_execution_remains(self):
+        self.implement(FAKE_CLAUDE_WRITE="docs/note.md")
+
+        self.assertIsNone(self.store.active_execution(self.run.run_id))
+        self.assertEqual(self.store.active_executions(), [])
+
+    def test_workspace_is_kept(self):
+        self.implement(FAKE_CLAUDE_WRITE="docs/note.md")
+
+        run = self.store.run(self.run.run_id)
+        self.assertTrue(Path(run.worktree_path).exists())
+        self.assertEqual(run.workspace_status.value, "ready")
+        self.assertEqual(GitRunner(run.worktree_path).current_branch(), run.branch)
+
+    def test_it_still_holds_the_task_run_slot(self):
+        self.implement(FAKE_CLAUDE_WRITE="docs/note.md")
+
+        with self.assertRaises(RunError):
+            self.store.start_run(self.run.task_id, WORKER)
+
+    def test_transition_is_idempotent(self):
+        self.implement(FAKE_CLAUDE_WRITE="docs/note.md")
+
+        again = self.store.await_validation(self.run.run_id)
+
+        self.assertIs(again.status, RunStatus.AWAITING_VALIDATION)
+
+    def test_it_can_still_be_finished_later(self):
+        """다음 validation slice가 여기서 이어받습니다."""
+
+        self.implement(FAKE_CLAUDE_WRITE="docs/note.md")
+
+        finished = self.store.finish_run(self.run.run_id, RunStatus.SUCCEEDED)
+
+        self.assertIs(finished.status, RunStatus.SUCCEEDED)
+
+    def test_failures_do_not_use_the_new_state(self):
+        report = self.implement(FAKE_CLAUDE_MODE="nochange")
+
+        self.assertIs(report.outcome, ImplementationOutcome.NO_CHANGES)
+        self.assertIs(self.store.run(self.run.run_id).status, RunStatus.FAILED)
 
 
 class WorktreeStateCaptureTest(ClaudeIntegrationTestCase):

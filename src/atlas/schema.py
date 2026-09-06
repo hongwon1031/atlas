@@ -181,6 +181,10 @@ class RunStatus(str, Enum):
 
     PENDING = "Pending"
     RUNNING = "Running"
+    # executor가 구현을 마쳤지만 아직 아무도 결과를 검증하지 않은 상태입니다.
+    # terminal이 아니고, executor process도 heartbeat도 없습니다. 다음
+    # validation slice가 여기서 시작합니다.
+    AWAITING_VALIDATION = "AwaitingValidation"
     SUCCEEDED = "Succeeded"
     FAILED = "Failed"
     CANCELLED = "Cancelled"
@@ -192,17 +196,45 @@ class RunStatus(str, Enum):
 
     @property
     def is_active(self) -> bool:
+        """Task의 active Run 슬롯을 차지하는가.
+
+        `AwaitingValidation`도 포함합니다. 아직 끝나지 않은 작업이므로 같은
+        Task로 다른 Run이 시작되면 branch와 worktree가 충돌합니다.
+        """
+
         return self in _ACTIVE_RUN_STATUSES
+
+    @property
+    def expects_heartbeat(self) -> bool:
+        """worker가 heartbeat를 보내고 있어야 하는 상태인가.
+
+        `AwaitingValidation`은 executor process가 이미 끝났으므로 heartbeat가
+        오지 않습니다. staleness 판정 대상에서 빼야 정상 결과를 `Orphaned`로
+        만들지 않습니다.
+        """
+
+        return self in _HEARTBEAT_RUN_STATUSES
 
 
 _TERMINAL_RUN_STATUSES = frozenset(
     {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.ORPHANED}
 )
 # active Run은 Task당 하나만 허용됩니다. store의 partial unique index와 같은 집합입니다.
-_ACTIVE_RUN_STATUSES = frozenset({RunStatus.PENDING, RunStatus.RUNNING})
+_ACTIVE_RUN_STATUSES = frozenset(
+    {RunStatus.PENDING, RunStatus.RUNNING, RunStatus.AWAITING_VALIDATION}
+)
+
+# heartbeat가 오고 있어야 하는 상태. staleness 판정은 이 집합만 봅니다.
+# active와 분리해야 하는 이유는 `AwaitingValidation`이 "아직 끝나지 않았지만
+# 돌고 있지도 않은" 상태이기 때문입니다.
+_HEARTBEAT_RUN_STATUSES = frozenset({RunStatus.PENDING, RunStatus.RUNNING})
 
 ACTIVE_RUN_STATUSES: tuple[str, ...] = tuple(
     sorted(status.value for status in _ACTIVE_RUN_STATUSES)
+)
+
+HEARTBEAT_RUN_STATUSES: tuple[str, ...] = tuple(
+    sorted(status.value for status in _HEARTBEAT_RUN_STATUSES)
 )
 
 # docs/specs/task-state-machine.md의 Failure Taxonomy.
