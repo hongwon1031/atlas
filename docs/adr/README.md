@@ -32,13 +32,14 @@ Follow-up Tasks
 | [ADR-007: Public Repository Security Policy](0007-public-repository-security-policy.md) | Proposed | 공개 가능 설계와 민감 운영 정보 분리 제안 |
 | [ADR-008: Initial GitHub Event Ingestion](0008-initial-github-event-ingestion.md) | Accepted | Initial MVP polling-first, webhook deferred |
 | [ADR-009: Worker Process Supervision](0009-worker-process-supervision.md) | Proposed | tmux PoC, stable systemd 또는 Docker 전환 제안 |
-| [ADR-010: Task Execution Isolation](0010-task-execution-isolation.md) | Proposed | Task별 branch, worktree/clone, process, Run, log 격리 제안 |
+| [ADR-010: Task Execution Isolation](0010-task-execution-isolation.md) | Partially Accepted | branch/worktree 격리는 Accepted, executor process 격리는 Proposed |
 | [ADR-011: Initial Implementation Language](0011-initial-implementation-language.md) | Accepted | Control Plane 초기 구현 언어는 Python 3.11 이상, dependency 0개 |
 | [ADR-012: Operational State Store](0012-operational-state-store.md) | Accepted | 운영 상태는 표준 라이브러리 sqlite3, atomic claim은 트랜잭션과 partial unique index |
 
 ## Status Definitions
 
 - `Proposed` — 검토 중이며 구현의 확정 근거로 사용할 수 없음
+- `Partially Accepted` — 일부 범위만 승인됨. ADR 안에서 Accepted 범위와 남은 Proposed 범위를 구분해 적음
 - `Accepted` — 사람이 승인했으며 후속 작업이 따라야 하는 결정
 - `Superseded` — 더 최신 ADR로 대체됨; 대체 문서 링크 필요
 - `Rejected` — 채택하지 않기로 결정; 이유와 대안 기록 유지

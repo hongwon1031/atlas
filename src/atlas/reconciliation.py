@@ -20,8 +20,9 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from .config import RunConfig
-from .schema import Run, RunFailure, RunStatus
+from .schema import Run, RunFailure, RunStatus, WorkspaceStatus
 from .store import TaskStore, from_iso, utcnow
+from .workspace_service import WorkspaceService
 
 # 재실행이 아니라 사람 확인이 필요하다는 뜻의 실패 분류입니다.
 ORPHAN_FAILURE_CATEGORY = "worker_lost"
@@ -53,6 +54,7 @@ class ReconcileReport:
     healthy: tuple[str, ...] = ()
     orphaned: tuple[str, ...] = ()
     verdicts: tuple[RunVerdict, ...] = ()
+    workspace_findings: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -60,6 +62,7 @@ class ReconcileReport:
             "healthy": list(self.healthy),
             "orphaned": list(self.orphaned),
             "verdicts": [verdict.to_dict() for verdict in self.verdicts],
+            "workspace_findings": list(self.workspace_findings),
         }
 
 
@@ -73,9 +76,15 @@ class _Counters:
 class RunReconciler:
     """active Run을 훑어 stale한 것을 recovery review로 넘깁니다."""
 
-    def __init__(self, store: TaskStore, config: RunConfig | None = None) -> None:
+    def __init__(
+        self,
+        store: TaskStore,
+        config: RunConfig | None = None,
+        workspaces: WorkspaceService | None = None,
+    ) -> None:
         self._store = store
         self._config = config or RunConfig()
+        self._workspaces = workspaces
 
     @property
     def config(self) -> RunConfig:
@@ -85,6 +94,7 @@ class RunReconciler:
         moment = now or utcnow()
         counters = _Counters()
         active = self._store.active_runs()
+        workspace_findings = self.reconcile_workspaces(now=moment)
 
         for run in active:
             verdict = self.evaluate(run, moment)
@@ -123,7 +133,74 @@ class RunReconciler:
             healthy=tuple(counters.healthy),
             orphaned=tuple(counters.orphaned),
             verdicts=tuple(counters.verdicts),
+            workspace_findings=tuple(workspace_findings),
         )
+
+    def reconcile_workspaces(self, now: datetime | None = None) -> list[dict[str, Any]]:
+        """기록된 workspace가 디스크와 일치하는지 확인합니다.
+
+        불일치를 발견해도 임의로 복구하거나 삭제하지 않습니다. recovery-required
+        근거를 event로 남기고 사람이 판단하게 합니다.
+        """
+
+        if self._workspaces is None:
+            return []
+
+        findings: list[dict[str, Any]] = []
+        for run in self._store.runs_with_workspace():
+            if not run.branch or not run.worktree_path:
+                continue
+            try:
+                disk = self._workspaces.planner.inspect(run.branch, run.worktree_path)
+            except Exception as error:  # noqa: BLE001 - 진단 실패도 근거로 남깁니다.
+                findings.append(
+                    self._workspace_finding(
+                        run, "workspace_inspect_failed", {"detail": type(error).__name__}, now
+                    )
+                )
+                continue
+
+            problems = []
+            if run.workspace_status is WorkspaceStatus.READY:
+                if not disk["path_exists"]:
+                    problems.append("worktree_missing")
+                elif not disk["registered_worktree"]:
+                    problems.append("worktree_not_registered")
+                if disk["branch_matches"] is False:
+                    problems.append("branch_mismatch")
+                if not disk["branch_exists"]:
+                    problems.append("branch_missing")
+            elif run.workspace_status in (WorkspaceStatus.PREPARING, WorkspaceStatus.FAILED):
+                if disk["path_exists"] or disk["branch_exists"]:
+                    problems.append("incomplete_workspace_left_resources")
+
+            if not disk["path_within_root"] and disk["path_exists"]:
+                problems.append("path_outside_root")
+
+            if problems:
+                findings.append(
+                    self._workspace_finding(
+                        run,
+                        "workspace_recovery_required",
+                        {"problems": problems, "disk": disk},
+                        now,
+                    )
+                )
+        return findings
+
+    def _workspace_finding(
+        self, run: Run, kind: str, detail: dict[str, Any], now: datetime | None
+    ) -> dict[str, Any]:
+        payload = {
+            "run_id": run.run_id,
+            "task_id": run.task_id,
+            "kind": kind,
+            "workspace_status": run.workspace_status.value,
+            "branch": run.branch,
+            **detail,
+        }
+        self._store.record_workspace_event(run.run_id, kind, payload, now=now)
+        return payload
 
     def evaluate(self, run: Run, now: datetime | None = None) -> RunVerdict:
         """Run 하나를 판정합니다. 상태를 바꾸지 않으므로 단독 조회에 쓸 수 있습니다.

@@ -11,7 +11,10 @@
     python -m atlas run-start <task-id> # claim된 Task에 Run 생성
     python -m atlas run-heartbeat <run-id>
     python -m atlas run-finish <run-id> --status Succeeded
-    python -m atlas reconcile           # stale Run을 recovery review로 전환
+    python -m atlas reconcile           # stale Run + workspace 정합성 확인
+    python -m atlas workspace-create --run-id <run-id>
+    python -m atlas workspace-show --run-id <run-id>
+    python -m atlas workspace-cleanup --run-id <run-id>
 
 Exit code: 0 성공, 1 대상 없음 또는 lifecycle 위반, 2 source 오류.
 """
@@ -33,6 +36,8 @@ from .polling import IssuePoller
 from .reconciliation import RunReconciler
 from .schema import RunFailure, RunStatus
 from .store import RunError, TaskStore
+from .workspace import WorkspaceError, WorkspacePlanner
+from .workspace_service import WorkspaceService
 
 _ISSUE_NUMBER = re.compile(r"^\d+$")
 COMMANDS = (
@@ -46,6 +51,9 @@ COMMANDS = (
     "run-heartbeat",
     "run-finish",
     "reconcile",
+    "workspace-create",
+    "workspace-show",
+    "workspace-cleanup",
 )
 
 # finish에서 사람이 지정할 수 있는 terminal 상태. Orphaned는 reconciliation이
@@ -148,11 +156,42 @@ def build_parser() -> argparse.ArgumentParser:
     finish.add_argument("--failure-message", default="", help="redaction을 마친 설명")
 
     reconcile = subparsers.add_parser(
-        "reconcile", parents=[common], help="stale Run을 탐지해 recovery review로 넘깁니다"
+        "reconcile", parents=[common], help="stale Run과 workspace 정합성을 확인합니다"
     )
     reconcile.add_argument("--stale-after", type=_positive_float, default=None, help="초")
     reconcile.add_argument(
         "--dry-run", action="store_true", help="판정만 하고 상태를 바꾸지 않습니다"
+    )
+
+    workspace_common = argparse.ArgumentParser(add_help=False)
+    workspace_common.add_argument("--run-id", required=True)
+    workspace_common.add_argument(
+        "--repository-root", default=None, help="대상 repository의 local root"
+    )
+    workspace_common.add_argument(
+        "--workspaces-root", default=None, help="worktree를 만들 worker root"
+    )
+
+    subparsers.add_parser(
+        "workspace-create",
+        parents=[common, workspace_common],
+        help="Run에 격리된 branch와 worktree를 만듭니다",
+    )
+    subparsers.add_parser(
+        "workspace-show",
+        parents=[common, workspace_common],
+        help="Run workspace의 기록과 실제 디스크 상태를 봅니다",
+    )
+    cleanup = subparsers.add_parser(
+        "workspace-cleanup",
+        parents=[common, workspace_common],
+        help="terminal Run의 worktree를 제거합니다",
+    )
+    cleanup.add_argument(
+        "--allow-dirty", action="store_true", help="저장되지 않은 변경이 있어도 제거"
+    )
+    cleanup.add_argument(
+        "--delete-branch", action="store_true", help="branch까지 삭제(기본은 보존)"
     )
 
     return parser
@@ -201,7 +240,12 @@ def _config(args: argparse.Namespace) -> WorkerConfig:
     run = config.run
     if stale_after := _option(args, "stale_after"):
         run = replace(run, stale_after_seconds=stale_after)
-    return replace(config, polling=polling, claim=claim, run=run)
+    workspace = config.workspace
+    if repository_root := _option(args, "repository_root"):
+        workspace = replace(workspace, repository_root=repository_root)
+    if workspaces_root := _option(args, "workspaces_root"):
+        workspace = replace(workspace, workspaces_root=workspaces_root)
+    return replace(config, polling=polling, claim=claim, run=run, workspace=workspace)
 
 
 def _default_worker_id() -> str:
@@ -233,6 +277,12 @@ def main(argv: list[str] | None = None) -> int:
             return _run_run_finish(args, config)
         if args.command == "reconcile":
             return _run_reconcile(args, config)
+        if args.command == "workspace-create":
+            return _run_workspace_create(args, config)
+        if args.command == "workspace-show":
+            return _run_workspace_show(args, config)
+        if args.command == "workspace-cleanup":
+            return _run_workspace_cleanup(args, config)
     except IssueSourceError as error:
         _emit(
             {"status": "SourceError", "category": error.category, "message": error.message},
@@ -242,6 +292,12 @@ def main(argv: list[str] | None = None) -> int:
     except RunError as error:
         _emit(
             {"status": "RunError", "category": error.category, "message": error.message},
+            _option(args, "indent", 2),
+        )
+        return 1
+    except WorkspaceError as error:
+        _emit(
+            {"status": "WorkspaceError", "category": error.category, "message": error.message},
             _option(args, "indent", 2),
         )
         return 1
@@ -387,9 +443,60 @@ def _run_run_finish(args: argparse.Namespace, config: WorkerConfig) -> int:
     return 0
 
 
+def _workspace_service(store: TaskStore, config: WorkerConfig) -> WorkspaceService:
+    """workspace 서비스를 만듭니다. repository root는 반드시 명시돼야 합니다."""
+
+    root = config.workspace.repository_root
+    if not root:
+        raise WorkspaceError(
+            "repository_root_missing",
+            "repository root가 지정되지 않았습니다. --repository-root 또는 "
+            "ATLAS_REPOSITORY_ROOT를 설정하세요. 현재 디렉터리를 추측하지 않습니다.",
+        )
+    planner = WorkspacePlanner(
+        root,
+        config.workspace.resolved_workspaces_root(),
+        repository=config.polling.repository,
+        base_branch="main",
+        git_timeout_seconds=config.workspace.git_timeout_seconds,
+    )
+    return WorkspaceService(store, planner)
+
+
+def _run_workspace_create(args: argparse.Namespace, config: WorkerConfig) -> int:
+    with TaskStore(config.database_path) as store:
+        result = _workspace_service(store, config).create(args.run_id)
+    _emit(
+        {"status": "WorkspaceReady" if result.created else "WorkspaceExists", **result.to_dict()},
+        _option(args, "indent", 2),
+    )
+    return 0
+
+
+def _run_workspace_show(args: argparse.Namespace, config: WorkerConfig) -> int:
+    with TaskStore(config.database_path) as store:
+        report = _workspace_service(store, config).show(args.run_id)
+    _emit({"status": "Workspace", **report}, _option(args, "indent", 2))
+    return 0
+
+
+def _run_workspace_cleanup(args: argparse.Namespace, config: WorkerConfig) -> int:
+    with TaskStore(config.database_path) as store:
+        result = _workspace_service(store, config).cleanup(
+            args.run_id,
+            allow_dirty=args.allow_dirty,
+            delete_branch=args.delete_branch,
+        )
+    _emit({"status": "WorkspaceCleanup", **result.to_dict()}, _option(args, "indent", 2))
+    return 0 if result.error is None else 1
+
+
 def _run_reconcile(args: argparse.Namespace, config: WorkerConfig) -> int:
     with TaskStore(config.database_path) as store:
-        reconciler = RunReconciler(store, config.run)
+        workspaces = None
+        if config.workspace.repository_root:
+            workspaces = _workspace_service(store, config)
+        reconciler = RunReconciler(store, config.run, workspaces)
         if args.dry_run:
             verdicts = [reconciler.evaluate(run) for run in store.active_runs()]
             payload = {

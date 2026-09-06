@@ -53,7 +53,13 @@ python -m atlas run-heartbeat <run-id> --worker-id worker-1
 python -m atlas run-finish <run-id> --status Succeeded
 python -m atlas runs --task-id ATLAS-0042
 
-# worker 재시작 후 stale Run 정리
+# Run별 격리 branch/worktree
+export ATLAS_REPOSITORY_ROOT=/path/to/repo
+python -m atlas workspace-create --run-id <run-id>
+python -m atlas workspace-show --run-id <run-id>
+python -m atlas workspace-cleanup --run-id <run-id>
+
+# worker 재시작 후 stale Run과 workspace 정리
 python -m atlas reconcile --dry-run   # 판정만
 python -m atlas reconcile
 ```
@@ -73,6 +79,9 @@ python -m atlas reconcile
 | `ATLAS_LEASE_TTL_SECONDS` | `900` | claim lease TTL |
 | `ATLAS_HEARTBEAT_INTERVAL_SECONDS` | `30` | Run heartbeat 권장 주기 |
 | `ATLAS_RUN_STALE_AFTER_SECONDS` | `300` | 이 시간 동안 heartbeat가 없으면 stale |
+| `ATLAS_REPOSITORY_ROOT` | 없음 | 대상 repository의 local root. workspace 명령에 필수 |
+| `ATLAS_WORKSPACES_ROOT` | `<repo>/.atlas/worktrees` | worktree를 만들 worker root |
+| `ATLAS_GIT_TIMEOUT_SECONDS` | `30` | git 명령 timeout |
 | `ATLAS_DISABLE_QUEUE_LABEL` | 미설정 | approval gate 해제. 신뢰된 repository에서만 사용 |
 
 token은 저장소에 두지 않고 환경변수로만 주입합니다. database 파일도 commit하지 않습니다. public repository의 Issue는 token 없이도 조회되지만 rate limit이 훨씬 낮습니다.
@@ -87,6 +96,7 @@ token은 저장소에 두지 않고 환경변수로만 주입합니다. database
 | Issue intake core | Complete | 단건 fetch·parse·validate와 회귀 테스트 구현; Issue #7로 live 확인 |
 | Polling, persistence, claim, lease | Complete | polling·SQLite store·atomic claim·lease·승인 회수 구현; Issue #7로 live E2E 확인 |
 | Run lifecycle, heartbeat, reconciliation | Complete | Run record·heartbeat·restart recovery 구현; 별도 OS 프로세스 동시성 확인 |
+| Run별 branch·worktree 격리 | Complete | 전용 branch/worktree, 경계 검증, cleanup, workspace reconciliation 구현 |
 | self-hosted Claude Code automated path | Planned | primary automated executor로 결정됐지만 invocation 미구현 |
 | Atlas-to-Codex Cloud automation | Feasibility Unverified | adapter로 표시하기 전 integration validation 필요 |
 | Polling, claim, recovery, routing, validation delivery | Not Implemented | 문서 계약만 존재 |
@@ -156,7 +166,9 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 ## Current Limitations
 
 - webhook ingestion이 없습니다. polling만 있으며 지연은 interval에 좌우됩니다.
-- Run은 실행 단위 record까지입니다. worktree, branch, executor process, timeout은 아직 없습니다.
+- Run별 branch와 worktree는 준비되지만 그 안에서 아무 process도 실행하지 않습니다. executor invocation, timeout, cancellation은 아직 없습니다.
+- 기존 workspace를 재사용할 때는 DB 기록만 믿지 않고 실제 git 상태를 다시 확인합니다. 불일치는 자동 복구하지 않고 `workspace_recovery_required`로 거부하므로 사람이 판단해야 합니다.
+- worktree는 `<repository-root>/.atlas/worktrees` 아래에 만듭니다. 대상 repository에서 이 경로를 ignore해야 합니다.
 - 승인이 회수되거나 claim이 해제돼도 실행 중인 executor를 멈추는 기능은 없습니다. 지금은 executor 자체가 없어 문제가 되지 않지만, executor를 도입하는 slice에서 cancellation을 함께 구현해야 합니다.
 - reconciliation은 heartbeat 경과와 claim/lease 상태로만 판단합니다. executor process가 없어 PID identity 확인을 수행하지 못하며, 판정 event에 `process_identity_checked: false`로 기록합니다.
 - live E2E는 Issue #7로 확인했습니다. 단계별 결과는 [Verification Log](docs/verification-log.md)에 있습니다.
@@ -242,8 +254,11 @@ atlas/
 │   ├── issue_source.py               # IssueSource/IssueLister 경계와 GitHub REST adapter
 │   ├── intake.py                     # fetch → parse → validate 조립
 │   ├── polling.py                    # candidate Issue polling과 등록
-│   ├── store.py                      # SQLite operational store, claim, lease, Run
-│   ├── reconciliation.py             # stale Run 판정과 recovery review 전환
+│   ├── store.py                      # SQLite operational store, claim, lease, Run, workspace
+│   ├── gitcmd.py                     # git CLI adapter (shell 미사용, timeout, redaction)
+│   ├── workspace.py                  # branch naming, 경로 경계, worktree 생성·검증
+│   ├── workspace_service.py          # workspace 단계별 lifecycle과 cleanup 정책
+│   ├── reconciliation.py             # stale Run과 workspace 정합성 판정
 │   └── cli.py                        # show / poll / claim / runs / reconcile 등
 ├── tests/                            # 단위 테스트 (표준 unittest)
 └── docs/

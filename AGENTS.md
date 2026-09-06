@@ -22,9 +22,9 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 - Target MVP에서는 Atlas worker가 Issue를 검증·claim하고 always-available server의 self-hosted Claude Code worker가 primary automated executor로 실행됩니다.
 - Codex Cloud는 manual/secondary executor입니다. 다른 Adapter를 배제하지 않지만 primary automated path로 간주하지 않습니다.
 - Atlas Control Plane의 초기 구현 언어는 [ADR-011](docs/adr/0011-initial-implementation-language.md)에 따라 Python 3.11 이상입니다.
-- `src/atlas/`의 현재 구현은 Issue polling, Task 저장(SQLite), atomic claim과 lease, Run lifecycle과 heartbeat, restart reconciliation까지입니다. worktree, branch, executor process 실행, validation, PR delivery는 없습니다.
-- polling-first ingestion은 [ADR-008](docs/adr/0008-initial-github-event-ingestion.md) Accepted이고 operational store는 [ADR-012](docs/adr/0012-operational-state-store.md) Accepted입니다. tmux PoC supervision과 Task/Run isolation은 ADR-009~010의 `Proposed` 방향이며 승인된 구현 근거로 취급하지 않습니다.
-- webhook, comment/label command automation, worktree, executor process 실행, Claude Code invocation은 아직 구현되지 않았습니다. 현재 존재한다고 주장하거나 문서 Task에서 구현하지 않습니다.
+- `src/atlas/`의 현재 구현은 Issue polling, Task 저장(SQLite), atomic claim과 lease, Run lifecycle과 heartbeat, restart reconciliation, Run별 branch·worktree 격리까지입니다. executor process 실행, validation, PR delivery는 없습니다.
+- polling-first ingestion은 [ADR-008](docs/adr/0008-initial-github-event-ingestion.md) Accepted이고 operational store는 [ADR-012](docs/adr/0012-operational-state-store.md) Accepted입니다. [ADR-010](docs/adr/0010-task-execution-isolation.md)은 branch/worktree 격리만 Accepted이고 executor process 격리는 계속 Proposed입니다. tmux PoC supervision(ADR-009)도 `Proposed`이며 승인된 구현 근거로 취급하지 않습니다.
+- webhook, comment/label command automation, executor process 실행, Claude Code invocation은 아직 구현되지 않았습니다. 현재 존재한다고 주장하거나 문서 Task에서 구현하지 않습니다.
 
 ## 우선순위와 기본 행동
 
@@ -45,7 +45,7 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 1. `AGENTS.md`
 2. `README.md`
 3. `docs/constitution.md`
-4. Accepted ADR-001, ADR-002, ADR-003, ADR-008, ADR-011, ADR-012
+4. Accepted ADR-001, ADR-002, ADR-003, ADR-008, ADR-011, ADR-012와 ADR-010의 Accepted 범위
 5. `docs/prd.md`
 6. `docs/architecture.md`
 7. `docs/security-governance.md`
@@ -67,7 +67,7 @@ Atlas의 핵심은 새 코딩 모델을 만드는 것이 아니라 다음을 안
 - Task가 문서·거버넌스 전용이면 application code, dependency, CI, infrastructure를 추가하지 않습니다.
 - Issue가 존재한다는 사실만으로 Task 후보가 되지 않습니다. `atlas:queued` label이 approval signal이며, GitHub가 label 추가를 triage 이상 권한자로 제한하는 것이 현재의 authorization gate입니다.
 - Target MVP의 worker가 구현되기 전에는 `/atlas` command나 `atlas:*` label이 작업을 자동 시작한다고 가정하지 않습니다.
-- `python -m atlas <issue-number>`는 단건 validation 결과만 출력하며 저장하지 않습니다. `poll`은 valid Task를 저장하고, `claim`은 lease를 잡고, `run-start`는 Run record를 만들지만 어느 것도 executor를 실행하지 않습니다.
+- `python -m atlas <issue-number>`는 단건 validation 결과만 출력하며 저장하지 않습니다. `poll`은 valid Task를 저장하고, `claim`은 lease를 잡고, `run-start`는 Run record를, `workspace-create`는 격리된 branch/worktree를 만들지만 어느 것도 executor를 실행하지 않습니다.
 - usage detection, routing, automated validation, mobile notification이 구현됐다고 가정하지 않습니다. reconciliation은 heartbeat와 claim 상태만 보며 process identity를 확인하지 않습니다.
 
 ## 브랜치와 커밋 규칙
@@ -157,3 +157,27 @@ application code가 명시적으로 승인된 Task에서만 다음 원칙을 적
 - 문서, 계약, ADR, 인덱스가 서로 일치합니다.
 - secret 또는 다른 Project의 컨텍스트가 포함되지 않았습니다.
 - 변경은 독립 브랜치에 commit됐고 사람 검토용 PR로 제출됐습니다.
+
+### Documentation Sync
+
+모든 implementation Task는 코드 변경과 함께 문서를 동기화해야 합니다.
+
+작업 완료 시 아래 문서를 영향 범위에 따라 반드시 검토하고, 변경이 필요한 문서는 함께 갱신합니다.
+
+- `README.md` — 현재 사용 가능한 workflow, 구현 상태, limitation
+- `docs/architecture.md` — 실제 구현 경계와 target architecture
+- `docs/roadmap.md` — 완료 항목과 다음 vertical slice
+- 관련 `docs/specs/*.md` — 구현된 contract와 남은 gap
+- 관련 ADR — 결정이 확정되거나 변경된 경우 status/scope
+- `AGENTS.md` — repository-wide operating rule이 바뀐 경우
+- `docs/verification-log.md` — 검증 결과와 미검증 항목
+
+코드와 문서가 불일치하면 Task는 완료된 것으로 간주하지 않습니다.
+
+PR에는 최소한 다음을 명시합니다.
+
+- 현재 구현 상태
+- 이번에 추가된 구현
+- 아직 미구현인 항목
+- 수행한 검증
+- 다음 권장 vertical slice
