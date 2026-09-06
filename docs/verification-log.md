@@ -99,7 +99,7 @@ heartbeat를 남기고 프로세스가 사라진 상황을 재현했습니다.
 
 ### 확인하지 못한 항목
 
-- 승인 회수 또는 claim 해제 이후 실행 중인 executor를 실제로 멈추는 동작. executor가 없어 취소할 대상이 없습니다. [Execution Runtime](specs/execution-runtime.md)에 executor slice 요구사항으로 기록했습니다.
+- 승인 회수 또는 claim 해제 이후 실행 중인 executor를 실제로 멈추는 동작. 이 시점에는 executor가 없어 취소할 대상이 없었습니다. 2026-09-06 executor runtime slice에서 구현하고 검증했습니다.
 - process identity(PID, start time) 기반 판정. executor process가 없어 수행할 수 없으며 판정 event에 `process_identity_checked: false`로 명시합니다
 - 실제 worker가 장시간 heartbeat를 보내는 상황의 안정성
 - orphan process 정리. executor process가 아직 없습니다
@@ -158,3 +158,154 @@ PR #9 리뷰에서 지적된 두 건을 수정하고 다시 검증했습니다.
 - **remote identity**: canonical `owner/repo` 정확 일치로 바꿨습니다. `https://github.com/evil/hongwon1031/atlas.git`처럼 suffix 비교였다면 통과했을 URL이 거부되는 것을 확인했습니다. HTTPS, SSH(scp 형식과 ssh:// 형식), credential 포함 URL, port 포함 URL을 모두 parsing합니다.
 
 두 수정을 일시 제거하면 회귀 테스트 11건이 실패하고 복원하면 통과하는 것을 확인했습니다.
+
+## 2026-09-06 — Executor process runtime (mock)
+
+- 대상 구현: `src/atlas/{executor,local_process,mock_executor,process_identity,redaction,execution_service}.py`, `store.py`(executions), `reconciliation.py`
+- 검증 방법: 실제 임시 git repository + 실제 OS subprocess. network와 provider 호출은 없습니다.
+- 관련 결정: [ADR-010](adr/0010-task-execution-isolation.md)의 process isolation 범위
+
+### 확인된 항목
+
+| 항목 | 결과 |
+| --- | --- |
+| mock executor 성공 실행 | exit 0, worktree에 파일 생성, stdout 캡처 |
+| non-zero exit | exit code 보존, `nonzero_exit` 분류, Run `Failed` |
+| timeout | graceful → 강제 종료, `timeout` 분류, Run `Failed(timeout)` |
+| 명시적 cancel | process 종료, cancellation state 기록, 재호출은 idempotent |
+| 승인 회수 cancel | safety gate 실패를 감지해 실행 중 process 종료 |
+| claim 상실 cancel | 동일 |
+| process cwd | Run의 worktree에서 실행됨 |
+| main worktree 오염 | 없음. README·HEAD·dirty 상태 모두 변화 없음 |
+| 다른 Run worktree 오염 | 없음 |
+| stale workspace | safety gate가 `workspace_valid` 실패로 거부 |
+| duplicate start | `execution_already_active`로 거부, execution 1개 유지 |
+| concurrent start (thread 6개) | 1개만 성공 |
+| stdout/stderr 분리 | 각각 별도 파일 |
+| 출력 크기 제한 | 상한에서 잘리고 `truncated` 표시 |
+| invalid UTF-8 | 예외 없이 안전 디코딩 |
+| secret redaction | token 형태, URL credential, Authorization 헤더, known 값 제거 |
+| 환경 allowlist | allowlist 밖 변수가 child에 전달되지 않음 |
+| child process 종료 | timeout과 cancel 양쪽에서 child가 남지 않음 |
+| heartbeat | 실행 중 갱신되고 종료 후 중단, 실패 event 없음 |
+| restart 후 재식별 | 살아 있는 process를 `execution_healthy`로 판정 |
+| process 없음 | `process_missing`으로 recovery-required |
+| PID identity mismatch | `pid_identity_mismatch`, `may_terminate=false`, 종료하지 않음 |
+| attach 전 crash | `process_never_attached` |
+| terminal Run + 생존 process | `execution_surviving_terminal_run`, 자동 종료하지 않음 |
+| schema migration v4 → v5 | `executions` 테이블과 `events.execution_id` 자동 추가, Run·workspace 보존 |
+
+### 검증 중 발견해 고친 것
+
+1. **Windows에서 종료된 process를 살아 있다고 판정**했습니다. `OpenProcess`가 종료된 process handle에도 성공하기 때문입니다. `GetProcessTimes`의 exit time으로 판별하도록 고쳤습니다.
+2. **child process가 살아남았습니다.** graceful 단계가 parent를 즉시 종료해 `taskkill /T`가 tree를 추적하지 못했습니다. graceful을 `CTRL_BREAK_EVENT`로 바꾸고 강제 단계를 parent 생존 중에 수행하도록 순서를 고쳤습니다.
+3. **heartbeat가 한 번도 동작하지 않았습니다.** SQLite 연결을 스레드 간에 공유해 `ProgrammingError`로 죽었습니다. heartbeat 스레드가 자기 연결을 열도록 고치고 실패를 event로 남기게 했습니다.
+4. **`Authorization: Bearer <token>`에서 토큰이 남았습니다.** 헤더 pattern이 `\S+`만 지워 "Bearer"만 사라졌습니다. 줄 끝까지 지우도록 고쳤습니다.
+
+### 확인하지 못한 항목
+
+- 실제 Claude Code나 Codex 호출. 이번 범위가 아닙니다.
+- provider credential 주입과 회수. redaction boundary만 준비했습니다.
+- POSIX에서의 process group 종료. 이 검증은 Windows에서 수행했습니다. POSIX 경로는 코드에 있으나 실측하지 않았습니다.
+- 별도 OS process 사이의 동시 `executor-start` 경쟁. thread 6개 경쟁만 검증했습니다.
+- 장시간 실행 executor의 안정성과 log 누적량.
+- Job Object를 쓰지 않아 Windows에서 CTRL_BREAK를 무시하는 child가 있을 때의 동작.
+
+### 2026-09-06 추가 — log redaction, 종료 확인, gate 경쟁
+
+merge-blocking review 세 건을 고치고 다시 검증했습니다.
+
+#### log artifact redaction
+
+이전에는 event만 redaction했고 **파일에는 raw 출력을 그대로 썼습니다.** secret이 디스크에 평문으로 남는 문제라서, 파일에 쓰기 전에 redaction하도록 바꿨습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 주입한 known secret | stdout·stderr 파일 어디에도 남지 않음 |
+| `Authorization: Bearer <token>` | 헤더가 줄 끝까지 제거됨 |
+| GitHub token 형태, URL credential | 제거됨 |
+| chunk 경계에 걸친 secret | 줄 단위로 모아 처리하므로 잘린 채 기록되지 않음 |
+| 개행 없이 65536자 초과 | 보류 한도에서 redaction 후 기록, secret 남지 않음 |
+| 유효하지 않은 UTF-8 | 예외 없이 대체 문자로 처리 |
+| 크기 상한 | redaction을 마친 byte 기준으로 잘리고 `truncated` 표시 |
+| pipe drain | 상한 도달 후에도 계속 비워 child가 블록되지 않음 |
+| event·DB 전체 | secret 평문 없음 |
+
+log는 텍스트로 취급하므로 **artifact는 원본과 byte 단위로 같지 않습니다.** binary를 그대로 남기려면 redaction을 적용할 수 없어, secret을 막는 쪽을 택했습니다.
+
+#### 종료 확인과 termination outcome
+
+이전에는 종료를 **요청**하기만 하면 `Finished`로 확정했습니다. identity를 확인할 수 없으면 실제로 종료하지 않으므로, 살아 있는 process가 terminal 처리되어 reconciliation에서 빠질 수 있었습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 정상 종료 | `not_required` → `Finished` |
+| 종료 확인됨 | `confirmed` → `Finished` |
+| 종료 미확인 | `unverified` → `Cancelling` 유지, terminal 아님 |
+| timeout 후 process 잔존 | `Finished`가 아니라 `Cancelling`으로 남음 |
+| cancel 미확인 | `cancelled=False` 반환, 근거 event 기록 |
+| reconciliation 범위 | `Cancelling`은 active라 다시 검사됨 |
+| 근거 | `execution_termination_unverified` event에 판정 evidence 기록 |
+
+#### safety gate → reserve → spawn 경쟁
+
+gate 통과와 spawn 사이에 승인 회수나 claim 해제가 들어오면 근거 없는 process가 뜰 수 있었습니다. 세 겹으로 막았습니다.
+
+| 층 | 시점 | 확인 |
+| --- | --- | --- |
+| 첫 gate | 예약 전 | 8개 항목 |
+| 예약 guard | 예약과 같은 transaction | run active, workspace ready, 승인, claim owner, lease |
+| final gate | spawn 직전 | 8개 항목 |
+
+| 확인 | 결과 |
+| --- | --- |
+| gate 직후 승인 회수 | spawn되지 않음 |
+| gate 직후 claim 해제 | spawn되지 않음 |
+| gate 직후 lease 만료 | spawn되지 않음 |
+| 차단 후 상태 | active execution 0개. ghost reservation 없음 |
+| 차단 근거 | `execution_safety_gate_failed` event에 단계와 실패 항목 기록 |
+| transaction 경계 | subprocess spawn은 transaction 밖에서만 수행 |
+
+예약 transaction은 rollback되므로 그 안에서 event를 남길 수 없습니다. 그래서 guard 실패 근거는 transaction 밖에서 기록합니다.
+
+#### 회귀 테스트가 실제로 잡는지 확인
+
+세 수정을 각각 되돌리고 다시 돌렸습니다. **11건이 실패**했고 복원하니 전부 통과했습니다. 테스트가 통과하기만 하는 것이 아니라 해당 결함을 실제로 잡습니다.
+
+#### 재실행한 검증
+
+- 전체 테스트 466건 통과
+- `compileall` (src, tests) 통과
+- Windows smoke 15단계 전부 통과 (timeout, cancel, child process tree, restart 재식별, `process_missing`, PID identity mismatch 포함)
+- 이번 수정분 end-to-end smoke 통과
+- secret scan, `git diff --check` 통과
+
+#### 확인하지 못한 항목
+
+앞 절의 항목이 그대로 남습니다. POSIX process group 종료 실측과 Windows Job Object 미사용 한계는 이번 범위에서 해소하지 않았습니다.
+
+### 2026-09-06 추가 — 강제 flush 경계의 secret 분할
+
+streaming redaction에 경계 문제가 하나 더 남아 있었습니다. 보류 한도에 도달해 **버퍼를 통째로 내보낼 때** secret이 그 경계에 걸치면, 앞 조각은 이미 기록된 뒤라 어느 쪽에도 전체 pattern이 없어 redaction이 걸리지 않았습니다.
+
+overlap을 보존하고, 자를 지점이 완결된 secret 한가운데면 구간 시작점까지 물러서도록 고쳤습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| known secret이 경계를 정확히 가로지름 | 전체·앞 조각 모두 남지 않음 |
+| provider token이 경계를 가로지름 | 남지 않음 |
+| Bearer token이 경계를 가로지름 | 남지 않음 |
+| forced flush 4회 반복 | 매 회차 secret 없음 |
+| 일반 출력 | 손실·중복 없이 입력과 정확히 일치 |
+| 개행 기반 경로 | 기존 동작 유지 |
+| `max_output_bytes`/truncation | 상한에서 정확히 잘리고 `truncated` 유지 |
+| 보류 버퍼 크기 | 한도(`MAX_RETAINED_CHARS`) 안에 머무름 |
+| overlap window | known secret 최대 길이 이상, 짧은 값은 window를 늘리지 않음 |
+
+#### 검증 중 발견해 고친 것
+
+**구간이 버퍼 끝까지 이어질 때 뒷부분이 raw로 남았습니다.** 버퍼 전체가 하나의 secret 후보(예: 아주 긴 `Authorization` 헤더)면 메모리 한도에서 강제로 내보내는데, 그 구간은 치환되지만 **이어서 들어오는 나머지 token 문자는 pattern 없이 그대로 기록**됐습니다. 구간이 버퍼 끝까지 이어진 경우 줄바꿈이 나올 때까지 이어지는 입력을 버리도록 고쳤습니다.
+
+#### 회귀 테스트 확인
+
+경계 보존을 되돌리고 다시 돌렸습니다. **3건이 실패**했고 복원하니 전부 통과했습니다.

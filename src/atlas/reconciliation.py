@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from .config import RunConfig
+from .execution_service import ExecutionService
+from .process_identity import IdentityVerdict, ProcessIdentity, verify
 from .schema import Run, RunFailure, RunStatus, WorkspaceStatus
 from .store import TaskStore, from_iso, utcnow
 from .workspace_service import WorkspaceService
@@ -55,6 +57,7 @@ class ReconcileReport:
     orphaned: tuple[str, ...] = ()
     verdicts: tuple[RunVerdict, ...] = ()
     workspace_findings: tuple[dict[str, Any], ...] = ()
+    process_findings: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +66,7 @@ class ReconcileReport:
             "orphaned": list(self.orphaned),
             "verdicts": [verdict.to_dict() for verdict in self.verdicts],
             "workspace_findings": list(self.workspace_findings),
+            "process_findings": list(self.process_findings),
         }
 
 
@@ -81,10 +85,12 @@ class RunReconciler:
         store: TaskStore,
         config: RunConfig | None = None,
         workspaces: WorkspaceService | None = None,
+        executions: ExecutionService | None = None,
     ) -> None:
         self._store = store
         self._config = config or RunConfig()
         self._workspaces = workspaces
+        self._executions = executions
 
     @property
     def config(self) -> RunConfig:
@@ -95,6 +101,7 @@ class RunReconciler:
         counters = _Counters()
         active = self._store.active_runs()
         workspace_findings = self.reconcile_workspaces(now=moment)
+        process_findings = self.reconcile_processes(now=moment)
 
         for run in active:
             verdict = self.evaluate(run, moment)
@@ -134,7 +141,88 @@ class RunReconciler:
             orphaned=tuple(counters.orphaned),
             verdicts=tuple(counters.verdicts),
             workspace_findings=tuple(workspace_findings),
+            process_findings=tuple(process_findings),
         )
+
+    def reconcile_processes(self, now: datetime | None = None) -> list[dict[str, Any]]:
+        """기록된 executor process가 실제 상태와 맞는지 확인합니다.
+
+        PID 존재 여부만 보지 않습니다. 저장한 identity와 현재 같은 PID의 identity가
+        일치해야 우리 process로 인정합니다. 일치하지 않으면 다른 process일 수
+        있으므로 **절대 종료하지 않습니다.**
+
+        이 slice에서는 자동 재실행도 하지 않습니다. 판정과 근거 기록만 합니다.
+        """
+
+        findings: list[dict[str, Any]] = []
+
+        for row in self._store.active_executions():
+            identity = ExecutionService._identity_of(row)
+            verdict = verify(identity) if identity else IdentityVerdict.PROCESS_ABSENT
+            status = row["status"]
+
+            if identity is None:
+                # Starting에서 attach 전에 죽었습니다.
+                kind = "execution_recovery_required"
+                problem = "process_never_attached"
+            elif verdict is IdentityVerdict.MATCH:
+                findings.append(
+                    self._process_finding(row, "execution_healthy", "process_alive", verdict, now)
+                )
+                continue
+            elif verdict is IdentityVerdict.PROCESS_ABSENT:
+                kind = "execution_recovery_required"
+                problem = "process_missing"
+            elif verdict is IdentityVerdict.MISMATCH:
+                # PID는 살아 있지만 다른 process입니다. 종료 금지.
+                kind = "execution_recovery_required"
+                problem = "pid_identity_mismatch"
+            else:
+                kind = "execution_recovery_required"
+                problem = "identity_unverifiable"
+
+            findings.append(self._process_finding(row, kind, problem, verdict, now, status))
+
+        for row in self._store.executions_for_terminal_runs():
+            identity = ExecutionService._identity_of(row)
+            verdict = verify(identity) if identity else IdentityVerdict.PROCESS_ABSENT
+            if verdict is IdentityVerdict.PROCESS_ABSENT:
+                continue
+            # Run은 끝났는데 process가 살아 있습니다. 승인 근거 없이 side effect를
+            # 만들 수 있으므로 심각도가 높습니다. 다만 ownership을 증명하기 전에
+            # 자동 종료하지 않습니다.
+            findings.append(
+                self._process_finding(
+                    row, "execution_surviving_terminal_run", "process_outlived_run", verdict, now
+                )
+            )
+
+        return findings
+
+    def _process_finding(
+        self,
+        row: Any,
+        kind: str,
+        problem: str,
+        verdict: IdentityVerdict,
+        now: datetime | None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "run_id": row["run_id"],
+            "execution_id": row["execution_id"],
+            "kind": kind,
+            "problem": problem,
+            "execution_status": status or row["status"],
+            "identity_verdict": verdict.value,
+            "may_terminate": verdict.may_terminate,
+            "process_id": row["process_id"],
+        }
+        if kind != "execution_healthy":
+            self._store.record_execution_event(
+                row["execution_id"], row["run_id"], kind, payload, now=now
+            )
+        return payload
 
     def reconcile_workspaces(self, now: datetime | None = None) -> list[dict[str, Any]]:
         """기록된 workspace가 디스크와 일치하는지 확인합니다.

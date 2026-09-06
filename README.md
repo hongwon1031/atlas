@@ -59,6 +59,11 @@ python -m atlas workspace-create --run-id <run-id>
 python -m atlas workspace-show --run-id <run-id>
 python -m atlas workspace-cleanup --run-id <run-id>
 
+# executor process (현재는 mock executor만)
+python -m atlas executor-start --run-id <run-id> --mock-mode success
+python -m atlas executor-show --run-id <run-id>
+python -m atlas executor-cancel --run-id <run-id>
+
 # worker 재시작 후 stale Run과 workspace 정리
 python -m atlas reconcile --dry-run   # 판정만
 python -m atlas reconcile
@@ -82,6 +87,10 @@ python -m atlas reconcile
 | `ATLAS_REPOSITORY_ROOT` | 없음 | 대상 repository의 local root. workspace 명령에 필수 |
 | `ATLAS_WORKSPACES_ROOT` | `<repo>/.atlas/worktrees` | worktree를 만들 worker root |
 | `ATLAS_GIT_TIMEOUT_SECONDS` | `30` | git 명령 timeout |
+| `ATLAS_LOGS_ROOT` | `<repo>/.atlas/logs` | Run별 executor log root |
+| `ATLAS_EXECUTOR_TIMEOUT_SECONDS` | `900` | executor process timeout |
+| `ATLAS_EXECUTOR_GRACE_SECONDS` | `5` | graceful 종료 후 강제 종료까지 |
+| `ATLAS_EXECUTOR_MAX_OUTPUT_BYTES` | `1048576` | stdout/stderr 각각의 최대 저장 크기 |
 | `ATLAS_DISABLE_QUEUE_LABEL` | 미설정 | approval gate 해제. 신뢰된 repository에서만 사용 |
 
 token은 저장소에 두지 않고 환경변수로만 주입합니다. database 파일도 commit하지 않습니다. public repository의 Issue는 token 없이도 조회되지만 rate limit이 훨씬 낮습니다.
@@ -97,6 +106,8 @@ token은 저장소에 두지 않고 환경변수로만 주입합니다. database
 | Polling, persistence, claim, lease | Complete | polling·SQLite store·atomic claim·lease·승인 회수 구현; Issue #7로 live E2E 확인 |
 | Run lifecycle, heartbeat, reconciliation | Complete | Run record·heartbeat·restart recovery 구현; 별도 OS 프로세스 동시성 확인 |
 | Run별 branch·worktree 격리 | Complete | 전용 branch/worktree, 경계 검증, cleanup, workspace reconciliation 구현 |
+| Executor process runtime | Complete | provider-neutral adapter, mock executor, timeout·cancel, process identity, reconciliation 구현 |
+| 실제 Claude Code·Codex adapter | Not Implemented | mock executor만 있으며 provider 호출은 다음 slice |
 | self-hosted Claude Code automated path | Planned | primary automated executor로 결정됐지만 invocation 미구현 |
 | Atlas-to-Codex Cloud automation | Feasibility Unverified | adapter로 표시하기 전 integration validation 필요 |
 | Polling, claim, recovery, routing, validation delivery | Not Implemented | 문서 계약만 존재 |
@@ -166,7 +177,12 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 ## Current Limitations
 
 - webhook ingestion이 없습니다. polling만 있으며 지연은 interval에 좌우됩니다.
-- Run별 branch와 worktree는 준비되지만 그 안에서 아무 process도 실행하지 않습니다. executor invocation, timeout, cancellation은 아직 없습니다.
+- executor는 mock만 있습니다. 실제 Claude Code나 Codex를 호출하지 않으며 provider credential도 주입하지 않습니다.
+- executor log는 redaction을 거쳐 저장되므로 원본과 byte 단위로 같지 않습니다. binary 출력은 UTF-8 대체 문자가 됩니다.
+- push, PR 생성, validation pipeline이 없습니다. executor가 worktree를 수정해도 그 결과를 전달하지 않습니다.
+- process identity 확인 방법이 플랫폼마다 다릅니다. 얻지 못하면 `unverifiable`로 남기고 그 process는 종료하지 않습니다.
+- Windows에서는 parent가 먼저 종료하면 child를 tree로 추적할 수 없습니다. graceful 단계에서 parent를 즉시 죽이지 않는 방식으로 완화했지만 Job Object만큼 견고하지는 않습니다.
+- executor log는 자동 삭제하지 않습니다. retention 정책이 아직 없습니다.
 - 기존 workspace를 재사용할 때는 DB 기록만 믿지 않고 실제 git 상태를 다시 확인합니다. 불일치는 자동 복구하지 않고 `workspace_recovery_required`로 거부하므로 사람이 판단해야 합니다.
 - worktree는 `<repository-root>/.atlas/worktrees` 아래에 만듭니다. 대상 repository에서 이 경로를 ignore해야 합니다.
 - 승인이 회수되거나 claim이 해제돼도 실행 중인 executor를 멈추는 기능은 없습니다. 지금은 executor 자체가 없어 문제가 되지 않지만, executor를 도입하는 slice에서 cancellation을 함께 구현해야 합니다.
@@ -258,6 +274,12 @@ atlas/
 │   ├── gitcmd.py                     # git CLI adapter (shell 미사용, timeout, redaction)
 │   ├── workspace.py                  # branch naming, 경로 경계, worktree 생성·검증
 │   ├── workspace_service.py          # workspace 단계별 lifecycle과 cleanup 정책
+│   ├── executor.py                   # provider-neutral executor contract
+│   ├── local_process.py              # OS process adapter (bounded capture, tree 종료)
+│   ├── mock_executor.py              # 개발·테스트용 mock (python -m atlas.mock_executor)
+│   ├── process_identity.py           # PID 재사용을 구분하는 identity 확인
+│   ├── redaction.py                  # secret redaction boundary
+│   ├── execution_service.py          # safety gate, lifecycle, heartbeat, cancellation
 │   ├── reconciliation.py             # stale Run과 workspace 정합성 판정
 │   └── cli.py                        # show / poll / claim / runs / reconcile 등
 ├── tests/                            # 단위 테스트 (표준 unittest)

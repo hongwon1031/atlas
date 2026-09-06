@@ -305,7 +305,7 @@ class SchemaMigrationTest(StoreTestCase):
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         ).fetchone()
 
-        self.assertEqual(row["value"], "4")
+        self.assertEqual(row["value"], "5")
 
     def test_v1_rows_without_approval_are_not_claimable(self):
         """승인 근거 없이 저장된 기존 Task는 migration 후 claim 대상이 아닙니다."""

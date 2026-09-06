@@ -173,7 +173,7 @@ execution:
 - Codex Cloud는 `manual` 또는 명시적인 secondary 선택일 때만 사용합니다. 자동 fallback은 아직 결정되지 않았습니다.
 - claim은 구현됐으며 `claim_id`, `claimed_by`, `lease_owner`, `lease_expires_at`, idempotency evidence를 operational store에 함께 기록합니다.
 - `active_run_id`는 Task record에 비정규화해 저장하지 않고 `runs` 테이블에서 조회합니다. 한 Task에 active Run이 최대 하나라는 invariant를 partial unique index가 강제하므로 중복 저장은 drift 위험만 늘립니다.
-- Run은 [Execution Runtime](execution-runtime.md)에 따라 unique Run ID, branch, worktree, process, log scope, timeout, cancellation state를 별도 record로 가집니다. 현재 Run ID, branch, worktree, log scope는 구현됐고 process, timeout, cancellation state는 미구현입니다.
+- Run은 [Execution Runtime](execution-runtime.md)에 따라 unique Run ID, branch, worktree, process, log scope, timeout, cancellation state를 별도 record로 가집니다. 모두 구현됐으며 process 관련 값은 `executions` record에 있습니다.
 - retry Run은 새 Run ID를 사용하고 이전 Run과 failure reason을 참조합니다. Task의 Acceptance Criteria와 scope는 명시적인 revision 없이 바꾸지 않습니다.
 
 ## Complete Example

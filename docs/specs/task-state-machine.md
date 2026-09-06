@@ -4,7 +4,7 @@
 
 현재 구현된 Task 상태는 `Draft`와 `NeedsClarification`뿐입니다. poller가 valid Task를 `Draft`로 저장하고 append-only event log를 남기며, ingestion claim lease를 원자적으로 관리합니다. `Draft` 이후의 자동 transition(`Planned` 이상)은 구현되지 않았고 사람이 Issue/PR 기록으로 추적합니다.
 
-Run은 Task와 별도의 상태 집합을 가지며 [Execution Runtime](execution-runtime.md)의 Run Lifecycle에 정의돼 있습니다. Run lifecycle과 heartbeat는 구현됐습니다. Task가 `Draft`인 동안에도 Run을 만들 수 있는데, 이는 claim이 ingestion 단계의 lease이고 Run이 그 lease 아래의 실행 시도이기 때문입니다. Run 완료가 Task 상태를 자동으로 옮기지는 않습니다.
+Run은 Task와 별도의 상태 집합을 가지며 [Execution Runtime](execution-runtime.md)의 Run Lifecycle에 정의돼 있습니다. Run lifecycle, heartbeat, executor process runtime은 구현됐습니다. executor 결과가 Run status로 옮겨지지만 Task status는 자동으로 바뀌지 않습니다. Run이 `Succeeded`여도 Task는 사람 승인과 merge 전까지 `Completed`가 아닙니다. Task가 `Draft`인 동안에도 Run을 만들 수 있는데, 이는 claim이 ingestion 단계의 lease이고 Run이 그 lease 아래의 실행 시도이기 때문입니다. Run 완료가 Task 상태를 자동으로 옮기지는 않습니다.
 
 ## States
 

@@ -2,14 +2,14 @@
 
 - Status: Partially Accepted
 - Date: 2026-08-31
-- Accepted: 2026-09-06 (filesystem/branch isolation 부분)
+- Accepted: 2026-09-06 (filesystem/branch isolation), 2026-09-06 (process isolation, timeout, cancellation, process identity)
 - Decision owners: Project owner
 
 ## Context
 
 Atlas가 여러 Project와 Task를 처리하면 conversation, mutable filesystem, branch, process, log가 섞일 위험이 있습니다. 논리적인 Task ID만으로는 동시 실행 충돌, stale process, 다른 Project context 유출을 막을 수 없습니다.
 
-branch와 worktree isolation은 구현됐습니다. executor process isolation은 구현되지 않았습니다.
+branch와 worktree isolation, executor process isolation, timeout, cancellation, process identity가 구현됐습니다. provider별 정책과 credential injection은 아직 결정되지 않았습니다.
 
 ## Accepted Scope (2026-09-06)
 
@@ -25,18 +25,31 @@ Project owner가 worktree/branch isolation 구현을 지시하면서 **filesyste
 - Atlas가 만들었다고 증명할 수 있는 리소스만 정리합니다. 증명은 Atlas branch namespace와 operational store의 provenance 기록이 함께 성립할 때만 인정합니다.
 - 여러 Task가 하나의 mutable worktree를 공유하지 않고, 여러 Run이 같은 branch를 동시에 수정하지 않습니다.
 
+### Accepted (2026-09-06, process isolation)
+
+Project owner가 executor runtime 구현을 지시하면서 process 격리 범위를 추가로 승인했습니다.
+
+- Run마다 새 OS process를 시작하며 이전 shell, conversation, 환경을 재사용하지 않습니다.
+- executor process의 작업 디렉터리는 반드시 해당 Run의 검증된 worktree입니다. repository root나 main worktree에서 실행하지 않으며 cwd fallback도 두지 않습니다.
+- 환경은 상속하지 않고 allowlist로 구성합니다. 필요한 OS 기본 변수만 전달합니다.
+- 모든 실행에 timeout이 있습니다. 만료하면 graceful 종료를 시도하고 grace period 뒤 강제 종료하며, 실패 분류는 `timeout`입니다.
+- cancellation은 명시적 상태로 관리합니다. 사용자 요청, 승인 회수, claim 상실이 모두 취소 trigger입니다.
+- 종료는 process 단위가 아니라 Run 단위 process tree로 수행합니다.
+- process identity는 PID와 process 시작 시각을 함께 저장하고 확인합니다. **identity가 일치하지 않거나 확인할 수 없으면 절대 종료하지 않습니다.**
+- stdout과 stderr는 크기 제한이 있는 Run별 log artifact로 수집합니다. raw 출력 전체를 event에 저장하지 않고 redaction을 적용합니다.
+
 ### 계속 Proposed
 
-- dedicated executor process와 이전 shell/conversation 재사용 금지. executor를 실행하는 slice에서 결정합니다.
-- explicit timeout과 cancellation state.
-- clone per Task를 선택할 기준.
+- provider별 executor 정책(Claude Code, Codex의 호출 형식과 옵션).
 - credential injection과 회수 절차.
-- orphan process 탐지와 강제 종료.
+- clone per Task를 선택할 기준.
+- cloud나 원격 host에서의 실행 정책.
 
 ### Open
 
-- worktree retention 기간과 disk 사용량 정책.
+- worktree와 log retention 기간, disk 사용량 정책.
 - 여러 Project를 다룰 때 worker root를 Project별로 분리할 방식.
+- 동시에 실행할 수 있는 Run 수와 자원 한도.
 
 ## Proposed Decision
 
@@ -95,7 +108,9 @@ worker는 Run 종료 시 child process를 중지하고, credential을 해제하�
 - [x] branch naming(`atlas/<task-id>/<run-id-short>`)과 worktree root 결정
 - [x] success, failure, cancel, orphaned별 branch 보존 정책 정의
 - [x] stale worktree recovery 판정 절차 구현 (임의 복구 없이 근거만 기록)
-- [ ] Project owner가 executor process isolation 범위를 승인
-- [ ] concurrent process ownership acceptance test 작성
-- [ ] orphan process recovery 절차 검증
-- [ ] worktree retention과 disk 사용량 정책 결정
+- [x] Project owner가 executor process isolation 범위를 승인
+- [x] concurrent process ownership acceptance test 작성
+- [x] orphan process recovery 판정 절차 구현 (자동 종료 없이 근거만 기록)
+- [ ] provider별 executor 정책과 credential injection 결정
+- [ ] worktree와 log retention, disk 사용량 정책 결정
+- [ ] 동시 실행 Run 수와 자원 한도 결정
