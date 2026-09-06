@@ -56,5 +56,25 @@ class InvalidResultShapeTest(unittest.TestCase):
             self.assertEqual(error["severity"], "error")
 
 
+class RunEnvelopeTest(unittest.TestCase):
+    """Run의 status가 envelope status를 덮어쓰면 안 됩니다."""
+
+    def test_run_payload_is_nested_not_spread(self):
+        from atlas.schema import Run, RunStatus
+
+        run = Run(
+            run_id="run-1", task_id="ATLAS-0042", fingerprint="f", claim_id="c",
+            worker_id="w", status=RunStatus.PENDING,
+            created_at="2026-09-06T00:00:00Z", heartbeat_at="2026-09-06T00:00:00Z",
+        )
+        payload = json.loads(
+            json.dumps({"status": "RunStarted", "run": run.to_dict()}, ensure_ascii=False)
+        )
+
+        self.assertEqual(payload["status"], "RunStarted")
+        self.assertEqual(payload["run"]["status"], "Pending")
+        self.assertEqual(payload["run"]["run_id"], "run-1")
+
+
 if __name__ == "__main__":
     unittest.main()

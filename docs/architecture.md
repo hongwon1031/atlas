@@ -19,7 +19,7 @@
 
 ## Current Manual Workflow
 
-현재 repository에는 Issue polling, Task persistence, atomic claim을 수행하는 worker가 있습니다. allowlist 안의 candidate Issue를 polling해 Task 후보로 parse·validate하고 SQLite에 저장한 뒤 lease 기반으로 claim합니다. webhook, Run record, worktree, Claude Code invocation, Run validation automation, PR delivery는 없습니다.
+현재 repository에는 Issue polling, Task persistence, atomic claim, Run lifecycle을 수행하는 worker가 있습니다. allowlist 안의 candidate Issue를 polling해 Task 후보로 parse·validate하고 SQLite에 저장한 뒤 lease 기반으로 claim하며, claim된 Task에 Run record를 만들고 heartbeat와 restart reconciliation으로 stale Run을 판정합니다. webhook, worktree, executor process, Claude Code invocation, Run validation automation, PR delivery는 없습니다.
 
 ```mermaid
 flowchart LR
@@ -230,14 +230,15 @@ stateDiagram-v2
 
 ## Recommended MVP
 
-[ADR-003](adr/0003-initial-execution-environment.md)에 따라 primary automated path는 **GitHub Issue → Atlas worker → self-hosted Claude Code worker → validation → PR → human review/merge**입니다. Codex Cloud는 manual/secondary로 유지합니다. 현재 이 경로 중 polling, parse·validation, Task persistence, atomic claim까지 구현됐고 Run 실행 이후 구성 요소는 구현되지 않았습니다.
+[ADR-003](adr/0003-initial-execution-environment.md)에 따라 primary automated path는 **GitHub Issue → Atlas worker → self-hosted Claude Code worker → validation → PR → human review/merge**입니다. Codex Cloud는 manual/secondary로 유지합니다. 현재 이 경로 중 polling, parse·validation, Task persistence, atomic claim, Run lifecycle과 heartbeat까지 구현됐고 executor process 실행 이후 구성 요소는 구현되지 않았습니다.
 
 ## Recommended Next Sprint Scope
 
 1. ~~valid Atlas Task Issue 한 건으로 live polling·claim E2E를 확인합니다.~~ (완료 — Issue #7)
-2. Run record와 heartbeat를 추가하고 worker restart reconciliation을 구현합니다.
-3. duplicate Run/PR 방지를 구현합니다.
-4. schema migration 절차를 정의합니다.
+2. ~~Run record와 heartbeat를 추가하고 worker restart reconciliation을 구현합니다.~~ (완료 — `store.py`, `reconciliation.py`)
+3. 격리된 worktree와 branch를 준비합니다 (ADR-010 승인 필요).
+4. mock executor를 새 process로 호출하고 Run에 연결합니다.
+5. duplicate PR 방지와 schema migration 절차를 정의합니다.
 5. repository allowlist 아래 격리 worktree와 branch를 만듭니다.
 6. provider-neutral contract를 따르는 mock executor를 새 process로 호출합니다.
 7. scope·forbidden path·secret validation을 수행하고 draft PR을 생성합니다.

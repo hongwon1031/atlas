@@ -7,8 +7,13 @@
     python -m atlas claim               # Task 하나 claim
     python -m atlas release <claim-id>
     python -m atlas tasks
+    python -m atlas runs                # Run 목록
+    python -m atlas run-start <task-id> # claim된 Task에 Run 생성
+    python -m atlas run-heartbeat <run-id>
+    python -m atlas run-finish <run-id> --status Succeeded
+    python -m atlas reconcile           # stale Run을 recovery review로 전환
 
-Exit code: 0 성공, 1 validation 실패 또는 claim 대상 없음, 2 source 오류.
+Exit code: 0 성공, 1 대상 없음 또는 lifecycle 위반, 2 source 오류.
 """
 
 from __future__ import annotations
@@ -25,10 +30,27 @@ from .config import WorkerConfig
 from .intake import DEFAULT_REPOSITORY, IssueIntake
 from .issue_source import GitHubRestIssueSource, IssueSourceError
 from .polling import IssuePoller
-from .store import TaskStore
+from .reconciliation import RunReconciler
+from .schema import RunFailure, RunStatus
+from .store import RunError, TaskStore
 
 _ISSUE_NUMBER = re.compile(r"^\d+$")
-COMMANDS = ("show", "poll", "claim", "release", "tasks")
+COMMANDS = (
+    "show",
+    "poll",
+    "claim",
+    "release",
+    "tasks",
+    "runs",
+    "run-start",
+    "run-heartbeat",
+    "run-finish",
+    "reconcile",
+)
+
+# finish에서 사람이 지정할 수 있는 terminal 상태. Orphaned는 reconciliation이
+# 판단 근거와 함께 기록하는 상태이므로 CLI로 직접 지정하지 않습니다.
+FINISH_STATUSES = ("Succeeded", "Failed", "Cancelled")
 
 
 def _positive_float(raw: str) -> float:
@@ -99,6 +121,40 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("tasks", parents=[common], help="저장된 current Task를 나열합니다")
 
+    runs = subparsers.add_parser("runs", parents=[common], help="Run을 나열합니다")
+    runs.add_argument("--task-id", default=None, help="특정 Task의 Run만")
+    runs.add_argument("--limit", type=_positive_int, default=50)
+
+    run_start = subparsers.add_parser(
+        "run-start", parents=[common], help="claim된 approved Task에 Run을 만듭니다"
+    )
+    run_start.add_argument("task_id")
+    run_start.add_argument("--worker-id", default=None, help="기본값은 host 기반 식별자")
+    run_start.add_argument("--previous-run-id", default=None, help="retry일 때 이전 Run")
+
+    heartbeat = subparsers.add_parser(
+        "run-heartbeat", parents=[common], help="Run이 살아 있음을 기록합니다"
+    )
+    heartbeat.add_argument("run_id")
+    heartbeat.add_argument("--worker-id", default=None)
+
+    finish = subparsers.add_parser(
+        "run-finish", parents=[common], help="Run을 terminal 상태로 전이합니다"
+    )
+    finish.add_argument("run_id")
+    finish.add_argument("--status", choices=FINISH_STATUSES, required=True)
+    finish.add_argument("--worker-id", default=None, help="지정하면 owner 일치를 확인")
+    finish.add_argument("--failure-category", default=None, help="Failed/Cancelled의 분류")
+    finish.add_argument("--failure-message", default="", help="redaction을 마친 설명")
+
+    reconcile = subparsers.add_parser(
+        "reconcile", parents=[common], help="stale Run을 탐지해 recovery review로 넘깁니다"
+    )
+    reconcile.add_argument("--stale-after", type=_positive_float, default=None, help="초")
+    reconcile.add_argument(
+        "--dry-run", action="store_true", help="판정만 하고 상태를 바꾸지 않습니다"
+    )
+
     return parser
 
 
@@ -142,7 +198,10 @@ def _config(args: argparse.Namespace) -> WorkerConfig:
     claim = config.claim
     if lease_ttl := _option(args, "lease_ttl"):
         claim = replace(claim, lease_ttl_seconds=lease_ttl)
-    return replace(config, polling=polling, claim=claim)
+    run = config.run
+    if stale_after := _option(args, "stale_after"):
+        run = replace(run, stale_after_seconds=stale_after)
+    return replace(config, polling=polling, claim=claim, run=run)
 
 
 def _default_worker_id() -> str:
@@ -164,12 +223,28 @@ def main(argv: list[str] | None = None) -> int:
             return _run_release(args, config)
         if args.command == "tasks":
             return _run_tasks(args, config)
+        if args.command == "runs":
+            return _run_runs(args, config)
+        if args.command == "run-start":
+            return _run_run_start(args, config)
+        if args.command == "run-heartbeat":
+            return _run_run_heartbeat(args, config)
+        if args.command == "run-finish":
+            return _run_run_finish(args, config)
+        if args.command == "reconcile":
+            return _run_reconcile(args, config)
     except IssueSourceError as error:
         _emit(
             {"status": "SourceError", "category": error.category, "message": error.message},
             _option(args, "indent", 2),
         )
         return 2
+    except RunError as error:
+        _emit(
+            {"status": "RunError", "category": error.category, "message": error.message},
+            _option(args, "indent", 2),
+        )
+        return 1
     return 2
 
 
@@ -263,6 +338,68 @@ def _run_tasks(args: argparse.Namespace, config: WorkerConfig) -> int:
                 }
             )
     _emit({"status": "Tasks", "count": len(payload), "tasks": payload}, _option(args, "indent", 2))
+    return 0
+
+
+def _run_runs(args: argparse.Namespace, config: WorkerConfig) -> int:
+    with TaskStore(config.database_path) as store:
+        runs = store.runs(task_id=args.task_id, limit=args.limit)
+    _emit(
+        {"status": "Runs", "count": len(runs), "runs": [run.to_dict() for run in runs]},
+        _option(args, "indent", 2),
+    )
+    return 0
+
+
+def _run_run_start(args: argparse.Namespace, config: WorkerConfig) -> int:
+    worker_id = args.worker_id or _default_worker_id()
+    with TaskStore(config.database_path) as store:
+        run = store.start_run(
+            args.task_id, worker_id, previous_run_id=args.previous_run_id
+        )
+    _emit({"status": "RunStarted", "run": run.to_dict()}, _option(args, "indent", 2))
+    return 0
+
+
+def _run_run_heartbeat(args: argparse.Namespace, config: WorkerConfig) -> int:
+    worker_id = args.worker_id or _default_worker_id()
+    with TaskStore(config.database_path) as store:
+        run = store.heartbeat(args.run_id, worker_id)
+    _emit({"status": "Heartbeat", "run": run.to_dict()}, _option(args, "indent", 2))
+    return 0
+
+
+def _run_run_finish(args: argparse.Namespace, config: WorkerConfig) -> int:
+    status = RunStatus(args.status)
+    failure = None
+    if args.failure_category:
+        failure = RunFailure(args.failure_category, args.failure_message)
+    elif status is RunStatus.FAILED:
+        failure = RunFailure("unknown", args.failure_message or "사유가 지정되지 않았습니다.")
+    elif status is RunStatus.CANCELLED and args.failure_message:
+        failure = RunFailure("cancelled_by_human", args.failure_message)
+
+    with TaskStore(config.database_path) as store:
+        run = store.finish_run(
+            args.run_id, status, worker_id=args.worker_id, failure=failure
+        )
+    _emit({"status": "RunFinished", "run": run.to_dict()}, _option(args, "indent", 2))
+    return 0
+
+
+def _run_reconcile(args: argparse.Namespace, config: WorkerConfig) -> int:
+    with TaskStore(config.database_path) as store:
+        reconciler = RunReconciler(store, config.run)
+        if args.dry_run:
+            verdicts = [reconciler.evaluate(run) for run in store.active_runs()]
+            payload = {
+                "status": "ReconcileDryRun",
+                "checked": len(verdicts),
+                "verdicts": [verdict.to_dict() for verdict in verdicts],
+            }
+        else:
+            payload = {"status": "Reconciled", **reconciler.reconcile().to_dict()}
+    _emit(payload, _option(args, "indent", 2))
     return 0
 
 

@@ -55,8 +55,8 @@ task_id: ATLAS-0001
 claim은 ingestion 단계의 lease이며 [Task State Machine](task-state-machine.md)의 실행 claim과 구분됩니다.
 
 - Task 상태를 `Queued`나 `Running`으로 옮기지 않습니다. 현재 구현은 `Draft`를 유지합니다.
-- Run record를 만들지 않으며 `active_run_id`는 null입니다.
-- executor를 실행하지 않습니다.
+- Run record를 만들지 않습니다. Run은 claim을 획득한 뒤 `run-start`로 별도 생성하며 [Execution Runtime](execution-runtime.md)을 따릅니다.
+- executor를 실행하지 않습니다. Run 생성도 하지 않습니다.
 - 목적은 "한 Task를 한 worker만 처리한다"를 보장하는 것입니다.
 
 ### Approval은 지속 상태입니다
