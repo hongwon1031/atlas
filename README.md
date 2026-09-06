@@ -2,9 +2,9 @@
 
 Atlas는 사람이 휴대전화에서 업무를 지시하면 여러 AI 개발 에이전트가 올바른 프로젝트 컨텍스트를 불러오고, 격리된 환경에서 작업하고, 검증 가능한 결과와 Pull Request를 생성하도록 조율하는 AI Workforce Operating System입니다.
 
-> **현재 작업 단계:** In Progress — Issue intake, polling, persistence, atomic claim, Run lifecycle, Run별 worktree 격리, executor process runtime을 구현했고 이제 **실제 Claude Code CLI가 격리된 worktree 안에서 코드를 수정**합니다. validation과 PR delivery는 아직 없습니다.
+> **현재 작업 단계:** In Progress — Issue intake부터 실제 Claude Code 구현까지 이어지고, 이제 **Atlas가 그 결과를 검증해 Run을 Succeeded/Failed로 확정**합니다. git commit, push, PR delivery는 아직 없습니다.
 >
-> 이 저장소는 제품 정의, 실행 계약, 기여 거버넌스와 함께 GitHub Issue를 polling해 Task로 검증·저장하고, lease로 claim한 뒤, Run별 격리된 branch·worktree에서 Claude Code를 실행해 코드를 수정하는 worker 코드를 포함합니다. validation pipeline, git commit, push, PR delivery automation, webhook은 아직 구현하지 않았습니다.
+> 이 저장소는 제품 정의, 실행 계약, 기여 거버넌스와 함께 GitHub Issue를 polling해 Task로 검증·저장하고, lease로 claim한 뒤, Run별 격리된 branch·worktree에서 Claude Code를 실행해 코드를 수정하고, 그 결과를 deterministic validation으로 검증하는 worker 코드를 포함합니다. git commit, push, PR delivery automation, webhook은 아직 구현하지 않았습니다.
 
 ## 핵심 MVP
 
@@ -65,6 +65,11 @@ python -m atlas executor-start --run-id <run-id> --mock-mode success  # 개발·
 python -m atlas executor-show --run-id <run-id>
 python -m atlas executor-cancel --run-id <run-id>
 
+# validation
+python -m atlas validation-start --run-id <run-id>
+python -m atlas validation-show --run-id <run-id>
+python -m atlas validation-reconcile
+
 # worker 재시작 후 stale Run과 workspace 정리
 python -m atlas reconcile --dry-run   # 판정만
 python -m atlas reconcile
@@ -95,6 +100,8 @@ python -m atlas reconcile
 | `ATLAS_CLAUDE_MODEL` | (CLI 기본값) | Claude 모델 |
 | `ATLAS_CLAUDE_PERMISSION_MODE` | `acceptEdits` | Claude 권한 모드. allowlist 밖 값은 거부됩니다 |
 | `ATLAS_CLAUDE_TOOLS` | `Read,Edit,Write,Glob,Grep` | Claude에 허용할 도구. safe set의 subset만 허용하고 shell 계열은 거부됩니다 |
+| `ATLAS_VALIDATION_TRUST` | `untrusted` | validation이 repository 코드를 실행해도 되는지 |
+| `ATLAS_TRUSTED_REPOSITORIES` | (없음) | 신뢰하는 `owner/name` 목록 |
 | `ATLAS_EXECUTOR_GRACE_SECONDS` | `5` | graceful 종료 후 강제 종료까지 |
 | `ATLAS_EXECUTOR_MAX_OUTPUT_BYTES` | `1048576` | stdout/stderr 각각의 최대 저장 크기 |
 | `ATLAS_DISABLE_QUEUE_LABEL` | 미설정 | approval gate 해제. 신뢰된 repository에서만 사용 |
@@ -115,6 +122,7 @@ token은 저장소에 두지 않고 환경변수로만 주입합니다. database
 | Executor process runtime | Complete | provider-neutral adapter, mock executor, timeout·cancel, process identity, reconciliation 구현 |
 | 실제 Claude Code adapter | Complete | `claude -p` 비대화형 실행, stdin prompt, 도구 제한, 변경 감지, no-op·policy 판정 |
 | Codex adapter | Not Implemented | manual/secondary 경로로 유지 |
+| Validation pipeline | Complete | workspace/git policy, tests, compile, lint·typecheck를 repository 근거로 선택해 실행하고 Run을 확정 |
 | self-hosted Claude Code automated path | Partial | 로컬에서 invocation까지 동작. always-available server 운영은 미구현 |
 | Atlas-to-Codex Cloud automation | Feasibility Unverified | adapter로 표시하기 전 integration validation 필요 |
 | Polling, claim, recovery, routing, validation delivery | Not Implemented | 문서 계약만 존재 |
@@ -186,11 +194,15 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 - webhook ingestion이 없습니다. polling만 있으며 지연은 interval에 좌우됩니다.
 - Claude Code는 **현재 로그인된 CLI 세션**을 씁니다. Atlas는 credential 값을 읽거나 저장하지 않고 API key를 argv에 넣지 않습니다.
 - Codex adapter는 없습니다.
-- **`changes_applied`는 "코드가 올바르다"는 뜻이 아닙니다.** worktree가 바뀌었다는 뜻일 뿐입니다. validation pipeline이 없어 구현 품질은 검증되지 않습니다.
-- 구현이 성공하면 Run은 `Succeeded`가 아니라 `AwaitingValidation`으로 갑니다. terminal이 아니고 heartbeat 대상도 아니라서 reconciliation이 회수하지 않으며, claim과 workspace가 유지된 채 validation을 기다립니다.
+- **`changes_applied`는 "코드가 올바르다"는 뜻이 아닙니다.** worktree가 바뀌었다는 뜻일 뿐이고, 판정은 validation이 합니다.
+- 구현이 끝나면 Run은 `AwaitingValidation`으로 가고, `validation-start`가 `Validating`을 거쳐 `Succeeded` 또는 `Failed`로 확정합니다.
+- **validation은 repository에서 발견한 근거로만 명령을 고릅니다.** 테스트가 없는 repository는 `no_tests_discovered` 경고와 함께 통과할 수 있습니다. "검증했다"가 아니라 "검증할 것이 없었다"는 뜻입니다.
+- validation은 dependency를 설치하지 않습니다. 필요한 도구가 없으면 계획 근거의 강도에 따라 `skipped` 또는 `error`로 보고합니다.
+- **validation은 repository 코드를 sandbox 없이 실행합니다.** 기본 정책은 `untrusted`이며 이 경우 정적 검사만 수행합니다. 테스트와 package script를 실행하려면 `ATLAS_VALIDATION_TRUST=trusted` 또는 `ATLAS_TRUSTED_REPOSITORIES`로 명시적으로 신뢰를 부여해야 합니다. network 차단이나 filesystem 격리는 **하지 않습니다.**
+- lint와 typecheck는 repository contract가 있을 때만 required입니다. `pyproject.toml`의 `[tool.X]` table만 있는 경우는 약한 근거로 보고 도구가 없으면 건너뜁니다.
 - allowed path 위반은 **탐지하고 기록만** 합니다. 자동으로 되돌리지 않습니다.
 - executor log는 redaction을 거쳐 저장되므로 원본과 byte 단위로 같지 않습니다. binary 출력은 UTF-8 대체 문자가 됩니다.
-- push, PR 생성, validation pipeline이 없습니다. executor가 worktree를 수정해도 그 결과를 전달하지 않습니다.
+- git commit, push, PR 생성이 없습니다. 검증을 통과해도 결과를 GitHub로 전달하지 않습니다.
 - process identity 확인 방법이 플랫폼마다 다릅니다. 얻지 못하면 `unverifiable`로 남기고 그 process는 종료하지 않습니다.
 - Windows에서는 parent가 먼저 종료하면 child를 tree로 추적할 수 없습니다. graceful 단계에서 parent를 즉시 죽이지 않는 방식으로 완화했지만 Job Object만큼 견고하지는 않습니다.
 - executor log는 자동 삭제하지 않습니다. retention 정책이 아직 없습니다.
@@ -255,6 +267,7 @@ Atlas는 orchestrator, dispatcher, state manager, delivery coordinator입니다.
 - [GitHub Issue Command Contract](docs/specs/issue-command-contract.md)
 - [Pull Request Output Contract](docs/specs/pr-output-contract.md)
 - [Execution Runtime](docs/specs/execution-runtime.md)
+- [Validation Pipeline](docs/specs/validation-pipeline.md)
 - [Agent Registry](docs/specs/agent-registry.md)
 - [Usage and Availability](docs/specs/usage-availability.md)
 - [GitHub Event Ingestion](docs/specs/github-event-ingestion.md)

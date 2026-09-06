@@ -10,7 +10,7 @@
 
 현재 가능한 운영 흐름은 **GitHub Issue 생성 → 사람이 Issue를 Executor에게 전달 → Executor가 branch에서 작업·검증 → PR 생성 → 사람 review/merge**입니다.
 
-GitHub Issue polling, parse·schema validation, Task persistence, atomic claim과 lease, Run lifecycle, Run별 branch·worktree 격리, executor process runtime, **실제 Claude Code invocation**까지 구현됐습니다. webhook, Run validation automation, git commit·push, GitHub delivery automation은 아직 구현되지 않았습니다.
+GitHub Issue polling, parse·schema validation, Task persistence, atomic claim과 lease, Run lifecycle, Run별 branch·worktree 격리, executor process runtime, 실제 Claude Code invocation, **구현 결과 validation**까지 구현됐습니다. webhook, git commit·push, GitHub delivery automation은 아직 구현되지 않았습니다.
 
 Codex Cloud의 **사람 prompt → branch 변경 → PR 생성 → 사람 merge** 흐름은 `Proven Manually`입니다. Atlas-to-Codex automated invocation은 `Feasibility Unverified`이며 adapter backlog로 이동하기 전에 별도 integration validation이 필요합니다.
 

@@ -38,6 +38,7 @@ from .worktree_changes import (
     ImplementationOutcome,
     compare,
     safe_capture,
+    safe_fingerprint,
 )
 
 # stderr 요약으로 남길 길이. 원문은 log artifact에만 둡니다.
@@ -164,6 +165,9 @@ class ImplementationRunner:
         result = outcome.result
 
         after = safe_capture(run.worktree_path, self._git_timeout)
+        # 파일 이름 집합만으로는 같은 파일의 내용 변경을 놓칩니다. validation이
+        # 비교할 수 있도록 내용 지문을 남깁니다.
+        after_fingerprint = safe_fingerprint(run.worktree_path, self._git_timeout)
         claude = self._adapter.interpret(result, request)
         stderr_tail = (
             read_log_tail(result.stderr.path, max_bytes=4096) if result.stderr else ""
@@ -185,13 +189,18 @@ class ImplementationRunner:
             failure=failure,
             result=result,
         )
-        self._record(report, stderr_tail)
+        self._record(report, stderr_tail, after_fingerprint)
         self._apply_to_run(report)
         return report
 
     # -- 기록과 Run 반영 --------------------------------------------------
 
-    def _record(self, report: ImplementationResult, stderr_tail: str) -> None:
+    def _record(
+        self,
+        report: ImplementationResult,
+        stderr_tail: str,
+        fingerprint=None,
+    ) -> None:
         """근거를 event로 남깁니다. Claude 응답 전문은 넣지 않습니다."""
 
         detail: dict[str, Any] = {
@@ -207,6 +216,9 @@ class ImplementationRunner:
             detail["claude"] = report.claude.to_dict()
         if report.changes is not None:
             detail["changes"] = report.changes.to_dict()
+        if fingerprint is not None:
+            # digest와 개수만 남습니다. raw source는 저장하지 않습니다.
+            detail["fingerprint"] = fingerprint.to_dict()
         if stderr_tail:
             detail["stderr_summary"] = redact_line(stderr_tail, limit=STDERR_SUMMARY_CHARS)
 

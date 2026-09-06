@@ -19,6 +19,9 @@
     python -m atlas executor-start --run-id <run-id> --executor claude
     python -m atlas executor-show --run-id <run-id>
     python -m atlas executor-cancel --run-id <run-id>
+    python -m atlas validation-start --run-id <run-id>
+    python -m atlas validation-show --run-id <run-id>
+    python -m atlas validation-reconcile
 
 Exit code: 0 성공, 1 대상 없음 또는 lifecycle 위반, 2 source 오류.
 """
@@ -65,6 +68,9 @@ COMMANDS = (
     "executor-start",
     "executor-show",
     "executor-cancel",
+    "validation-start",
+    "validation-show",
+    "validation-reconcile",
 )
 
 # mock executor 실행 모드. 개발과 테스트 전용이며 public UX가 아닙니다.
@@ -242,6 +248,32 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--mock-sleep-seconds", type=float, default=1.0)
     start.add_argument("--mock-exit-code", type=int, default=0)
 
+    validation_start = subparsers.add_parser(
+        "validation-start",
+        parents=[common, executor_common],
+        help="AwaitingValidation Run을 검증하고 Succeeded/Failed로 확정합니다",
+    )
+    validation_start.add_argument("--worker-id", default=None)
+    validation_start.add_argument(
+        "--step-timeout", type=_positive_float, default=None, help="step 하나의 초 단위 timeout"
+    )
+    validation_start.add_argument(
+        "--trust",
+        choices=("untrusted", "trusted"),
+        default=None,
+        help="repository 코드 실행 허용 여부. 기본값은 ATLAS_VALIDATION_TRUST",
+    )
+    subparsers.add_parser(
+        "validation-show",
+        parents=[common, executor_common],
+        help="Run의 validation 기록과 step 결과를 봅니다",
+    )
+    subparsers.add_parser(
+        "validation-reconcile",
+        parents=[common, executor_common],
+        help="validation process의 실제 상태를 판정합니다",
+    )
+
     subparsers.add_parser(
         "executor-show",
         parents=[common, executor_common],
@@ -357,6 +389,12 @@ def main(argv: list[str] | None = None) -> int:
             return _run_executor_show(args, config)
         if args.command == "executor-cancel":
             return _run_executor_cancel(args, config)
+        if args.command == "validation-start":
+            return _run_validation_start(args, config)
+        if args.command == "validation-show":
+            return _run_validation_show(args, config)
+        if args.command == "validation-reconcile":
+            return _run_validation_reconcile(args, config)
     except IssueSourceError as error:
         _emit(
             {"status": "SourceError", "category": error.category, "message": error.message},
@@ -697,6 +735,124 @@ def _run_mock_start(args: argparse.Namespace, config: WorkerConfig) -> int:
             service.apply_to_run(args.run_id, outcome.result)
     _emit({"status": "ExecutorFinished", **outcome.to_dict()}, _option(args, "indent", 2))
     return 0 if outcome.result and outcome.result.succeeded else 1
+
+
+def _validation_pipeline(store: TaskStore, config: WorkerConfig) -> "ValidationPipeline":
+    from .validation_pipeline import ValidationPipeline
+
+    logs_root = config.workspace.resolved_logs_root()
+    if logs_root is None:
+        raise WorkspaceError(
+            "logs_root_missing",
+            "log root를 정할 수 없습니다. --repository-root 또는 --logs-root를 지정하세요.",
+        )
+    return ValidationPipeline(
+        store,
+        _workspace_service(store, config),
+        logs_root,
+        config.run,
+        git_timeout_seconds=config.workspace.git_timeout_seconds,
+        trusted_repositories=config.validation.trusted_repositories,
+        trust_policy=config.validation.trust_policy,
+    )
+
+
+def _run_validation_start(args: argparse.Namespace, config: WorkerConfig) -> int:
+    """AwaitingValidation Run만 검증합니다.
+
+    다른 상태에서 시작하면 근거 없는 결론이 나오므로 store가 거부합니다.
+    """
+
+    from .validation_pipeline import ValidationGateFailed
+
+    if trust := _option(args, "trust", None):
+        config = replace(config, validation=replace(config.validation, trust_policy=trust))
+    worker_id = args.worker_id or _default_worker_id()
+    with TaskStore(config.database_path) as store:
+        pipeline = _validation_pipeline(store, config)
+        try:
+            report = pipeline.validate(
+                args.run_id,
+                worker_id,
+                timeout_seconds=_option(args, "step_timeout", None)
+                or config.validation.step_timeout_seconds,
+                max_output_bytes=config.executor.max_output_bytes,
+            )
+        except ValidationGateFailed as error:
+            _emit(
+                {
+                    "status": "ValidationRejected",
+                    "run_id": args.run_id,
+                    "category": error.category,
+                    "detail": error.message,
+                    "failed_checks": list(error.failed_checks),
+                },
+                _option(args, "indent", 2),
+            )
+            return 1
+        run = store.run(args.run_id)
+    _emit(
+        {
+            "status": "ValidationFinished",
+            "run_status": run.status.value if run else None,
+            **report.to_dict(),
+        },
+        _option(args, "indent", 2),
+    )
+    return 0 if report.passed else 1
+
+
+def _run_validation_show(args: argparse.Namespace, config: WorkerConfig) -> int:
+    with TaskStore(config.database_path) as store:
+        run = store.run(args.run_id)
+        validations = []
+        for row in store.validations(args.run_id):
+            validations.append(
+                {
+                    "validation_id": row["validation_id"],
+                    "status": row["status"],
+                    "outcome": row["outcome"],
+                    "summary": row["summary"],
+                    "failure_category": row["failure_category"],
+                    "started_at": row["started_at"],
+                    "finished_at": row["finished_at"],
+                    "steps": [
+                        {
+                            "position": step["position"],
+                            "name": step["name"],
+                            "kind": step["kind"],
+                            "required": bool(step["required"]),
+                            "status": step["status"],
+                            "exit_code": step["exit_code"],
+                            "duration_seconds": step["duration_seconds"],
+                            "reason": step["reason"],
+                            "stdout_path": step["stdout_path"],
+                            "stderr_path": step["stderr_path"],
+                        }
+                        for step in store.validation_steps(row["validation_id"])
+                    ],
+                }
+            )
+    _emit(
+        {
+            "status": "Validations",
+            "run_id": args.run_id,
+            "run_status": run.status.value if run else None,
+            "validations": validations,
+        },
+        _option(args, "indent", 2),
+    )
+    return 0
+
+
+def _run_validation_reconcile(args: argparse.Namespace, config: WorkerConfig) -> int:
+    with TaskStore(config.database_path) as store:
+        findings = RunReconciler(store, config.run).reconcile_validations()
+    _emit(
+        {"status": "ValidationReconciled", "findings": findings},
+        _option(args, "indent", 2),
+    )
+    return 0
 
 
 def _run_executor_show(args: argparse.Namespace, config: WorkerConfig) -> int:

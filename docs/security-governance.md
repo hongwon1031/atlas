@@ -91,6 +91,35 @@ redaction 실패 또는 secret 탐지는 Run과 PR delivery를 중단하는 poli
 
 provider의 구조화된 출력을 해석해야 할 때는 **저장본이 아니라 별도의 임시 메모리 버퍼**를 씁니다. redaction은 텍스트 치환이므로 JSON 같은 구조를 깨뜨릴 수 있고, 깨진 구조를 되살리려고 저장본의 redaction을 약화해서는 안 됩니다. 임시 버퍼는 상한이 있고 디스크나 DB에 저장되지 않으며 한 번 읽히면 즉시 폐기됩니다.
 
+### Validation process
+
+**검증은 repository의 코드를 실제로 실행합니다. 격리하지 않습니다.**
+
+`shell=True`를 쓰지 않는 것은 Atlas가 shell wrapper를 거치지 않는다는 뜻일 뿐이고, 환경변수를 줄이는 것도 sandbox가 아닙니다. 실행된 코드는 subprocess를 띄우고 network에 접속하고 host filesystem에 접근할 수 있습니다. Python 테스트는 import만으로, `npm run`은 script 본문으로, mypy는 plugin으로 임의 코드를 실행합니다.
+
+executor에게 shell 도구를 주지 않았더라도, executor가 test나 `package.json`을 고친 뒤 validation이 그것을 실행하면 그 제한을 우회하는 경로가 됩니다.
+
+그래서 **명시적 신뢰 정책 뒤에** 둡니다.
+
+- 기본값은 `untrusted`이고 fail closed입니다.
+- `untrusted`에서는 repository 코드를 실행하지 않는 step만 수행합니다. Node package script는 신뢰 없이 실행하지 않습니다.
+- 신뢰는 `ATLAS_VALIDATION_TRUST=trusted` 또는 명시적 repository 목록으로만 부여합니다.
+- 정적 검사만 수행한 결과에는 그 사실을 경고 evidence로 남깁니다.
+
+Atlas가 지키는 것과 지키지 않는 것을 나눠 적습니다.
+
+| 항목 | 보장 |
+| --- | --- |
+| shell wrapper 미사용, argv list | 예 |
+| 명령 선택이 repository 근거 기반 | 예 |
+| 사용자 텍스트가 명령에 들어가지 않음 | 예 |
+| dependency 설치 안 함 | 예 |
+| provider credential 환경 미전달 | 예 |
+| 출력 redaction | 예 |
+| **실행된 코드의 network 차단** | **아니오** |
+| **실행된 코드의 filesystem 경계** | **아니오** |
+| **실행된 코드의 subprocess 제한** | **아니오** |
+
 ### Provider credential
 
 - Atlas는 provider credential의 raw value를 읽거나 저장하지 않습니다.

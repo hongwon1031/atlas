@@ -185,6 +185,9 @@ class RunStatus(str, Enum):
     # terminal이 아니고, executor process도 heartbeat도 없습니다. 다음
     # validation slice가 여기서 시작합니다.
     AWAITING_VALIDATION = "AwaitingValidation"
+    # validation을 실제로 수행하는 중입니다. 검증 process가 살아 있으므로
+    # heartbeat 대상이고, 끊기면 stale 판정을 받아야 합니다.
+    VALIDATING = "Validating"
     SUCCEEDED = "Succeeded"
     FAILED = "Failed"
     CANCELLED = "Cancelled"
@@ -221,13 +224,20 @@ _TERMINAL_RUN_STATUSES = frozenset(
 )
 # active Run은 Task당 하나만 허용됩니다. store의 partial unique index와 같은 집합입니다.
 _ACTIVE_RUN_STATUSES = frozenset(
-    {RunStatus.PENDING, RunStatus.RUNNING, RunStatus.AWAITING_VALIDATION}
+    {
+        RunStatus.PENDING,
+        RunStatus.RUNNING,
+        RunStatus.AWAITING_VALIDATION,
+        RunStatus.VALIDATING,
+    }
 )
 
 # heartbeat가 오고 있어야 하는 상태. staleness 판정은 이 집합만 봅니다.
 # active와 분리해야 하는 이유는 `AwaitingValidation`이 "아직 끝나지 않았지만
 # 돌고 있지도 않은" 상태이기 때문입니다.
-_HEARTBEAT_RUN_STATUSES = frozenset({RunStatus.PENDING, RunStatus.RUNNING})
+_HEARTBEAT_RUN_STATUSES = frozenset(
+    {RunStatus.PENDING, RunStatus.RUNNING, RunStatus.VALIDATING}
+)
 
 ACTIVE_RUN_STATUSES: tuple[str, ...] = tuple(
     sorted(status.value for status in _ACTIVE_RUN_STATUSES)

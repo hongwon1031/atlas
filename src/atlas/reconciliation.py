@@ -15,6 +15,7 @@ event에 남겨 나중에 감사할 수 있게 합니다.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
@@ -22,6 +23,7 @@ from typing import Any
 from .config import RunConfig
 from .execution_service import ExecutionService
 from .process_identity import IdentityVerdict, ProcessIdentity, verify
+from .validation_models import ValidationStatus
 from .schema import Run, RunFailure, RunStatus, WorkspaceStatus
 from .store import TaskStore, from_iso, utcnow
 from .workspace_service import WorkspaceService
@@ -58,6 +60,7 @@ class ReconcileReport:
     verdicts: tuple[RunVerdict, ...] = ()
     workspace_findings: tuple[dict[str, Any], ...] = ()
     process_findings: tuple[dict[str, Any], ...] = ()
+    validation_findings: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,6 +70,7 @@ class ReconcileReport:
             "verdicts": [verdict.to_dict() for verdict in self.verdicts],
             "workspace_findings": list(self.workspace_findings),
             "process_findings": list(self.process_findings),
+            "validation_findings": list(self.validation_findings),
         }
 
 
@@ -102,6 +106,7 @@ class RunReconciler:
         active = self._store.active_runs()
         workspace_findings = self.reconcile_workspaces(now=moment)
         process_findings = self.reconcile_processes(now=moment)
+        validation_findings = self.reconcile_validations(now=moment)
 
         for run in active:
             verdict = self.evaluate(run, moment)
@@ -142,6 +147,7 @@ class RunReconciler:
             verdicts=tuple(counters.verdicts),
             workspace_findings=tuple(workspace_findings),
             process_findings=tuple(process_findings),
+            validation_findings=tuple(validation_findings),
         )
 
     def reconcile_processes(self, now: datetime | None = None) -> list[dict[str, Any]]:
@@ -222,6 +228,163 @@ class RunReconciler:
             self._store.record_execution_event(
                 row["execution_id"], row["run_id"], kind, payload, now=now
             )
+        return payload
+
+    def reconcile_validations(self, now: datetime | None = None) -> list[dict[str, Any]]:
+        """validation process의 실제 상태를 판정합니다.
+
+        executor process와 같은 원칙입니다. **증명하지 못한 process는 종료하지
+        않고, 자동으로 재검증하지도 않습니다.** 근거만 남기고 사람이 판단합니다.
+        """
+
+        moment = now or utcnow()
+        findings: list[dict[str, Any]] = []
+
+        for row in self._store.active_validations():
+            findings.append(self._validation_finding(row, moment))
+
+        for row in self._store.validations_for_terminal_runs():
+            findings.append(
+                self._record_validation(
+                    row,
+                    "validation_surviving_terminal_run",
+                    "terminal Run인데 validation이 아직 active합니다.",
+                    {"severity": "high"},
+                    moment,
+                )
+            )
+
+        # validation status만으로는 부족합니다. 결과를 terminal로 닫은 뒤에도
+        # 종료를 확인하지 못한 process가 남아 있을 수 있습니다.
+        seen = {f.get("validation_id") for f in findings}
+        for step in self._store.validation_steps_with_live_process():
+            if step["validation_id"] in seen:
+                continue
+            findings.append(self._live_step_finding(step, moment))
+        return findings
+
+    def _live_step_finding(self, step: Any, moment: datetime) -> dict[str, Any]:
+        """terminal validation record에 남은 process를 판정합니다."""
+
+        identity = self._validation_identity(step)
+        verdict = verify(identity) if identity else IdentityVerdict.UNVERIFIABLE
+        detail = {
+            "validation_id": step["validation_id"],
+            "run_id": step["run_id"],
+            "kind": "validation_orphan_process",
+            "reason": "validation record는 닫혔는데 process가 남아 있을 수 있습니다.",
+            "validation_status": step["validation_status"],
+            "step": step["name"],
+            "step_status": step["status"],
+            "process_id": step["process_id"],
+            "identity_verdict": verdict.value,
+            # 증명하지 못한 process는 종료하지 않습니다.
+            "may_terminate": verdict.may_terminate,
+            "severity": "high" if verdict is IdentityVerdict.MATCH else "medium",
+        }
+        self._store.record_validation_event(
+            step["validation_id"], step["run_id"], "validation_orphan_process", detail,
+            now=moment,
+        )
+        return detail
+
+    def _validation_finding(self, row: Any, moment: datetime) -> dict[str, Any]:
+        step = self._store.running_validation_step(row["validation_id"])
+        if step is None:
+            if row["status"] == ValidationStatus.STARTING.value:
+                # 예약만 하고 첫 step을 시작하지 못했습니다.
+                return self._record_validation(
+                    row,
+                    "validation_never_started",
+                    "validation을 예약했지만 step이 시작되지 않았습니다.",
+                    {},
+                    moment,
+                )
+            # Running인데 실행 중인 step이 없습니다. 결과를 저장하기 전에
+            # 중단된 상태로 봅니다. 자동으로 성공 처리하지 않습니다.
+            return self._record_validation(
+                row,
+                "validation_state_ambiguous",
+                "실행 중인 step이 없는데 validation이 끝나지도 않았습니다.",
+                {"severity": "high"},
+                moment,
+            )
+
+        if step["process_id"] is None:
+            return self._record_validation(
+                row,
+                "validation_process_never_attached",
+                "step을 시작했지만 process를 붙이지 못했습니다.",
+                {"step": step["name"]},
+                moment,
+            )
+
+        identity = self._validation_identity(step)
+        verdict = verify(identity) if identity else IdentityVerdict.UNVERIFIABLE
+        detail = {
+            "step": step["name"],
+            "process_id": step["process_id"],
+            "identity_verdict": verdict.value,
+            "may_terminate": verdict.may_terminate,
+        }
+
+        if verdict is IdentityVerdict.MATCH:
+            return self._record_validation(
+                row, "validation_healthy", "validation process가 살아 있습니다.", detail, moment
+            )
+        if verdict is IdentityVerdict.PROCESS_ABSENT:
+            return self._record_validation(
+                row,
+                "validation_process_missing",
+                "기록된 process가 사라졌습니다.",
+                detail,
+                moment,
+            )
+        if verdict is IdentityVerdict.MISMATCH:
+            return self._record_validation(
+                row,
+                "validation_pid_identity_mismatch",
+                "PID는 있지만 다른 process입니다. 종료하지 않습니다.",
+                {**detail, "severity": "high"},
+                moment,
+            )
+        return self._record_validation(
+            row,
+            "validation_identity_unverifiable",
+            "process identity를 확인할 수 없습니다. 종료하지 않습니다.",
+            detail,
+            moment,
+        )
+
+    @staticmethod
+    def _validation_identity(step: Any) -> ProcessIdentity | None:
+        raw = step["process_identity"]
+        if not raw:
+            return None
+        try:
+            return ProcessIdentity.from_dict(json.loads(raw))
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    def _record_validation(
+        self,
+        row: Any,
+        kind: str,
+        reason: str,
+        detail: dict[str, Any],
+        moment: datetime,
+    ) -> dict[str, Any]:
+        payload = {
+            "validation_id": row["validation_id"],
+            "run_id": row["run_id"],
+            "kind": kind,
+            "reason": reason,
+            "validation_status": row["status"],
+            **detail,
+        }
+        self._store.record_validation_event(
+            row["validation_id"], row["run_id"], kind, payload, now=moment
+        )
         return payload
 
     def reconcile_workspaces(self, now: datetime | None = None) -> list[dict[str, Any]]:

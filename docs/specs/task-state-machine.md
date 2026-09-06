@@ -140,11 +140,16 @@ executor process가 성공했다고 Run이 곧바로 `Succeeded`가 되지는 �
 `AwaitingValidation`은 terminal이 아니고, Task의 active Run 슬롯을 차지하며, **heartbeat 대상이 아닙니다.** executor process가 이미 끝났으므로 heartbeat가 멈춘 것이 정상이고, 그것을 이유로 staleness reconciliation이 회수하면 정상 결과를 잃습니다. claim과 workspace는 유지되어 다음 validation slice가 같은 worktree에서 이어받습니다.
 
 ```
-Running → AwaitingValidation   (구현 적용됨)
-Running → Failed               (변경 없음 / 범위 위반 / executor 실패)
+Running            → AwaitingValidation   (구현 적용됨)
+Running            → Failed               (변경 없음 / 범위 위반 / executor 실패)
+AwaitingValidation → Validating           (validation 예약 성공)
+Validating         → Succeeded            (required step 전부 통과)
+Validating         → Failed               (required step 실패 또는 수행 불가)
 ```
 
-자세한 판정은 [Execution Runtime](execution-runtime.md)의 "구현 결과 판정"을 따릅니다.
+`Validating`은 terminal이 아니고 active Run 슬롯을 차지하며 **heartbeat 대상입니다.** 검증 process가 실제로 돌고 있으므로 heartbeat가 끊기면 stale 판정을 받아야 합니다. `AwaitingValidation`과 성질이 다른 지점입니다.
+
+자세한 판정은 [Execution Runtime](execution-runtime.md)의 "구현 결과 판정"과 [Validation Pipeline](validation-pipeline.md)을 따릅니다.
 
 ## Retry and Idempotency
 

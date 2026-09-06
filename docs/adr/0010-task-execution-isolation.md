@@ -49,6 +49,16 @@ Project owner가 실제 Claude Code adapter 구현을 지시하면서 Claude Cod
 - provider 세부사항은 adapter 경계 안에만 둡니다. core contract는 provider-neutral로 유지합니다.
 - process 수명주기는 기존 executor runtime을 재사용합니다. provider별 process manager를 만들지 않습니다.
 
+### Accepted (2026-09-06, validation 실행 경계)
+
+Project owner가 validation pipeline 구현을 지시하면서 검증 실행 경계를 승인했습니다.
+
+- 검증 명령은 repository에서 발견한 근거로만 선택합니다. 임의 shell 명령을 만들지 않습니다.
+- 검증 process도 Run의 검증된 worktree에서만 실행하고 argv list로만 띄웁니다.
+- 검증 process 환경은 executor보다 좁습니다. provider credential 환경을 넘기지 않습니다.
+- dependency를 설치하지 않습니다.
+- 검증 process도 같은 process identity·timeout·cancellation·reconciliation 경로를 씁니다. 별도 process manager를 만들지 않습니다.
+
 ### 계속 Proposed
 
 - Codex의 호출 형식과 옵션.

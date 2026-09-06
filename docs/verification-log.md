@@ -493,3 +493,227 @@ schema v5 → v6에서 active Run partial unique index를 다시 만듭니다. �
 #### 확인하지 못한 항목
 
 POSIX 실측은 여전히 하지 않았습니다. 앞 절의 미확인 항목이 그대로 남습니다.
+
+## 2026-09-06 — Validation pipeline
+
+Windows 11, Python 3.12.x, git 설치 환경에서 확인했습니다.
+
+### repository 검증 능력 사전 조사
+
+Atlas repository 자체를 대상으로 실측했습니다. 추측한 항목은 없습니다.
+
+| 항목 | 확인한 사실 |
+| --- | --- |
+| `pyproject.toml` | 존재. `[tool.ruff]`(line-length, src)만 있고 lint dependency 선언 없음 |
+| pytest config | 없음 |
+| `pytest` 실행 파일 | PATH에 있으나 worker interpreter에서 import 불가 |
+| `tests/` | 존재. `tests/__init__.py`가 `src`를 sys.path에 넣어 설치 없이 실행 가능 |
+| `ruff` | 설치 안 됨 |
+| `mypy` | 설치돼 있으나 repository에 config 없음 |
+| `pyright` | 설치 안 됨 |
+| CI workflow | 없음. `.github`에는 Issue template과 PR template만 존재 |
+
+이 사실에서 계획이 결정됩니다.
+
+- pytest contract가 없고 `tests/`가 있으므로 **stdlib `unittest` discover**를 씁니다. dependency를 요구하지 않는 쪽을 먼저 고릅니다.
+- `src`와 `tests`가 있으므로 **`compileall`이 required**입니다.
+- ruff는 `[tool.ruff]` table만 있는 **weak contract**이고 실행 파일이 없어 `skipped`입니다.
+- mypy는 config가 없어 `skipped`입니다.
+
+#### contract 강도를 나눈 이유
+
+`pyproject.toml`의 `[tool.X]` table만으로 "이 repository는 그 도구로 게이트한다"고 볼 수 없습니다. 편집기 설정만 담는 경우가 흔합니다. 전용 config 파일이나 dependency 선언은 강한 근거로, `[tool.X]` table만 있는 경우는 약한 근거로 나눴습니다.
+
+이 구분이 없으면 Atlas 자신이 ruff 미설치만으로 실패하고, 구분을 아예 두지 않으면 진짜로 ruff를 요구하는 repository를 통과시킵니다. **이 정책은 명시적 선택이며 검토 대상입니다.**
+
+### 실제 Atlas repository validation smoke
+
+Atlas repository를 임시 위치로 clone하고 Run과 worktree를 만든 뒤, 구현이 끝난 상태를 만들어 실제 validation을 수행했습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 시작 상태 | `AwaitingValidation` |
+| 계획 ecosystem | `python`, test capability 발견 |
+| workspace integrity | passed |
+| git policy | passed |
+| **tests** | `python -m unittest discover -s tests -t .` **exit 0, 246초** |
+| **compile** | `python -m compileall -q src tests` exit 0 |
+| ruff | skipped (`command_missing_weak_contract`) |
+| mypy | skipped (`no_contract`) |
+| required step | 전부 통과 |
+| Run 전이 | `AwaitingValidation` → `Validating` → **`Succeeded`** |
+| main repository HEAD | 변경 없음 |
+| main repository dirty | 변화 없음 |
+| main에 결과 파일 | 없음 |
+| branch | 예상 atlas branch 유지 |
+| commit | 없음. HEAD가 base revision 그대로 |
+| validation 기록 | 1건, outcome=passed |
+| step 기록 | 6건 전부 저장 |
+| log artifact | 2건 경로 저장, 파일 존재 |
+| credential 흔적 | log·event·DB 전체에 없음 |
+
+Atlas가 자기 자신의 전체 테스트를 격리된 worktree에서 실제로 돌려 통과시켰습니다.
+
+### 임시 repository 통합 테스트
+
+| 확인 | 결과 |
+| --- | --- |
+| `AwaitingValidation` → `Validating` → `Succeeded` | 확인 |
+| 실패하는 테스트 | `validation_test_failed`, Run `Failed` |
+| 이후 step 처리 | `earlier_required_step_failed`로 건너뜀 |
+| timeout | `validation_timeout`, Run `Failed(timeout)` |
+| 필수 명령 없음 | `command_missing`, Run `Failed` |
+| 테스트 없는 repository | `Succeeded` + `no_tests_discovered` 경고 |
+| pytest 강제 실행 | 없음 |
+| allowed scope 밖 변경 | `out_of_scope_path_changed`, `policy_violation` |
+| forbidden path 변경 | `forbidden_path_changed` |
+| 예상치 못한 commit | `unexpected_commit` |
+| 변경이 아예 없음 | `no_changes_to_validate` |
+| 구현 이후 사람이 수정 | `workspace_changed_after_implementation` |
+| branch 전환 | gate가 `workspace_valid`로 거부 |
+| gate 통과 후 branch 이동 | workspace integrity step이 `failed` |
+| workspace 삭제 | gate가 거부 |
+| 승인 회수 | gate가 `task_approved`로 거부 |
+| claim 해제 | gate가 `claim_active`로 거부 |
+| 다른 worker | `claim_owner_matches`로 거부 |
+| 거부 시 Run 상태 | `AwaitingValidation` 유지, active validation 없음 |
+| 중복 validation start | database가 거부 |
+| active execution 존재 | `execution_still_active`로 거부 |
+| main worktree 오염 | 없음 |
+| 다른 worktree 오염 | 없음 |
+| validation log redaction | token·Authorization 헤더 모두 제거 |
+| event·DB secret | 없음 |
+| event 크기 | 전체 출력 미저장 |
+
+### restart / reconciliation
+
+| 상황 | 판정 | 자동 종료 |
+| --- | --- | --- |
+| `Running` + process 살아 있음 | `validation_healthy` | — |
+| `Running` + process 사라짐 | `validation_process_missing` | 해당 없음 |
+| `Running` + PID identity 불일치 | `validation_pid_identity_mismatch` | **하지 않음** (process 생존 확인) |
+| step은 있으나 attach 실패 | `validation_process_never_attached` | 해당 없음 |
+| `Starting`인데 step 없음 | `validation_never_started` | 해당 없음 |
+| `Running`인데 실행 중 step 없음 | `validation_state_ambiguous` (high) | 해당 없음 |
+| terminal Run + validation 생존 | `validation_surviving_terminal_run` (high) | **하지 않음** (process 생존 확인) |
+| 자동 재검증 | **하지 않음.** 판정 후에도 status/outcome이 그대로 |
+| `Validating` heartbeat 중단 | stale 판정으로 `Orphaned` |
+
+마지막 항목이 `AwaitingValidation`과의 차이입니다. `AwaitingValidation`은 process가 없으므로 heartbeat 중단이 정상이고, `Validating`은 process가 돌고 있어야 하므로 중단이 이상입니다.
+
+### 검증 중 발견해 고친 것
+
+1. **git policy가 변경을 전혀 감지하지 못했습니다.** 기준선을 현재 상태로 잡아 자기 자신과 비교했기 때문입니다. workspace를 만든 시점(base revision, 깨끗한 트리)을 기준선으로 바꿨습니다. 이제 HEAD 비교가 commit 탐지도 겸합니다.
+2. **설정 파일만 있는 repository를 Python으로 인식하지 못했습니다.** `pyproject.toml`이나 소스 디렉터리가 있어야만 Python으로 봐서, `ruff.toml`이나 `pyrightconfig.json`만 있는 repository는 어떤 step도 계획되지 않았습니다. Python marker 파일과 최상위 `*.py` 존재도 근거로 넣었습니다.
+3. **heartbeat가 `Validating`을 `Running`으로 되돌렸습니다.** 기존 `heartbeat()`가 상태를 무조건 `Running`으로 썼습니다. `Pending`일 때만 올리도록 고치고, heartbeat 대상이 아닌 상태는 거부하도록 했습니다.
+
+### 확인하지 못한 항목
+
+- POSIX에서의 validation 실행. 이 검증은 Windows에서 수행했습니다.
+- Node repository의 **실제** 검증 실행. detection은 단위 테스트로 확인했으나 실제 `npm run test` 실행은 검증하지 않았습니다.
+- pytest를 실제로 실행하는 경로. Atlas는 pytest contract가 없어 unittest 경로만 실측했습니다.
+- ruff·mypy·pyright를 실제로 실행하는 경로. 이 환경에 ruff와 pyright가 없고 Atlas에 mypy config가 없습니다.
+- step 단위 resume. ambiguous 상태 식별까지만 구현했습니다.
+- 매우 큰 repository에서의 소요 시간과 log 누적량.
+- 여러 validation을 동시에 수행했을 때의 자원 경쟁.
+
+### 2026-09-06 추가 — 코드 실행 신뢰 정책, 내용 지문, 종료 확인
+
+merge-blocking review 네 건을 고치고 다시 검증했습니다.
+
+#### validation이 임의 코드 실행 경로였던 문제
+
+`shell=False`는 Atlas가 shell wrapper를 거치지 않는다는 뜻일 뿐, **실행된 repository 코드를 격리하지 않습니다.** 환경변수를 줄이는 것도 sandbox가 아닙니다. executor에게 shell 도구를 주지 않았어도, executor가 test나 `package.json`을 고친 뒤 validation이 그것을 실행하면 그 제한이 무의미해집니다.
+
+이번 범위에서 실제 sandbox를 만들지 않았습니다. 대신 **명시적 신뢰 정책 뒤에** 두고, 문서가 실제 보장보다 강하게 주장하던 부분("network 사용 금지")을 정정했습니다.
+
+실제 Atlas repository로 확인했습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 기본 정책 | `untrusted` (fail closed) |
+| 코드 실행 step 식별 | `unittest`, `mypy` 2개 |
+| 기본 정책에서 차단 | 전부 `active_validation_requires_trust` |
+| argv 제거 | 확인. 계획에 명령이 남지 않음 |
+| required 여부 | 전부 optional로 내려감 |
+| 정적 step | `compileall` required 유지, `workspace-integrity`·`git-policy` 유지 |
+| 정적 step의 코드 실행 | 없음 |
+| sandbox 주장 | `sandboxed: false`, `network_denied: false` 명시 |
+| 신뢰 부여 후 | 테스트가 required로 실행 대상이 됨 |
+| dependency 설치 명령 | 양쪽 정책 모두 없음 |
+
+임시 repository 테스트에서 확인한 것입니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 악성 `package.json` test script (`powershell ... && curl ...`) | 기본 정책에서 실행되지 않음. argv에 `powershell`·`curl` 없음 |
+| Python 테스트 분류 | `executes_repository_code=True` |
+| 정적 검사만 통과한 결과 | `active_validation_skipped_untrusted`, `validation_passed_static_only` 경고 |
+| 신뢰 목록에 있는 repository | 실행 허용 |
+| 목록에 없는 repository | 기본 거부 |
+
+**Node package script는 신뢰 없이 실행하지 않습니다.** script 본문이 임의 shell 문자열이라 이름 allowlist로는 통제되지 않습니다.
+
+#### 같은 파일 내용만 바뀌면 drift를 놓치던 문제
+
+이전 구현은 `implementation_completed` event의 변경 파일 **이름 집합**만 비교했습니다. Claude가 `src/a.py`를 고치고 사람이 같은 파일을 다시 고치면 양쪽 다 `{"src/a.py"}`라 drift가 없었습니다. PR 본문이 주장하던 "구현 이후 수정 시 실패" 보장과 달랐습니다.
+
+내용 지문(SHA-256)으로 바꿨습니다. HEAD, branch, `git diff HEAD --binary`, untracked 파일의 경로와 내용을 모두 넣습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 같은 파일 내용만 변경 | 탐지 |
+| untracked 파일 내용만 변경 | 탐지 |
+| 파일 추가 | 탐지 |
+| 파일 삭제 | 탐지 |
+| 변경 없음 | 동일 지문 |
+| 되돌리면 | 원래 지문과 일치 |
+| 저장 내용 | digest와 개수만. raw source 없음 |
+| 지문 없는 예전 Run | 이름 비교로 물러서되 `weaker_guarantee: true` 기록 |
+
+#### 종료 미확인 process를 terminal로 숨기던 문제
+
+executor runtime의 invariant가 validation에 적용되지 않고 있었습니다. `_classify()`가 termination 확인 없이 timeout을 `error`로 바꿨고, validation record가 `Finished`/`Failed`로 닫히면 `active_validations()`(당시 `Starting`/`Running`만 조회)에서 사라졌습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 종료 미확인 timeout | step `unconfirmed`. 평범한 error로 닫지 않음 |
+| validation status | `RecoveryRequired`. terminal 아님 |
+| outcome | `ambiguous`, `validation_termination_unverified` |
+| Run 상태 | 확정하지 않음. `Validating` 유지 |
+| reconciliation | 계속 보임 |
+| 확인된 정상 timeout | 기존대로 `Finished` + Run `Failed` |
+| identity 불일치 | 종료하지 않음. process 생존 확인 |
+| spawn 후 attach 실패 | `validation_process_attach_failed` + `validation_interrupted` 기록, `RecoveryRequired` 유지 |
+| terminal validation record + 생존 process | `validation_orphan_process`로 탐지. 종료하지 않음 |
+
+**validation status만으로 reconciliation 범위를 정하지 않습니다.** process identity가 기록된 step 자체를 기준으로도 훑습니다.
+
+#### unittest 0건 실행 문제
+
+`unittest discover`는 기본 pattern(`test*.py`)에 맞는 파일이 없어도 "Ran 0 tests"로 exit 0을 냅니다. pytest 형식(`*_test.py`)만 있는 repository가 조용히 통과할 수 있었습니다.
+
+| 확인 | 결과 |
+| --- | --- |
+| 계획 시점 pattern 불일치 | `test_runner_mismatch`로 required error |
+| 실행 후 0건 | `no_tests_executed`로 되돌림 |
+| Run 결과 | `Failed(validation_no_tests_executed)` |
+| 파일이 아예 없는 경우 | 기존대로 `no_tests_discovered` skip |
+
+#### 회귀 테스트가 실제로 잡는지 확인
+
+네 수정을 각각 되돌리고 다시 돌렸습니다. **11건이 실패**했고 복원하니 전부 통과했습니다.
+
+#### 재실행한 검증
+
+- 전체 테스트 통과
+- `compileall` (src, tests) 통과
+- **real Atlas validation smoke 재실행 통과** — 신뢰를 부여한 상태에서 Atlas 자체 테스트 372초 exit 0, `Succeeded` 확정, main 무오염, commit 없음, credential 흔적 없음
+- 실제 Atlas repository로 신뢰 정책·지문 smoke 통과
+- secret scan, `git diff --check` 통과
+
+#### 확인하지 못한 항목
+
+- **실제 sandbox는 만들지 않았습니다.** filesystem 경계, process spawn 제한, network deny를 강제하지 않습니다. 신뢰 정책이 유일한 통제입니다.
+- 신뢰를 부여한 repository에서 악성 코드가 실제로 host에 미치는 영향은 검증 대상이 아닙니다. 그 경우 통제 수단이 없습니다.
+- 앞 절의 미확인 항목(POSIX, Node 실제 실행, pytest·ruff·mypy·pyright 실행 경로)이 그대로 남습니다.

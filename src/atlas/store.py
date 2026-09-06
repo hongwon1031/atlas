@@ -22,6 +22,7 @@ from typing import Any
 
 from .idempotency import IdempotencyKey
 from .executor import ExecutionStatus
+from .validation_models import ValidationStatus
 from .schema import (
     ACTIVE_RUN_STATUSES,
     IntakeResult,
@@ -33,7 +34,7 @@ from .schema import (
     WorkspaceStatus,
 )
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 
 _PRIORITY_RANK = {
     Priority.LOW: 0,
@@ -139,7 +140,8 @@ CREATE TABLE IF NOT EXISTS runs (
 -- Task 하나에 active Run은 최대 하나입니다(execution-runtime.md의 Run Boundary).
 -- claim의 partial unique index와 같은 방식으로 database가 강제합니다.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active
-    ON runs(task_id) WHERE status IN ('Pending', 'Running', 'AwaitingValidation');
+    ON runs(task_id)
+    WHERE status IN ('Pending', 'Running', 'AwaitingValidation', 'Validating');
 CREATE INDEX IF NOT EXISTS idx_runs_claim ON runs(claim_id);
 
 CREATE TABLE IF NOT EXISTS executions (
@@ -178,6 +180,67 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_active
     ON executions(run_id) WHERE status IN ('Starting', 'Running', 'Cancelling');
 CREATE INDEX IF NOT EXISTS idx_executions_run ON executions(run_id);
 
+-- validation attempt. Run 하나에 여러 번 시도할 수 있으므로 별도 table입니다.
+-- event만으로는 restart 후 "어디까지 끝났는가"를 복원할 수 없습니다.
+CREATE TABLE IF NOT EXISTS validations (
+    validation_id    TEXT PRIMARY KEY,
+    run_id           TEXT NOT NULL,
+    task_id          TEXT NOT NULL,
+    worker_id        TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    outcome          TEXT,
+    cwd              TEXT NOT NULL,
+    plan_json        TEXT NOT NULL,
+    summary          TEXT,
+    warnings         TEXT,
+    failure_category TEXT,
+    started_at       TEXT,
+    finished_at      TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+
+-- Run 하나에 active validation은 최대 하나입니다. 중복 시작을 database가
+-- 최종적으로 막습니다.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_validations_active
+    ON validations(run_id) WHERE status IN ('Starting', 'Running');
+CREATE INDEX IF NOT EXISTS idx_validations_run ON validations(run_id);
+
+-- step 단위 결과. 어디까지 끝났는지, 지금 어떤 process가 도는지 알 수 있어야
+-- restart 후 판정할 수 있습니다.
+CREATE TABLE IF NOT EXISTS validation_steps (
+    step_id            TEXT PRIMARY KEY,
+    validation_id      TEXT NOT NULL,
+    run_id             TEXT NOT NULL,
+    position           INTEGER NOT NULL,
+    name               TEXT NOT NULL,
+    kind               TEXT NOT NULL,
+    required           INTEGER NOT NULL,
+    status             TEXT NOT NULL,
+    command            TEXT NOT NULL,
+    exit_code          INTEGER,
+    duration_seconds   REAL,
+    process_id         INTEGER,
+    process_identity   TEXT,
+    process_started_at TEXT,
+    stdout_path        TEXT,
+    stdout_bytes       INTEGER,
+    stdout_truncated   INTEGER,
+    stderr_path        TEXT,
+    stderr_bytes       INTEGER,
+    stderr_truncated   INTEGER,
+    reason             TEXT,
+    evidence           TEXT,
+    started_at         TEXT,
+    finished_at        TEXT,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_validation_steps_position
+    ON validation_steps(validation_id, position);
+CREATE INDEX IF NOT EXISTS idx_validation_steps_run ON validation_steps(run_id);
+
 CREATE TABLE IF NOT EXISTS poll_cursors (
     repository      TEXT PRIMARY KEY,
     last_updated_at TEXT,
@@ -205,6 +268,18 @@ class RunError(Exception):
         super().__init__(message)
         self.category = category
         self.message = message
+
+
+class ValidationError(RunError):
+    """validation lifecycle 위반."""
+
+
+class ValidationConflict(ValidationError):
+    """validation을 시작할 수 없거나 기대한 단계가 아닙니다."""
+
+    def __init__(self, category: str, message: str, validation: dict | None = None) -> None:
+        super().__init__(category, message)
+        self.validation = validation
 
 
 class ExecutionError(RunError):
@@ -311,6 +386,8 @@ class TaskStore:
         }
         if "execution_id" not in event_columns2:
             self._connection.execute("ALTER TABLE events ADD COLUMN execution_id TEXT")
+        if "validation_id" not in event_columns2:
+            self._connection.execute("ALTER TABLE events ADD COLUMN validation_id TEXT")
 
         # schema v3 database의 runs에는 workspace 컬럼이 없습니다.
         run_columns = {
@@ -341,11 +418,11 @@ class TaskStore:
         index_sql = self._connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_runs_active'"
         ).fetchone()
-        if index_sql and "AwaitingValidation" not in (index_sql["sql"] or ""):
+        if index_sql and "Validating" not in (index_sql["sql"] or ""):
             self._connection.execute("DROP INDEX idx_runs_active")
             self._connection.execute(
-                "CREATE UNIQUE INDEX idx_runs_active ON runs(task_id) "
-                "WHERE status IN ('Pending', 'Running', 'AwaitingValidation')"
+                "CREATE UNIQUE INDEX idx_runs_active ON runs(task_id) WHERE status IN "
+                "('Pending', 'Running', 'AwaitingValidation', 'Validating')"
             )
 
         self._connection.execute(
@@ -864,6 +941,13 @@ class TaskStore:
                     "run_terminal",
                     f"{run_id}는 이미 {status.value} 상태입니다. heartbeat할 수 없습니다.",
                 )
+            if not status.expects_heartbeat:
+                # AwaitingValidation처럼 process가 없는 상태입니다. heartbeat를
+                # 받으면 살아 있다는 잘못된 근거가 생깁니다.
+                raise RunError(
+                    "heartbeat_not_expected",
+                    f"{run_id}는 {status.value} 상태라 heartbeat 대상이 아닙니다.",
+                )
             if row["worker_id"] != worker_id:
                 raise RunError(
                     "worker_mismatch",
@@ -871,7 +955,9 @@ class TaskStore:
                 )
 
             promoted = status is RunStatus.PENDING
-            new_status = RunStatus.RUNNING
+            # Pending일 때만 올립니다. Validating을 Running으로 되돌리면
+            # 어느 단계인지 알 수 없게 됩니다.
+            new_status = RunStatus.RUNNING if promoted else status
             connection.execute(
                 "UPDATE runs SET status = ?, heartbeat_at = ?, "
                 "started_at = COALESCE(started_at, ?) WHERE run_id = ?",
@@ -1657,6 +1743,374 @@ class TaskStore:
 
 
 
+    # -- validation -------------------------------------------------------
+
+    def start_validation(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+        cwd: str,
+        plan: dict[str, Any],
+        now: datetime | None = None,
+    ) -> str:
+        """validation을 예약하고 Run을 `Validating`으로 전이합니다.
+
+        `AwaitingValidation`에서만 시작할 수 있습니다. 구현이 끝나지 않았거나
+        이미 검증된 Run을 다시 검증하면 근거 없는 결론이 나옵니다.
+
+        예약과 상태 전이와 근거 확인을 **하나의 transaction**에서 합니다. 첫
+        확인과 예약 사이에 승인이 회수되거나 claim이 풀리는 창을 닫습니다.
+        subprocess는 이 transaction 밖에서 띄웁니다.
+        """
+
+        moment = now or utcnow()
+        stamp = to_iso(moment)
+        validation_id = f"val-{uuid.uuid4().hex[:16]}"
+
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise RunError("run_not_found", f"{run_id}를 찾을 수 없습니다.")
+
+            status = RunStatus(row["status"])
+            if status is not RunStatus.AWAITING_VALIDATION:
+                raise ValidationConflict(
+                    "run_not_awaiting_validation",
+                    f"{run_id}는 {status.value} 상태입니다. "
+                    f"{RunStatus.AWAITING_VALIDATION.value}에서만 시작할 수 있습니다.",
+                )
+
+            existing = connection.execute(
+                "SELECT * FROM validations WHERE run_id = ? AND status IN "
+                "('Starting','Running','RecoveryRequired')",
+                (run_id,),
+            ).fetchone()
+            if existing is not None:
+                raise ValidationConflict(
+                    "validation_already_active",
+                    f"{run_id}에 이미 active validation "
+                    f"{existing['validation_id']}이 있습니다.",
+                    self._validation_from_row(existing),
+                )
+
+            active_execution = connection.execute(
+                "SELECT execution_id FROM executions WHERE run_id = ? AND status IN "
+                "('Starting','Running','Cancelling')",
+                (run_id,),
+            ).fetchone()
+            if active_execution is not None:
+                raise ValidationConflict(
+                    "execution_still_active",
+                    f"{run_id}에 아직 실행 중인 execution "
+                    f"{active_execution['execution_id']}이 있습니다.",
+                )
+
+            failed = self._reservation_guards(connection, run_id, worker_id, moment)
+            if failed:
+                raise ValidationConflict(
+                    "validation_guard_failed",
+                    f"validation 시작 근거 확인에 실패했습니다: {', '.join(failed)}",
+                    {"failed_checks": failed},
+                )
+
+            connection.execute(
+                "INSERT INTO validations(validation_id, run_id, task_id, worker_id, status, "
+                "cwd, plan_json, started_at, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    validation_id,
+                    run_id,
+                    row["task_id"],
+                    worker_id,
+                    ValidationStatus.STARTING.value,
+                    cwd,
+                    json.dumps(plan, ensure_ascii=False),
+                    stamp,
+                    stamp,
+                    stamp,
+                ),
+            )
+            connection.execute(
+                "UPDATE runs SET status = ?, heartbeat_at = ? WHERE run_id = ?",
+                (RunStatus.VALIDATING.value, stamp, run_id),
+            )
+            self._record(
+                connection,
+                kind="validation_started",
+                moment=stamp,
+                task_id=row["task_id"],
+                fingerprint=row["fingerprint"],
+                claim_id=row["claim_id"],
+                run_id=run_id,
+                validation_id=validation_id,
+                detail={
+                    "worker_id": worker_id,
+                    "ecosystem": plan.get("ecosystem"),
+                    "step_count": len(plan.get("steps") or []),
+                },
+            )
+        return validation_id
+
+    def mark_validation_running(
+        self, validation_id: str, now: datetime | None = None
+    ) -> None:
+        """첫 step을 시작했음을 기록합니다."""
+
+        stamp = to_iso(now or utcnow())
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE validations SET status = ?, updated_at = ? "
+                "WHERE validation_id = ? AND status = ?",
+                (
+                    ValidationStatus.RUNNING.value,
+                    stamp,
+                    validation_id,
+                    ValidationStatus.STARTING.value,
+                ),
+            )
+
+    def record_validation_step(
+        self,
+        validation_id: str,
+        run_id: str,
+        *,
+        position: int,
+        name: str,
+        kind: str,
+        required: bool,
+        status: str,
+        command: list[str] | tuple[str, ...] = (),
+        exit_code: int | None = None,
+        duration_seconds: float | None = None,
+        process_id: int | None = None,
+        process_identity: dict[str, Any] | None = None,
+        process_started_at: str | None = None,
+        stdout: dict[str, Any] | None = None,
+        stderr: dict[str, Any] | None = None,
+        reason: str = "",
+        evidence: dict[str, Any] | None = None,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+        now: datetime | None = None,
+    ) -> str:
+        """step 하나의 상태를 기록합니다. 같은 position이면 갱신합니다.
+
+        step을 시작할 때 먼저 `running`으로 기록해야 restart 후 "어디까지
+        갔는지"를 알 수 있습니다. 결과만 기록하면 중간에 죽은 경우를 구분할
+        수 없습니다.
+        """
+
+        stamp = to_iso(now or utcnow())
+        step_id = f"vstep-{validation_id[4:]}-{position:02d}"
+        with self._write() as connection:
+            connection.execute(
+                "INSERT INTO validation_steps(step_id, validation_id, run_id, position, name, "
+                "kind, required, status, command, exit_code, duration_seconds, process_id, "
+                "process_identity, process_started_at, stdout_path, stdout_bytes, "
+                "stdout_truncated, stderr_path, stderr_bytes, stderr_truncated, reason, "
+                "evidence, started_at, finished_at, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(step_id) DO UPDATE SET "
+                "status = excluded.status, exit_code = excluded.exit_code, "
+                "duration_seconds = excluded.duration_seconds, "
+                "process_id = COALESCE(excluded.process_id, validation_steps.process_id), "
+                "process_identity = COALESCE(excluded.process_identity, "
+                "validation_steps.process_identity), "
+                "process_started_at = COALESCE(excluded.process_started_at, "
+                "validation_steps.process_started_at), "
+                "stdout_path = excluded.stdout_path, stdout_bytes = excluded.stdout_bytes, "
+                "stdout_truncated = excluded.stdout_truncated, "
+                "stderr_path = excluded.stderr_path, stderr_bytes = excluded.stderr_bytes, "
+                "stderr_truncated = excluded.stderr_truncated, reason = excluded.reason, "
+                "evidence = excluded.evidence, finished_at = excluded.finished_at, "
+                "updated_at = excluded.updated_at",
+                (
+                    step_id,
+                    validation_id,
+                    run_id,
+                    position,
+                    name,
+                    kind,
+                    1 if required else 0,
+                    status,
+                    json.dumps(list(command), ensure_ascii=False),
+                    exit_code,
+                    duration_seconds,
+                    process_id,
+                    json.dumps(process_identity, ensure_ascii=False)
+                    if process_identity
+                    else None,
+                    process_started_at,
+                    (stdout or {}).get("path"),
+                    (stdout or {}).get("bytes_written"),
+                    1 if (stdout or {}).get("truncated") else 0,
+                    (stderr or {}).get("path"),
+                    (stderr or {}).get("bytes_written"),
+                    1 if (stderr or {}).get("truncated") else 0,
+                    reason,
+                    json.dumps(evidence or {}, ensure_ascii=False),
+                    started_at or stamp,
+                    finished_at,
+                    stamp,
+                    stamp,
+                ),
+            )
+        return step_id
+
+    def finish_validation(
+        self,
+        validation_id: str,
+        *,
+        status: ValidationStatus,
+        outcome: str | None = None,
+        summary: str = "",
+        warnings: list[str] | tuple[str, ...] = (),
+        failure_category: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """validation attempt를 종료합니다. Run 전이는 별도로 수행합니다."""
+
+        stamp = to_iso(now or utcnow())
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT * FROM validations WHERE validation_id = ?", (validation_id,)
+            ).fetchone()
+            if row is None:
+                raise ValidationConflict(
+                    "validation_not_found", f"{validation_id}를 찾을 수 없습니다."
+                )
+            connection.execute(
+                "UPDATE validations SET status = ?, outcome = ?, summary = ?, warnings = ?, "
+                "failure_category = ?, finished_at = ?, updated_at = ? WHERE validation_id = ?",
+                (
+                    status.value,
+                    outcome,
+                    summary,
+                    json.dumps(list(warnings), ensure_ascii=False),
+                    failure_category,
+                    stamp,
+                    stamp,
+                    validation_id,
+                ),
+            )
+            self._record(
+                connection,
+                kind="validation_finished",
+                moment=stamp,
+                task_id=row["task_id"],
+                run_id=row["run_id"],
+                validation_id=validation_id,
+                detail={
+                    "status": status.value,
+                    "outcome": outcome,
+                    "failure_category": failure_category,
+                    "warnings": list(warnings),
+                },
+            )
+
+    def record_validation_event(
+        self,
+        validation_id: str | None,
+        run_id: str,
+        kind: str,
+        detail: dict[str, Any],
+        now: datetime | None = None,
+    ) -> None:
+        stamp = to_iso(now or utcnow())
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT task_id FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            self._record(
+                connection,
+                kind=kind,
+                moment=stamp,
+                task_id=row["task_id"] if row else None,
+                run_id=run_id,
+                validation_id=validation_id,
+                detail=detail,
+            )
+
+    def validation(self, validation_id: str) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT * FROM validations WHERE validation_id = ?", (validation_id,)
+        ).fetchone()
+
+    def active_validation(self, run_id: str) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT * FROM validations WHERE run_id = ? AND status IN "
+            "('Starting','Running','RecoveryRequired')",
+            (run_id,),
+        ).fetchone()
+
+    def validations(self, run_id: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+        if run_id is None:
+            return self._connection.execute(
+                "SELECT * FROM validations ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return self._connection.execute(
+            "SELECT * FROM validations WHERE run_id = ? ORDER BY created_at DESC LIMIT ?",
+            (run_id, limit),
+        ).fetchall()
+
+    def active_validations(self) -> list[sqlite3.Row]:
+        return self._connection.execute(
+            "SELECT * FROM validations WHERE status IN "
+            "('Starting','Running','RecoveryRequired') ORDER BY created_at ASC"
+        ).fetchall()
+
+    def validation_steps_with_live_process(self) -> list[sqlite3.Row]:
+        """process가 아직 살아 있을 수 있는 step 전부.
+
+        **validation status만 보면 놓칩니다.** 결과를 terminal로 닫은 뒤에도
+        종료를 확인하지 못한 process가 남아 있을 수 있습니다. step 자체를
+        기준으로 훑어야 감사에서 사라지지 않습니다.
+        """
+
+        return self._connection.execute(
+            "SELECT s.*, v.status AS validation_status FROM validation_steps s "
+            "JOIN validations v ON v.validation_id = s.validation_id "
+            "WHERE s.process_id IS NOT NULL AND s.status IN ('running','unconfirmed') "
+            "ORDER BY s.updated_at ASC"
+        ).fetchall()
+
+    def validations_for_terminal_runs(self) -> list[sqlite3.Row]:
+        """terminal Run인데 validation이 아직 active한 경우입니다."""
+
+        return self._connection.execute(
+            "SELECT v.* FROM validations v JOIN runs r ON r.run_id = v.run_id "
+            "WHERE v.status IN ('Starting','Running','RecoveryRequired') AND r.status IN "
+            "('Succeeded','Failed','Cancelled','Orphaned') ORDER BY v.created_at ASC"
+        ).fetchall()
+
+    def validation_steps(self, validation_id: str) -> list[sqlite3.Row]:
+        return self._connection.execute(
+            "SELECT * FROM validation_steps WHERE validation_id = ? ORDER BY position ASC",
+            (validation_id,),
+        ).fetchall()
+
+    def running_validation_step(self, validation_id: str) -> sqlite3.Row | None:
+        """process가 살아 있을 수 있는 step. reconciliation이 이것을 봅니다."""
+
+        return self._connection.execute(
+            "SELECT * FROM validation_steps WHERE validation_id = ? AND status IN "
+            "('running','unconfirmed') ORDER BY position ASC LIMIT 1",
+            (validation_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _validation_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "validation_id": row["validation_id"],
+            "run_id": row["run_id"],
+            "status": row["status"],
+            "outcome": row["outcome"],
+            "worker_id": row["worker_id"],
+        }
+
     def run(self, run_id: str) -> Run | None:
         row = self._connection.execute(
             "SELECT * FROM runs WHERE run_id = ?", (run_id,)
@@ -1853,12 +2307,14 @@ class TaskStore:
         claim_id: str | None = None,
         run_id: str | None = None,
         execution_id: str | None = None,
+        validation_id: str | None = None,
         detail: dict[str, Any] | None = None,
     ) -> None:
         connection.execute(
             "INSERT INTO events"
-            "(occurred_at, kind, task_id, fingerprint, claim_id, run_id, execution_id, detail) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "(occurred_at, kind, task_id, fingerprint, claim_id, run_id, execution_id, "
+            "validation_id, detail) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 moment,
                 kind,
@@ -1867,6 +2323,7 @@ class TaskStore:
                 claim_id,
                 run_id,
                 execution_id,
+                validation_id,
                 json.dumps(detail or {}, ensure_ascii=False, default=str),
             ),
         )
